@@ -1,0 +1,7 @@
+# https://dart.dev/guides/libraries/private-files
+# Created by `dart pub`
+.dart_tool/
+benchmark_*.txt
+benchmark_*.csv
+benchmark_*.png
+debug_test.dart.ignore
