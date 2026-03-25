@@ -11,6 +11,11 @@ import 'lru_cache.dart';
 /// without touching disk on cache hits.
 class PageManager {
   static const int pageSize = 4096; // 4KB pages
+  
+  /// Maximum number of dirty pages before forcing a flush in write-behind mode.
+  /// Prevents unbounded memory growth when write-behind is enabled.
+  /// Default: 1000 pages = 4MB of dirty data.
+  static const int maxDirtyPages = 1000;
 
   final StorageStrategy storage;
 
@@ -59,6 +64,9 @@ class PageManager {
   /// In **write-through** mode (default): updates cache and writes to disk immediately.
   /// In **write-behind** mode: updates cache and marks dirty; disk write deferred to [flushDirty()].
   ///
+  /// BUG FIX: Automatically flushes when dirty pages exceed [maxDirtyPages] to prevent
+  /// unbounded memory growth in long-running write-behind operations.
+  ///
   /// Not declared `async` so that the write-behind fast path can return a
   /// pre-allocated completed [Future] without allocating a state-machine object
   /// on every call.
@@ -73,6 +81,13 @@ class PageManager {
 
     if (writeBehind) {
       _dirtyPages[pageIndex] = data;
+      
+      // BUG FIX: Flush automatically when dirty pages exceed threshold
+      // to prevent unbounded memory growth.
+      if (_dirtyPages.length >= maxDirtyPages) {
+        return flushDirty();
+      }
+      
       // Return a pre-allocated completed future — no state-machine allocation,
       // no extra microtask bounce compared to an async function body.
       return _doneFuture;
@@ -155,6 +170,11 @@ class PageManager {
   /// (e.g. from a preceding insertAll) and must be preserved.
   void clearLruCache() {
     _cache.clear();
+  }
+
+  /// Clears all dirty pages without flushing (used during rollback).
+  void clearDirtyPages() {
+    _dirtyPages.clear();
   }
 
   // ─── Helpers ─────────────────────────────────────────────────────────────

@@ -28,7 +28,12 @@ class IoStorageStrategy implements StorageStrategy {
     if (!await dbFile.exists()) {
       await dbFile.create(recursive: true);
     }
-    _file = await dbFile.open(mode: FileMode.append);
+    // CRITICAL FIX: Use FileMode.write instead of FileMode.append
+    // FileMode.append causes corruption on mobile (Android/iOS) because:
+    // - setPosition() is ignored for writes in append mode
+    // - all writes are forced to the end of the file
+    // - this corrupts the database since B-tree nodes are overwritten at specific offsets
+    _file = await dbFile.open(mode: FileMode.write);
     _cachedSize = await _file!.length();
 
     // Acquire an exclusive file lock (blocks other processes)

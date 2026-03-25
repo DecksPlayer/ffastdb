@@ -9,6 +9,7 @@ const int _typeBool = 3;
 const int _typeList = 4;
 const int _typeMap = 5;
 const int _typeDouble = 6;
+const int _typeDateTime = 7;
 
 class FastBinaryWriter implements BinaryWriter {
   final BytesBuilder _builder = BytesBuilder();
@@ -51,9 +52,14 @@ class FastBinaryWriter implements BinaryWriter {
       writeUint8(_typeNull);
     } else if (value is int) {
       writeUint8(_typeInt);
-      // Write as 64-bit little-endian to avoid truncation of large integers
+      // ByteData.setInt64 is not supported by dart2js (Flutter Web).
+      // Split into two 32-bit writes; maintains the same little-endian byte layout.
       final bd = ByteData(8);
-      bd.setInt64(0, value, Endian.little);
+      final lo = value & 0xFFFFFFFF; // lower 32 bits (may be signed in JS)
+      final loUnsigned = lo < 0 ? lo + 0x100000000 : lo;
+      final hi = (value - loUnsigned) ~/ 0x100000000; // upper 32 bits
+      bd.setInt32(0, lo, Endian.little);
+      bd.setInt32(4, hi, Endian.little);
       _builder.add(bd.buffer.asUint8List());
     } else if (value is double) {
       writeUint8(_typeDouble);
@@ -79,9 +85,55 @@ class FastBinaryWriter implements BinaryWriter {
         writeDynamic(k);
         writeDynamic(v);
       });
+    } else if (value is DateTime) {
+      writeUint8(_typeDateTime);
+      final bd = ByteData(8);
+      final ms = value.millisecondsSinceEpoch;
+      final lo = ms & 0xFFFFFFFF;
+      final loUnsigned = lo < 0 ? lo + 0x100000000 : lo;
+      final hi = (ms - loUnsigned) ~/ 0x100000000;
+      bd.setInt32(0, lo, Endian.little);
+      bd.setInt32(4, hi, Endian.little);
+      _builder.add(bd.buffer.asUint8List());
+    } else if (value is Uint8List) {
+      writeUint8(_typeString);
+      // Encode as Base64 string so it round-trips cleanly
+      writeString('\u0000bl:${base64Encode(value)}');
     } else {
-      // Potentially a custom object if we had a registry here
-      throw UnsupportedError('Unsupported type: ${value.runtimeType}');
+      // Try Firebase duck-typing before giving up.
+      // 1) Timestamp → DateTime
+      try {
+        final dt = (value as dynamic).toDate() as DateTime;
+        writeDynamic(dt);
+        return;
+      } catch (_) {}
+      // 2) GeoPoint → {latitude, longitude} map
+      try {
+        final lat = ((value as dynamic).latitude as num).toDouble();
+        final lng = ((value as dynamic).longitude as num).toDouble();
+        writeDynamic(<String, dynamic>{'latitude': lat, 'longitude': lng});
+        return;
+      } catch (_) {}
+      // 3) DocumentReference → path string
+      try {
+        final path = (value as dynamic).path as String;
+        writeDynamic(path);
+        return;
+      } catch (_) {}
+      // 4) Blob → Uint8List
+      try {
+        final bytes = (value as dynamic).bytes as Uint8List;
+        writeDynamic(bytes);
+        return;
+      } catch (_) {}
+      // 5) Objects with toJson() (application model classes)
+      try {
+        final map = (value as dynamic).toJson() as Map<String, dynamic>;
+        writeDynamic(map);
+        return;
+      } catch (_) {}
+      // Last resort: store as string so the document is never lost
+      writeDynamic(value.toString());
     }
   }
 }
@@ -139,7 +191,11 @@ class FastBinaryReader implements BinaryReader {
           bd.setUint8(i, _data[_offset + i]);
         }
         _offset += 8;
-        return bd.getInt64(0, Endian.little);
+        // ByteData.getInt64 is not supported by dart2js; reconstruct from two Int32 reads.
+        final lo = bd.getInt32(0, Endian.little);
+        final loUnsigned = lo < 0 ? lo + 0x100000000 : lo;
+        final hi = bd.getInt32(4, Endian.little);
+        return hi * 0x100000000 + loUnsigned;
       case _typeDouble:
         final bd = ByteData(8);
         for (int i = 0; i < 8; i++) {
@@ -161,6 +217,18 @@ class FastBinaryReader implements BinaryReader {
           map[k] = v;
         }
         return map;
+      case _typeDateTime:
+        final bdDt = ByteData(8);
+        for (int i = 0; i < 8; i++) {
+          bdDt.setUint8(i, _data[_offset + i]);
+        }
+        _offset += 8;
+        // ByteData.getInt64 is not supported by dart2js; reconstruct from two Int32 reads.
+        final dtLo = bdDt.getInt32(0, Endian.little);
+        final dtLoUnsigned = dtLo < 0 ? dtLo + 0x100000000 : dtLo;
+        final dtHi = bdDt.getInt32(4, Endian.little);
+        return DateTime.fromMillisecondsSinceEpoch(
+            dtHi * 0x100000000 + dtLoUnsigned);
       default:
         throw UnsupportedError('Unsupported type ID: $type');
     }

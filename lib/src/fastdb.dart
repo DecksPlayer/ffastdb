@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:typed_data';
+import 'package:meta/meta.dart';
 import 'storage/storage_strategy.dart';
 import 'storage/page_manager.dart';
 import 'storage/wal_storage_strategy.dart';
@@ -38,10 +39,18 @@ class FastDB {
   bool _batchMode = false;
   bool _inTransaction = false;
   int _nextId = 1;
+  
+  /// Marks whether this database instance has been closed.
+  /// Used to prevent operations on a closed database, especially important
+  /// for the singleton pattern where users might retain references after dispose.
+  bool _isClosed = false;
 
   Future<void> _writeLock = Future.value();
 
   Future<T> _exclusive<T>(Future<T> Function() fn) {
+    if (_isClosed) {
+      throw StateError('Cannot perform operations on a closed database.');
+    }
     if (_inTransaction) return fn();
     final next = _writeLock.then((_) => fn());
     _writeLock = next.then((_) {}, onError: (_) {});
@@ -57,19 +66,54 @@ class FastDB {
   WalStorageStrategy? get _wal =>
       storage is WalStorageStrategy ? storage as WalStorageStrategy : null;
 
-  /// Standard constructor.
-  /// Provide [dataStorage] to separate documents from B-Tree pages for max performance.
-  /// Set [autoCompactThreshold] (0–1) to trigger automatic compaction whenever the
-  /// ratio of deleted documents exceeds that fraction. E.g. `0.3` = compact when
-  /// more than 30 % of slots are deleted. Disabled by default (0).
-  FastDB(this.storage, {
+  /// Internal constructor used by factory constructors and singleton.
+  FastDB._internal(this.storage, {
     this.dataStorage,
-    int cacheCapacity = 256,
+    int cacheCapacity = 2048,
     double autoCompactThreshold = 0,
   }) {
     _autoCompactThreshold = autoCompactThreshold;
     _pageManager = PageManager(storage, cacheCapacity: cacheCapacity);
     _primaryIndex = BTree(_pageManager);
+  }
+  
+  /// Creates a FastDB instance directly.
+  /// 
+  /// **For most applications**, use [FfastDb.init()] with the singleton pattern instead.
+  /// Use this constructor when you need multiple isolated database instances 
+  /// (e.g., benchmarks, advanced use cases, or non-singleton scenarios).
+  ///
+  /// Provide [dataStorage] to separate documents from B-Tree pages for max performance.
+  /// Set [autoCompactThreshold] (0–1) to trigger automatic compaction whenever the
+  /// ratio of deleted documents exceeds that fraction. E.g. `0.3` = compact when
+  /// more than 30% of slots are deleted. Disabled by default (0).
+  factory FastDB(StorageStrategy storage, {
+    StorageStrategy? dataStorage,
+    int cacheCapacity = 2048,
+    double autoCompactThreshold = 0,
+  }) {
+    return FastDB._internal(
+      storage,
+      dataStorage: dataStorage,
+      cacheCapacity: cacheCapacity,
+      autoCompactThreshold: autoCompactThreshold,
+    );
+  }
+  
+  /// Constructor for testing purposes - directly creates a FastDB instance.
+  /// **WARNING**: In production code, use [FfastDb.init()] instead.
+  @visibleForTesting
+  factory FastDB.forTesting(StorageStrategy storage, {
+    StorageStrategy? dataStorage,
+    int cacheCapacity = 2048,
+    double autoCompactThreshold = 0,
+  }) {
+    return FastDB._internal(
+      storage,
+      dataStorage: dataStorage,
+      cacheCapacity: cacheCapacity,
+      autoCompactThreshold: autoCompactThreshold,
+    );
   }
 
   // ─── Singleton ────────────────────────────────────────────────────────────
@@ -81,6 +125,10 @@ class FastDB {
     if (_instance == null) {
       throw StateError(
           'FfastDb not initialized. Call `await FfastDb.init(storage)` first.');
+    }
+    if (_instance!._isClosed) {
+      throw StateError(
+          'FfastDb instance has been closed. Call `await FfastDb.init(storage)` again.');
     }
     return _instance!;
   }
@@ -106,7 +154,7 @@ class FastDB {
     int version = 1,
     Map<int, dynamic Function(dynamic)>? migrations,
   }) async {
-    final db = FastDB(
+    final db = FastDB._internal(
       storage,
       dataStorage: dataStorage,
       cacheCapacity: cacheCapacity,
@@ -241,7 +289,11 @@ class FastDB {
     }
   }
 
+  /// Closes the database and releases all resources.
   Future<void> close() async {
+    if (_isClosed) return; // Already closed
+    _isClosed = true;
+    
     await _saveIndexes();
     if (storage.needsExplicitFlush) {
       await storage.write(24, Uint8List(1)..[0] = 0x43);
@@ -252,7 +304,9 @@ class FastDB {
     await storage.close();
     await dataStorage?.flush();
     await dataStorage?.close();
-    for (final c in _watchers.values) {
+    final watchersCopy = _watchers.values.toList();
+    _watchers.clear();
+    for (final c in watchersCopy) {
       await c.close();
     }
   }
@@ -270,14 +324,19 @@ class FastDB {
 
   Future<int> _insertImpl(dynamic doc) async {
     final wal = _wal;
-    if (!_inTransaction && !_batchMode && wal != null) await wal.beginTransaction();
+    final hasWal = !_inTransaction && !_batchMode && wal != null;
+    if (hasWal) await wal.beginTransaction();
+    
     try {
       final id = _nextId++;
       final data = _serialize(doc, id: id);
       final targetStorage = dataStorage ?? storage;
       final offset = _dataOffset;
 
-      await targetStorage.write(offset, data);
+      // OPTIMIZATION: Use sync write when possible for better performance
+      if (!targetStorage.writeSync(offset, data)) {
+        await targetStorage.write(offset, data);
+      }
 
       if (_batchMode) {
         _batchEntries.add(MapEntry(id, offset));
@@ -285,12 +344,10 @@ class FastDB {
         await _primaryIndex.insert(id, offset);
       }
 
-      if (dataStorage != null) {
-        _dataOffset += data.length;
-      } else {
-        _dataOffset = storage.sizeSync ?? await storage.size;
-      }
+      // OPTIMIZATION: Always increment offset directly instead of querying storage size
+      _dataOffset += data.length;
 
+      // OPTIMIZATION: Only flush and save header when storage requires it
       if (!_batchMode && storage.needsExplicitFlush) {
         await targetStorage.flush();
         await storage.flush();
@@ -299,10 +356,10 @@ class FastDB {
 
       if (doc is Map<String, dynamic>) _indexDocument(id, doc);
       if (!_batchMode) _notifyWatchers(doc);
-      if (!_inTransaction && !_batchMode && wal != null) await wal.commit();
+      if (hasWal) await wal.commit();
       return id;
     } catch (e) {
-      if (!_inTransaction && !_batchMode && wal != null) await wal.rollback();
+      if (hasWal) await wal.rollback();
       rethrow;
     }
   }
@@ -312,7 +369,7 @@ class FastDB {
 
   Future<void> _putImpl(int id, dynamic value) async {
     final oldOffset = await _primaryIndex.search(id);
-    if (oldOffset != null) _deletedOffsets.add(oldOffset);
+    if (oldOffset != null) _deletedCount++;
 
     final wal = _wal;
     if (!_inTransaction && wal != null) await wal.beginTransaction();
@@ -324,11 +381,8 @@ class FastDB {
         await targetStorage.write(offset, data);
       }
       if (storage.needsExplicitFlush) await targetStorage.flush();
-      if (dataStorage != null) {
-        _dataOffset += data.length;
-      } else {
-        _dataOffset = storage.sizeSync ?? await storage.size;
-      }
+      // OPTIMIZATION: Always increment offset directly instead of querying storage size
+      _dataOffset += data.length;
       await _primaryIndex.insert(id, offset);
       if (id >= _nextId) _nextId = id + 1;
       if (storage.needsExplicitFlush) {
@@ -356,11 +410,14 @@ class FastDB {
     final serializedDocs = <Uint8List>[];
 
     var state = _BatchState.serialize;
-    bool done = false;
+    bool done = false
 
-    while (!done) {
-      switch (state) {
-        case _BatchState.serialize:
+;
+
+    try {
+      while (!done) {
+        switch (state) {
+          case _BatchState.serialize:
           for (int i = 0; i < docs.length; i++) {
             final doc = docs[i];
             final id = _nextId++;
@@ -383,8 +440,7 @@ class FastDB {
             }
             _batchEntries.add(MapEntry(id, offset));
             _dataOffset += data.length;
-            final doc = docs[i];
-            if (doc is Map<String, dynamic>) _indexDocument(id, doc);
+            // OPTIMIZATION: Defer secondary indexing until after primary B-Tree bulkLoad
             if (_runningOnWeb && i > 0 && i % 500 == 0) await Future.delayed(Duration.zero);
           }
           state = _BatchState.indexing;
@@ -393,6 +449,14 @@ class FastDB {
         case _BatchState.indexing:
           await _primaryIndex.bulkLoad(_batchEntries);
           _batchEntries.clear();
+          
+          // OPTIMIZATION: Index all documents after B-Tree is built
+          for (int i = 0; i < docs.length; i++) {
+            final doc = docs[i];
+            final id = ids[i];
+            if (doc is Map<String, dynamic>) _indexDocument(id, doc);
+          }
+          
           state = _BatchState.finish;
           break;
 
@@ -413,13 +477,23 @@ class FastDB {
           }
           done = true;
           break;
+        }
       }
+    } catch (e) {
+      // BUG FIX: ensure batch state is always cleaned up on exception to
+      // prevent the database from being permanently stuck in batch mode.
+      _batchMode = false;
+      _batchEntries.clear();
+      _disableWriteBehind();
+      if (!_inTransaction && _wal != null) await _wal!.rollback();
+      rethrow;
     }
     return ids;
   }
 
   Future<void> beginBatch() async {
     _batchMode = true;
+    _enableWriteBehind(); // Enable write-behind mode for faster B-Tree operations
   }
 
   Future<void> commitBatch() async {
@@ -435,6 +509,7 @@ class FastDB {
     }
 
     _batchMode = false;
+    _disableWriteBehind(); // Disable write-behind mode
     await _pageManager.flushDirty();
     await dataStorage?.flush();
     await storage.flush();
@@ -471,7 +546,7 @@ class FastDB {
     final wal = _wal;
     if (!_inTransaction && wal != null) await wal.beginTransaction();
     try {
-      if (oldOffset != null) _deletedOffsets.add(oldOffset);
+      if (oldOffset != null) _deletedCount++;
 
       for (final idx in _secondaryIndexes.values) {
         idx.remove(id, existing[idx.fieldName]);
@@ -485,11 +560,8 @@ class FastDB {
         await targetStorage.write(offset, data);
       }
 
-      if (dataStorage != null) {
-        _dataOffset += data.length;
-      } else {
-        _dataOffset = storage.sizeSync ?? await storage.size;
-      }
+      // OPTIMIZATION: Always increment offset directly instead of querying storage size
+      _dataOffset += data.length;
 
       await _primaryIndex.insert(id, offset);
       _indexDocument(id, merged);
@@ -536,6 +608,13 @@ class FastDB {
 
   /// Executes [fn] as an atomic transaction.
   Future<T> transaction<T>(Future<T> Function() fn) {
+    if (_inTransaction) {
+      // BUG FIX: nested calls would corrupt savepoints and rollback state.
+      // Callers should flatten all operations into a single transaction().
+      throw StateError(
+          'FastDB: Nested transactions are not supported. '
+          'Flatten concurrent operations into a single transaction() call.');
+    }
     return _exclusive(() async {
       _inTransaction = true;
       final wal = _wal;
@@ -559,10 +638,13 @@ class FastDB {
       } catch (e) {
         if (wal != null) await wal.rollback();
         _batchMode = false;
+        _disableWriteBehind(); // BUG FIX: Ensure write-behind is disabled on rollback
+        _batchEntries.clear(); // BUG FIX: Clear any pending batch entries
         _nextId = savedNextId;
         _dataOffset = savedDataOffset;
         _primaryIndex.rootPage = savedRootPage;
         _pageManager.clearLruCache();
+        _pageManager.clearDirtyPages(); // BUG FIX: Clear dirty pages on rollback
         _primaryIndex.clearNodeCache();
         if (_secondaryIndexes.isNotEmpty) await _rebuildSecondaryIndexes();
         rethrow;
@@ -576,15 +658,29 @@ class FastDB {
 
   /// Get by primary key — O(log n).
   Future<dynamic> findById(int id) async {
+    if (_isClosed) {
+      throw StateError('Cannot perform operations on a closed database.');
+    }
+    
+    // OPTIMIZATION: Try sync path first - nearly always succeeds with hot cache
     final syncOffset = _primaryIndex.searchSync(id);
     if (syncOffset != null) {
       if (dataStorage == null && syncOffset < PageManager.pageSize) return null;
       final syncDoc = _readAtSync(syncOffset);
       if (syncDoc != null) return syncDoc;
     }
+    
+    // Fallback to async path
     final offset = await _primaryIndex.search(id);
     if (offset == null) return null;
     if (dataStorage == null && offset < PageManager.pageSize) return null;
+    
+    // Try sync read for small offsets (recently written data likely in OS cache)
+    if (offset < 100000) {
+      final doc = _readAtSync(offset);
+      if (doc != null) return doc;
+    }
+    
     return _readAt(offset);
   }
 
@@ -717,11 +813,22 @@ class FastDB {
   // ─── Reactive Watchers ────────────────────────────────────────────────────
 
   Stream<List<int>> watch(String field) {
-    final ctrl = _watchers.putIfAbsent(
-      field,
-      () => StreamController<List<int>>.broadcast(),
-    );
-    return ctrl.stream;
+    if (!_watchers.containsKey(field)) {
+      // BUG FIX: use onCancel to remove the controller from _watchers once
+      // all listeners unsubscribe, preventing StreamControllers from
+      // accumulating indefinitely in long-running applications.
+      late StreamController<List<int>> ctrl;
+      ctrl = StreamController<List<int>>.broadcast(
+        onCancel: () {
+          if (!ctrl.hasListener) {
+            ctrl.close();
+            _watchers.remove(field);
+          }
+        },
+      );
+      _watchers[field] = ctrl;
+    }
+    return _watchers[field]!.stream;
   }
 
   void _notifyWatchers(dynamic doc) {
@@ -772,10 +879,20 @@ class FastDB {
     }
     final body = fullData.sublist(4, 4 + length);
     if (body.isNotEmpty && (body[0] == 123 || body[0] == 91)) {
-      return FastSerializer.deserialize(fullData);
+      final doc = FastSerializer.deserialize(fullData);
+      // Restore original 'id' field if it was preserved (e.g., from Firebase)
+      if (doc is Map && doc.containsKey('_originalId')) {
+        doc['id'] = doc.remove('_originalId');
+      }
+      return doc;
     }
     final reader = FastBinaryReader(body);
-    return _registry.read(reader);
+    final doc = _registry.read(reader);
+    // Restore original 'id' field if it was preserved (e.g., from Firebase)
+    if (doc is Map && doc.containsKey('_originalId')) {
+      doc['id'] = doc.remove('_originalId');
+    }
+    return doc;
   }
 
   Future<dynamic> _readAt(int offset) async {
@@ -792,27 +909,58 @@ class FastDB {
           'FastDB: Document at offset $offset has length $length bytes '
           '(exceeds 10 MB). This likely indicates file corruption.');
     }
+    // BUG FIX: read 4 extra bytes for the trailing CRC32 checksum.
+    final int totalSize = 4 + length + 4;
     final Uint8List fullData;
-    if (4 + length <= chunk.length) {
+    if (totalSize <= chunk.length) {
       fullData = chunk;
     } else {
-      fullData = await targetStorage.read(offset, 4 + length);
+      fullData = await targetStorage.read(offset, totalSize);
+    }
+    // Verify CRC — same check as the sync path (_readAtSync).
+    if (fullData.length >= totalSize) {
+      final storedCrc = _readInt32(fullData, 4 + length);
+      if (storedCrc != _crc32(fullData.sublist(4, 4 + length))) return null;
     }
     final body = fullData.sublist(4, 4 + length);
     if (body.isNotEmpty && (body[0] == 123 || body[0] == 91)) {
-      return FastSerializer.deserialize(fullData);
+      final doc = FastSerializer.deserialize(fullData);
+      // Restore original 'id' field if it was preserved (e.g., from Firebase)
+      if (doc is Map && doc.containsKey('_originalId')) {
+        doc['id'] = doc.remove('_originalId');
+      }
+      return doc;
     }
     final reader = FastBinaryReader(body);
-    return _registry.read(reader);
+    final doc = _registry.read(reader);
+    // Restore original 'id' field if it was preserved (e.g., from Firebase)
+    if (doc is Map && doc.containsKey('_originalId')) {
+      doc['id'] = doc.remove('_originalId');
+    }
+    return doc;
   }
 
   Uint8List _serialize(dynamic doc, {int? id}) {
     final Uint8List payload;
     if (doc is Map) {
-      final map = Map<String, dynamic>.from(doc as Map<String, dynamic>);
-      if (id != null) map['id'] = id;
+      Map<String, dynamic> map;
+      final docMap = doc as Map<String, dynamic>;
+      
+      // OPTIMIZATION: Avoid Map.from() copy if we don't need to modify
+      if (id != null && docMap['id'] != id) {
+        map = Map<String, dynamic>.from(docMap);
+        // Preserve original 'id' field (e.g., from Firebase) before overwriting
+        if (docMap.containsKey('id')) {
+          map['_originalId'] = docMap['id'];
+        }
+        map['id'] = id;
+      } else {
+        map = docMap;
+      }
+      
       payload = FastSerializer.serialize(map);
-    } else {
+    } else if (_registry.getTypeId(doc.runtimeType) != null) {
+      // Registered TypeAdapter path — fast binary format.
       final writer = FastBinaryWriter();
       _registry.write(writer, doc);
       final body = writer.result;
@@ -823,6 +971,24 @@ class FastDB {
       tmp[3] = (body.length >> 24) & 0xFF;
       tmp.setRange(4, 4 + body.length, body);
       payload = tmp;
+    } else {
+      // No TypeAdapter registered — fall back to JSON so the data is always
+      // recoverable. Try toJson() first (model classes), then toString().
+      Map<String, dynamic> map;
+      try {
+        final json = (doc as dynamic).toJson();
+        map = Map<String, dynamic>.from(json as Map);
+      } catch (_) {
+        map = {'value': doc.toString(), 'runtimeType': doc.runtimeType.toString()};
+      }
+      // Preserve original 'id' field (e.g., from Firebase) before overwriting
+      if (id != null) {
+        if (map.containsKey('id') && map['id'] != id) {
+          map['_originalId'] = map['id'];
+        }
+        map['id'] = id;
+      }
+      payload = FastSerializer.serialize(map);
     }
     final bodySlice = payload.sublist(4);
     final crc = _crc32(bodySlice);
@@ -950,7 +1116,7 @@ class FastDB {
           idx.removeById(id);
         }
       }
-      _deletedOffsets.add(offset);
+      _deletedCount++;
       if (!_batchMode) await _saveHeader();
       if (!_inTransaction && wal != null) await wal.commit();
       if (_autoCompactThreshold > 0 && !_inTransaction && !_batchMode) {
@@ -963,7 +1129,10 @@ class FastDB {
     }
   }
 
-  final Set<int> _deletedOffsets = {};
+  /// Count of documents deleted or overwritten since last compact().
+  /// Used by auto-compact threshold logic. A Set<int> was previously used here
+  /// but caused unbounded memory growth under heavy delete/update loads.
+  int _deletedCount = 0;
 
   /// Deletes all documents matching [queryFn] in a single atomic transaction.
   Future<int> deleteWhere(List<int> Function(QueryBuilder q) queryFn) =>
@@ -992,10 +1161,15 @@ class FastDB {
   Future<void> _maybeAutoCompact() async {
     if (_autoCompactThreshold <= 0) return;
     final liveIds = await _primaryIndex.rangeSearch(1, _nextId - 1);
-    final deleted = _deletedOffsets.length;
+    final deleted = _deletedCount;
     final total = liveIds.length + deleted;
     if (total == 0) return;
-    if (deleted / total >= _autoCompactThreshold) await _compactImpl();
+    if (deleted / total >= _autoCompactThreshold) {
+      await _compactImpl();
+      // BUG FIX: Reset _deletedCount after successful compaction to prevent
+      // infinite re-triggering of auto-compact on every subsequent operation.
+      _deletedCount = 0;
+    }
   }
 
   // ─── Compact (Vacuum) ──────────────────────────────────────────────────────
@@ -1012,24 +1186,60 @@ class FastDB {
       if (doc != null) docs[id] = doc;
       if (i > 0 && i % 250 == 0) await Future.delayed(Duration.zero);
     }
-    final targetStorage = dataStorage ?? storage;
-    final int writeStart = dataStorage != null ? 0 : _dataOffset;
-    int writePos = writeStart;
-    int i = 0;
-    for (final entry in docs.entries) {
-      final data = _serialize(entry.value, id: entry.key);
-      await targetStorage.write(writePos, data);
-      await _primaryIndex.insert(entry.key, writePos);
-      writePos += data.length;
-      if (i > 0 && i % 250 == 0) await Future.delayed(Duration.zero);
-      i++;
+
+    if (dataStorage != null) {
+      // ── Dual-file mode: overwrite data file from scratch and truncate ────────
+      int writePos = 0;
+      int i = 0;
+      for (final entry in docs.entries) {
+        final data = _serialize(entry.value, id: entry.key);
+        await dataStorage!.write(writePos, data);
+        await _primaryIndex.insert(entry.key, writePos);
+        writePos += data.length;
+        if (i > 0 && i % 250 == 0) await Future.delayed(Duration.zero);
+        i++;
+      }
+      _dataOffset = writePos;
+      await dataStorage!.truncate(_dataOffset);
+      await _pageManager.flushDirty();
+      _pageManager.clearCache();
+      _primaryIndex.clearNodeCache();
+    } else {
+      // ── Single-file mode: full rebuild ────────────────────────────────────
+      // B-Tree pages and document data share the same file interleaved, so there
+      // is no simple truncation point. The only correct strategy is to truncate
+      // down to just the header page and rebuild the B-Tree + doc zone from scratch.
+      await storage.truncate(PageManager.pageSize); // keep only the header page
+      _pageManager.clearCache();                    // discard all cached/dirty B-Tree pages
+      _primaryIndex.clearNodeCache();
+      _primaryIndex.rootPage = null;                // force a fresh root on first insert
+      for (final idx in _secondaryIndexes.values) idx.clear();
+
+      // Create the initial sentinel entry (id=0, offset=0) — same as open().
+      await _primaryIndex.insert(0, 0);
+      // Mark header dirty so clean-flag byte is written below.
+      if (storage.needsExplicitFlush) {
+        await storage.write(24, Uint8List(1)); // dirty flag — forces index rebuild on next open
+      }
+      _dataOffset = await storage.size;
+
+      int i = 0;
+      for (final entry in docs.entries) {
+        final data = _serialize(entry.value, id: entry.key);
+        await storage.write(_dataOffset, data);
+        await _primaryIndex.insert(entry.key, _dataOffset);
+        if (entry.value is Map<String, dynamic>) {
+          _indexDocument(entry.key, entry.value as Map<String, dynamic>);
+        }
+        // Track actual file end including any new B-Tree pages allocated during insert.
+        _dataOffset = storage.sizeSync ?? await storage.size;
+        if (i > 0 && i % 250 == 0) await Future.delayed(Duration.zero);
+        i++;
+      }
+      await _pageManager.flushDirty();
     }
-    _dataOffset = writePos;
-    if (dataStorage != null) await dataStorage!.truncate(_dataOffset);
-    await _pageManager.flushDirty();
-    _pageManager.clearCache();
-    _primaryIndex.clearNodeCache();
-    _deletedOffsets.clear();
+
+    _deletedCount = 0;
     await _saveHeader();
     await storage.flush();
     if (dataStorage != null) await dataStorage!.flush();
@@ -1069,7 +1279,7 @@ class FastDB {
       if (i > 0 && i % 250 == 0) await Future.delayed(Duration.zero);
       i++;
     }
-    _deletedOffsets.clear();
+    _deletedCount = 0;
     if (dataStorage != null) await dataStorage!.truncate(_dataOffset);
     await storage.flush();
     if (dataStorage != null) await dataStorage!.flush();

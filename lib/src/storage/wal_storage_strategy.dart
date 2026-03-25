@@ -33,9 +33,10 @@ class WalStorageStrategy implements StorageStrategy {
   // In-progress transaction
   bool _txOpen = false;
   int _txId = 0;
-  int _walPos = 0;
-  int _txStartPos = 0;
   final List<_WalEntry> _txEntries = [];
+
+  // Current write position in the WAL
+  int _walPos = 0;
 
   WalStorageStrategy({
     required StorageStrategy main,
@@ -120,9 +121,15 @@ class WalStorageStrategy implements StorageStrategy {
 
   /// Begins a WAL transaction. Multiple writes will be atomically committed.
   Future<void> beginTransaction() async {
+    if (_txOpen) {
+      // Guard: silently rolling back un-committed entries here would cause
+      // silent data loss. Throw so callers notice the misuse.
+      throw StateError(
+          'WAL: beginTransaction() called while a transaction is already open. '
+          'Call commit() or rollback() before starting a new transaction.');
+    }
     _txOpen = true;
     _txId++;
-    _txStartPos = _walPos;
     _txEntries.clear();
   }
 
@@ -158,9 +165,7 @@ class WalStorageStrategy implements StorageStrategy {
   Future<void> rollback() async {
     _txOpen = false;
     _txEntries.clear();
-    // Truncate the WAL file to remove aborted entries from disk.
-    await _wal.truncate(_txStartPos);
-    _walPos = _txStartPos;
+    // WAL entries are ignored on next recovery since there's no COMMIT marker
   }
 
   /// Truncates the WAL after all entries have been applied to main storage.

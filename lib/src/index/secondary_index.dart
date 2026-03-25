@@ -24,6 +24,10 @@ abstract class SecondaryIndex {
   /// Returns all document IDs stored in this index.
   List<int> all();
 
+  /// Returns the total number of indexed (docId, value) pairs.
+  /// Used by the query planner for cost estimation.
+  int get size;
+
   /// Clears all entries from this index.
   /// Called by FastDB during crash recovery to rebuild the index from documents.
   void clear();

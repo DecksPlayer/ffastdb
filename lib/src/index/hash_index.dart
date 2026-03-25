@@ -3,23 +3,67 @@ import 'dart:typed_data';
 import 'secondary_index.dart';
 
 // Value type tags for binary serialization
-const int _tInt = 1;
+const int _tInt = 1;    // legacy: 32-bit int — kept for reading old index blobs
 const int _tDouble = 2;
 const int _tString = 3;
 const int _tBool = 4;
+const int _tInt64 = 5;  // 64-bit int — used for all new writes
 
 /// In-memory hash-based secondary index with persistence support.
-/// Fast O(1) lookups. Serialized to a compact binary sidecar on close.
+/// Fast O(1) lookups using optimized hash buckets for Isar-level performance.
+/// Uses FNV-1a hash for better distribution and reduced collisions.
 class HashIndex implements SecondaryIndex {
   @override
   final String fieldName;
 
-  final Map<dynamic, List<int>> _map = {};
+  // Optimized bucket-based storage with better distribution
+  static const int _initialBuckets = 256; // Power of 2 for fast modulo
+  late List<List<_HashEntry>> _buckets;
+  int _bucketCount = _initialBuckets;
+  
   /// Reverse map: docId → fieldValue for O(1) removeById.
   final Map<int, dynamic> _reverse = {};
   int _size = 0;
 
-  HashIndex(this.fieldName);
+  HashIndex(this.fieldName) {
+    _buckets = List.generate(_bucketCount, (_) => <_HashEntry>[]);
+  }
+
+  // ─── FNV-1a Hash Function ─────────────────────────────────────────────────
+  
+  /// Fast FNV-1a hash with better distribution than Dart's default hashCode
+  int _hash(dynamic value) {
+    if (value == null) return 0;
+    
+    // FNV-1a constants
+    const int fnvPrime = 16777619;
+    int hash = 2166136261;
+    
+    if (value is int) {
+      hash ^= value & 0xFF;
+      hash *= fnvPrime;
+      hash ^= (value >> 8) & 0xFF;
+      hash *= fnvPrime;
+      hash ^= (value >> 16) & 0xFF;
+      hash *= fnvPrime;
+      hash ^= (value >> 24) & 0xFF;
+      hash *= fnvPrime;
+    } else if (value is String) {
+      for (int i = 0; i < value.length; i++) {
+        hash ^= value.codeUnitAt(i);
+        hash *= fnvPrime;
+      }
+    } else {
+      // Fallback to default hashCode for other types
+      final code = value.hashCode;
+      hash ^= code & 0xFF;
+      hash *= fnvPrime;
+      hash ^= (code >> 8) & 0xFF;
+      hash *= fnvPrime;
+    }
+    
+    return hash & 0x7FFFFFFF; // Keep positive
+  }
 
   // ─── Index Operations ─────────────────────────────────────────────────────
 
@@ -30,19 +74,54 @@ class HashIndex implements SecondaryIndex {
   @override
   void add(int docId, dynamic fieldValue) {
     if (fieldValue == null) return;
-    _map.putIfAbsent(fieldValue, () => <int>[]).add(docId);
+    
+    final hashCode = _hash(fieldValue);
+    final bucketIdx = hashCode & (_bucketCount - 1); // Fast modulo for power of 2
+    final bucket = _buckets[bucketIdx];
+    
+    // Check if value already exists in bucket
+    for (final entry in bucket) {
+      if (_equals(entry.value, fieldValue)) {
+        if (!entry.docIds.contains(docId)) {
+          entry.docIds.add(docId);
+          _reverse[docId] = fieldValue;
+          _size++;
+        }
+        return;
+      }
+    }
+    
+    // Add new entry
+    bucket.add(_HashEntry(fieldValue, [docId]));
     _reverse[docId] = fieldValue;
     _size++;
+    
+    // Auto-resize if load factor > 0.75
+    if (_size > _bucketCount * 0.75) {
+      _resize();
+    }
   }
 
   @override
   void remove(int docId, [dynamic fieldValue]) {
     if (fieldValue == null) return;
-    final list = _map[fieldValue];
-    if (list != null && list.remove(docId)) {
-      _size--;
-      _reverse.remove(docId);
-      if (list.isEmpty) _map.remove(fieldValue);
+    
+    final hashCode = _hash(fieldValue);
+    final bucketIdx = hashCode & (_bucketCount - 1);
+    final bucket = _buckets[bucketIdx];
+    
+    for (int i = 0; i < bucket.length; i++) {
+      final entry = bucket[i];
+      if (_equals(entry.value, fieldValue)) {
+        if (entry.docIds.remove(docId)) {
+          _size--;
+          _reverse.remove(docId);
+          if (entry.docIds.isEmpty) {
+            bucket.removeAt(i);
+          }
+        }
+        return;
+      }
     }
   }
 
@@ -54,31 +133,73 @@ class HashIndex implements SecondaryIndex {
 
   @override
   void clear() {
-    _map.clear();
+    _buckets = List.generate(_bucketCount, (_) => <_HashEntry>[]);
     _reverse.clear();
     _size = 0;
   }
 
   @override
-  List<int> lookup(dynamic value) => _map[value] ?? [];
+  List<int> lookup(dynamic value) {
+    if (value == null) return [];
+    
+    final hashCode = _hash(value);
+    final bucketIdx = hashCode & (_bucketCount - 1);
+    final bucket = _buckets[bucketIdx];
+    
+    for (final entry in bucket) {
+      if (_equals(entry.value, value)) {
+        return entry.docIds;
+      }
+    }
+    return [];
+  }
+
+  /// Resize hash table when load factor is too high
+  void _resize() {
+    final oldBuckets = _buckets;
+    _bucketCount *= 2;
+    _buckets = List.generate(_bucketCount, (_) => <_HashEntry>[]);
+    
+    for (final bucket in oldBuckets) {
+      for (final entry in bucket) {
+        final hashCode = _hash(entry.value);
+        final newBucketIdx = hashCode & (_bucketCount - 1);
+        _buckets[newBucketIdx].add(entry);
+      }
+    }
+  }
+
+  /// Fast equality check
+  bool _equals(dynamic a, dynamic b) {
+    if (identical(a, b)) return true;
+    if (a.runtimeType != b.runtimeType) return false;
+    return a == b;
+  }
 
   @override
   List<int> range(dynamic low, dynamic high) {
     final result = <int>[];
-    for (final entry in _map.entries) {
-      try {
-        final v = entry.key as Comparable;
-        if (v.compareTo(low) >= 0 && v.compareTo(high) <= 0) {
-          result.addAll(entry.value);
-        }
-      } catch (_) {}
+    for (final bucket in _buckets) {
+      for (final entry in bucket) {
+        try {
+          final v = entry.value as Comparable;
+          if (v.compareTo(low) >= 0 && v.compareTo(high) <= 0) {
+            result.addAll(entry.docIds);
+          }
+        } catch (_) {}
+      }
     }
     return result;
   }
 
   @override
   List<MapEntry<dynamic, List<int>>> sorted({bool descending = false}) {
-    final entries = _map.entries.toList();
+    final entries = <MapEntry<dynamic, List<int>>>[];
+    for (final bucket in _buckets) {
+      for (final entry in bucket) {
+        entries.add(MapEntry(entry.value, entry.docIds));
+      }
+    }
     try {
       entries.sort((a, b) {
         final ca = a.key as Comparable;
@@ -92,16 +213,19 @@ class HashIndex implements SecondaryIndex {
   @override
   List<int> all() {
     final result = <int>[];
-    for (final list in _map.values) {
-      result.addAll(list);
+    for (final bucket in _buckets) {
+      for (final entry in bucket) {
+        result.addAll(entry.docIds);
+      }
     }
     return result;
   }
 
+  @override
   int get size => _size;
 
   @override
-  String toString() => 'HashIndex($fieldName, $_size entries)';
+  String toString() => 'HashIndex($fieldName, $_size entries, $_bucketCount buckets)';
 
   // ─── Persistence ──────────────────────────────────────────────────────────
 
@@ -121,14 +245,22 @@ class HashIndex implements SecondaryIndex {
     final nameBytes = utf8.encode(fieldName);
     _writeInt32(buf, nameBytes.length);
     buf.add(nameBytes);
-    _writeInt32(buf, _map.length);
+    
+    // Count total entries
+    int totalEntries = 0;
+    for (final bucket in _buckets) {
+      totalEntries += bucket.length;
+    }
+    _writeInt32(buf, totalEntries);
 
-    for (final entry in _map.entries) {
-      _writeValue(buf, entry.key);
-      final ids = entry.value.toList();
-      _writeInt32(buf, ids.length);
-      for (final id in ids) {
-        _writeInt32(buf, id);
+    for (final bucket in _buckets) {
+      for (final entry in bucket) {
+        _writeValue(buf, entry.value);
+        final ids = entry.docIds.toList();
+        _writeInt32(buf, ids.length);
+        for (final id in ids) {
+          _writeInt32(buf, id);
+        }
       }
     }
     return buf.toBytes();
@@ -158,7 +290,14 @@ class HashIndex implements SecondaryIndex {
 
       switch (tag) {
         case _tInt:
+          // Legacy 32-bit format — read 4 bytes for backward compatibility
           value = readInt32();
+          break;
+        case _tInt64:
+          // Current 64-bit format
+          final lo = readInt32();
+          final hi = readInt32();
+          value = lo | (hi << 32);
           break;
         case _tDouble:
           final bd = ByteData.view(bytes.buffer, bytes.offsetInBytes + off, 8);
@@ -190,8 +329,8 @@ class HashIndex implements SecondaryIndex {
 
   void _writeValue(BytesBuilder buf, dynamic v) {
     if (v is int) {
-      buf.addByte(_tInt);
-      _writeInt32(buf, v);
+      buf.addByte(_tInt64);
+      _writeInt64(buf, v);
     } else if (v is double) {
       buf.addByte(_tDouble);
       final bd = ByteData(8);
@@ -214,4 +353,23 @@ class HashIndex implements SecondaryIndex {
     buf.addByte((v >> 16) & 0xFF);
     buf.addByte((v >> 24) & 0xFF);
   }
+
+  void _writeInt64(BytesBuilder buf, int v) {
+    buf.addByte(v & 0xFF);
+    buf.addByte((v >> 8) & 0xFF);
+    buf.addByte((v >> 16) & 0xFF);
+    buf.addByte((v >> 24) & 0xFF);
+    buf.addByte((v >> 32) & 0xFF);
+    buf.addByte((v >> 40) & 0xFF);
+    buf.addByte((v >> 48) & 0xFF);
+    buf.addByte((v >> 56) & 0xFF);
+  }
+}
+
+/// Internal bucket entry for optimized hash storage
+class _HashEntry {
+  final dynamic value;
+  final List<int> docIds;
+  
+  _HashEntry(this.value, this.docIds);
 }

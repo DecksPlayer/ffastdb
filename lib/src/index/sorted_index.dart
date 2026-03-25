@@ -210,6 +210,7 @@ class SortedIndex implements SecondaryIndex {
     return Uint32List.sublistView(_docIds, 0, _length).toList();
   }
 
+  @override
   int get size => _length;
 
   /// Cardinality — number of distinct values. Faster dynamic calculation.

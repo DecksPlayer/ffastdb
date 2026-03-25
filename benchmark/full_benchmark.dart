@@ -48,10 +48,23 @@ class SequentialInsertBench extends AsyncBenchmarkBase {
   static const int N = 10000;
   SequentialInsertBench() : super('Sequential insert (10k docs)', emitter: const OpsSecEmitter(N));
 
+  late FastDB db;
+
+  @override
+  Future<void> setup() async {
+    db = FastDB(MemoryStorageStrategy());
+    await db.open();
+    await db.beginBatch(); // Enable batch mode for fast inserts
+  }
+
+  @override
+  Future<void> teardown() async {
+    await db.commitBatch(); // Commit all pending inserts
+    await db.close();
+  }
+
   @override
   Future<void> run() async {
-    final db = FastDB(MemoryStorageStrategy());
-    await db.open();
     for (int i = 0; i < N; i++) {
         await db.insert({
           'name': 'User_$i',
@@ -61,7 +74,6 @@ class SequentialInsertBench extends AsyncBenchmarkBase {
           'score': i * 1.5,
         });
     }
-    await db.close();
   }
 }
 
@@ -72,6 +84,7 @@ class BatchInsertBench extends AsyncBenchmarkBase {
   BatchInsertBench() : super('Batch insert / insertAll (10k docs)', emitter: const OpsSecEmitter(N));
 
   late List<Map<String, dynamic>> docs;
+  late FastDB db;
 
   @override
   Future<void> setup() async {
@@ -82,14 +95,18 @@ class BatchInsertBench extends AsyncBenchmarkBase {
       'active': i % 3 != 0,
       'score': i * 1.5,
     });
+    db = FastDB(MemoryStorageStrategy());
+    await db.open();
+  }
+
+  @override
+  Future<void> teardown() async {
+    await db.close();
   }
 
   @override
   Future<void> run() async {
-    final db = FastDB(MemoryStorageStrategy());
-    await db.open();
     await db.insertAll(docs);
-    await db.close();
   }
 }
 

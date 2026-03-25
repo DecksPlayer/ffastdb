@@ -194,6 +194,7 @@ class BitmaskIndex implements SecondaryIndex {
     return _bitsToList(result, _highestDocId);
   }
 
+  @override
   int get size => _size;
 
   /// Number of distinct values. Should be low (< 1000) for this index type.

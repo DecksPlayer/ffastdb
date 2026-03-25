@@ -6,7 +6,7 @@ import 'package:ffastdb/src/storage/wal_storage_strategy.dart';
 /// Minimal FastDB example showing the core API.
 void main() async {
   final dir = Directory.systemTemp.createTempSync('fastdb_example_');
-  final db = FastDB(
+  final db = await FfastDb.init(
     WalStorageStrategy(
       main: IoStorageStrategy('${dir.path}/mydb.fdb'),
       wal: IoStorageStrategy('${dir.path}/mydb.fdb.wal'),
@@ -16,8 +16,6 @@ void main() async {
   // ── Register secondary indexes before open() ─────────────────────────────
   db.addSortedIndex('age');   // range / sort queries
   db.addIndex('city');        // O(1) equality lookup
-
-  await db.open();
 
   // ── Insert ───────────────────────────────────────────────────────────────
   final aliceId = await db.insert({'name': 'Alice', 'age': 30, 'city': 'Paris'});
@@ -83,7 +81,7 @@ void main() async {
   await subscription.cancel();
 
   // ── Close (persists everything) ───────────────────────────────────────────
-  await db.close();
+  await FfastDb.disposeInstance();
   print('Done.');
 
   // Clean up temp directory

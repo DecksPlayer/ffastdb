@@ -2,10 +2,12 @@ import 'dart:typed_data';
 
 /// Maximum keys per B-Tree node. Order = T means max 2T-1 keys per node.
 /// With 4096 page size: header(5) + maxKeys*4 + maxVals*8 <= 4096
-/// Using order 100: 199 keys * 4 + 200 vals * 8 = 796 + 1600 = 2396 bytes  
-const int kBTreeOrder = 100;
-const int kMaxKeys = 2 * kBTreeOrder - 1; // 199
-const int kMinKeys = kBTreeOrder - 1; // 99
+/// Optimized for Isar-level performance with higher branching factor:
+/// Using order 128: 255 keys * 4 + 256 vals * 8 = 1020 + 2048 = 3068 bytes  
+/// Higher branching = fewer levels = faster lookups (O(log_256 N) vs O(log_200 N))
+const int kBTreeOrder = 128;
+const int kMaxKeys = 2 * kBTreeOrder - 1; // 255
+const int kMinKeys = kBTreeOrder - 1; // 127
 
 /// Represents a node in the B-Tree.
 /// Layout in 4096-byte page:
@@ -55,16 +57,6 @@ class BTreeNode {
   }
 
   factory BTreeNode.deserialize(int pageIndex, Uint8List data) {
-    // Basic sanity check: uninitialized pages (all zeros) are not valid nodes.
-    // We check the first 5 bytes (leaf flag + count).
-    if (data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 0 && data[4] == 0) {
-      return BTreeNode(
-        pageIndex: pageIndex,
-        isLeaf: true,
-        keys: [],
-        values: [],
-      );
-    }
     // Use data.offsetInBytes so the view is correct even for non-zero-base slices.
     final bd = ByteData.view(data.buffer, data.offsetInBytes, data.lengthInBytes);
     final isLeaf = bd.getUint8(0) == 1;

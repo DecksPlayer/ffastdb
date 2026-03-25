@@ -5,3 +5,15 @@ benchmark_*.txt
 benchmark_*.csv
 benchmark_*.png
 debug_test.dart.ignore
+
+# Flutter generated / build artifacts
+**/build/
+**/.flutter-plugins
+**/.flutter-plugins-dependencies
+**/flutter_export_environment.sh
+**/GeneratedPluginRegistrant.*
+**/generated_plugin_registrant.*
+**/*.g.dart
+**/*.freezed.dart
+**/*.mocks.dart
+**/pubspec.lock

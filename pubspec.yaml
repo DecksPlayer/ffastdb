@@ -1,18 +1,19 @@
 name: ffastdb
 description: A high-performance, pure-Dart embedded NoSQL database with B-Tree indexes, WAL crash recovery, and reactive queries.
-version: 0.0.1
-repository: https://github.com/gonojan/fastdb
+version: 0.0.11
+repository: https://github.com/gonojuarez/ffastdb
 
 environment:
-  sdk: ^3.11.1
+  sdk: ">=3.11.1 <4.0.0"
 
 # Add regular dependencies here.
 dependencies:
   path: ^1.9.0
+  meta: ">=1.16.0 <2.0.0"
   
 
 dev_dependencies:
   lints: ^6.0.0
-  test: ^1.25.6
-  benchmark_harness: ^2.4.0
-  glados: ^1.1.7
+  test: ">=1.25.6 <2.0.0"
+  benchmark_harness: ">=2.4.0 <3.0.0"
+  glados: ">=1.1.7 <2.0.0"

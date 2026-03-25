@@ -98,6 +98,24 @@ class QueryBuilder {
   ///   2. Intersect (AND) results within an OR group.
   ///   3. Union (OR) results across groups.
   List<int> findIds() {
+    // ── Hot path: sortBy-only query (no filter, just sort) ──────────────────
+    // Common pattern: query().where('field').alwaysTrue().sortBy('field')
+    // If sortField matches the True condition's field, return sorted IDs directly
+    if (_orGroups.length == 1 && _sortField != null) {
+      final group = _orGroups[0];
+      if (group.length == 1) {
+        final cond = group[0];
+        if (cond is _TrueCondition && cond.field == _sortField) {
+          final index = _indexes[_sortField!];
+          if (index is SortedIndex) {
+            // Return all sorted IDs directly from the SortedIndex
+            final sortedAll = index.sortedIds(descending: _sortDesc);
+            return _paginate(sortedAll);
+          }
+        }
+      }
+    }
+    
     // ── Hot path: single AND condition, no sort, no pagination ──────────────
     // Avoids Set allocation and double evaluation; covers the most common query
     // pattern by returning the index result directly (zero copies for
@@ -145,27 +163,56 @@ class QueryBuilder {
       });
 
       // AND (intersect) within group
-      Set<int>? groupResult;
-      for (final cond in sortedConditions) {
+      // OPTIMIZATION: Use sorted lists and merge instead of Set operations
+      List<int>? groupResult;
+      for (int i = 0; i < sortedConditions.length; i++) {
+        final cond = sortedConditions[i];
         final index = _indexes[cond.field];
         if (index == null) continue; // Unindexed field → skip
 
-        final matches = cond.evaluate(index).toSet();
-
-        if (groupResult == null) {
-          groupResult = matches;
+        final matches = cond.evaluate(index);
+        
+        if (i == 0) {
+          // First condition: just convert to List
+          groupResult = matches is List<int> ? matches : matches.toList();
         } else {
-          groupResult = groupResult.intersection(matches);
-          // Short-circuit: no need to continue if already empty
-          if (groupResult.isEmpty) break;
+          // Subsequent conditions: intersect with previous results
+          if (groupResult!.isEmpty) break; // Short-circuit
+          
+          // OPTIMIZATION: For small result sets, use Set intersection
+          // For large sets, use sorted merge
+          if (groupResult.length < 1000) {
+            final matchSet = matches.toSet();
+            groupResult = groupResult.where((id) => matchSet.contains(id)).toList();
+          } else {
+            // Merge algorithm: O(n + m) instead of O(n * m)
+            final matchList = matches is List<int> ? matches : matches.toList();
+            if (!_isSorted(matchList)) matchList.sort();
+            if (!_isSorted(groupResult)) groupResult.sort();
+            
+            final result = <int>[];
+            int i = 0, j = 0;
+            while (i < groupResult.length && j < matchList.length) {
+              if (groupResult[i] == matchList[j]) {
+                result.add(groupResult[i]);
+                i++;
+                j++;
+              } else if (groupResult[i] < matchList[j]) {
+                i++;
+              } else {
+                j++;
+              }
+            }
+            groupResult = result;
+          }
         }
       }
 
-      if (groupResult != null) {
+      if (groupResult != null && groupResult.isNotEmpty) {
         if (unionResult == null) {
-          unionResult = groupResult;
+          unionResult = groupResult.toSet();
         } else {
-          unionResult = unionResult.union(groupResult);
+          unionResult.addAll(groupResult);
         }
       }
     }
@@ -174,12 +221,26 @@ class QueryBuilder {
     return _applySort(ids);
   }
 
+  /// Quick check if a list is already sorted (for optimization)
+  bool _isSorted(List<int> list) {
+    for (int i = 1; i < list.length; i++) {
+      if (list[i] < list[i - 1]) return false;
+    }
+    return true;
+  }
+
   /// Estimated result count for a condition (for CBO ordering).
+  /// Uses cheap index-level statistics to avoid evaluating the full condition twice.
   int _estimateSize(_Condition cond) {
     final index = _indexes[cond.field];
     if (index == null) return 1000000; // No index = very expensive
-    // Use the total items as a proxy — future versions can use cardinality
-    return cond.evaluate(index).length;
+    // For equals, use the exact bucket size — O(1) for HashIndex.
+    if (cond is _EqualsCondition) {
+      return index.lookup(cond.value).length;
+    }
+    // For other conditions, use total index size as a rough proxy.
+    // This avoids running the full condition evaluation a second time.
+    return index.size;
   }
 
   List<int> _applySort(List<int> ids) {
@@ -194,19 +255,32 @@ class QueryBuilder {
             // sortBy without filter — return all sorted IDs
             return _paginate(sortedAll);
           }
+          
+          // Simple and fast: use Set for O(1) lookups
           final idSet = ids.toSet();
           return _paginate(sortedAll.where((id) => idSet.contains(id)).toList());
         }
-        // Generic path: build rank map from sorted() entries
+        
+        // Generic path: build rank map and sort
         final sorted = idx.sorted(descending: _sortDesc);
         final order = <int, int>{};
         int rank = 0;
+        
         for (final entry in sorted) {
           for (final id in entry.value) {
-            order[id] = rank++;
+            order[id] = rank;
+            rank++;
           }
         }
-        ids.sort((a, b) => (order[a] ?? 0).compareTo(order[b] ?? 0));
+        
+        ids.sort((a, b) {
+          final rankA = order[a];
+          final rankB = order[b];
+          if (rankA == null && rankB == null) return 0;
+          if (rankA == null) return 1;
+          if (rankB == null) return -1;
+          return rankA.compareTo(rankB);
+        });
       }
     }
     return _paginate(ids);
@@ -366,10 +440,18 @@ class _StartsWithCondition implements _Condition {
 
   @override
   Iterable<int> evaluate(SecondaryIndex index) {
-    final results = <int>[];
-    for (final entry in index.sorted()) {
-      if (entry.key is String && (entry.key as String).startsWith(prefix)) {
-        results.addAll(entry.value);
+    List<int> results;
+    if (index is SortedIndex && prefix.isNotEmpty) {
+      // O(log n) prefix scan: use the natural lexicographic sort of SortedIndex.
+      // Upper bound '$prefix\uffff' covers all strings with this prefix for
+      // typical Unicode data (U+FFFF is larger than any common character).
+      results = List<int>.from(index.range(prefix, '$prefix\uffff'));
+    } else {
+      results = <int>[];
+      for (final entry in index.sorted()) {
+        if (entry.key is String && (entry.key as String).startsWith(prefix)) {
+          results.addAll(entry.value);
+        }
       }
     }
     if (!negated) return results;

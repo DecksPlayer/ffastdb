@@ -1,13 +1,11 @@
 import 'dart:typed_data';
 import '../storage_strategy.dart';
 
-/// Placeholder for Web storage.
-/// In a real scenario, this would use IndexedDB via package:web or dart:js_interop.
-/// Since we are in a pure Dart environment without Flutter/Web SDKs initialized,
-/// we provide a stub that can be completed in a Web environment.
+/// In-memory storage strategy for web.
 ///
-/// This implementation uses a single contiguous [Uint8List] buffer — identical
-/// to [MemoryStorageStrategy] — so that reads at any offset work correctly.
+/// Backed by a single growable [Uint8List] buffer.
+/// For persistence across page reloads use [LocalStorageStrategy] (web-only)
+/// which is selected automatically by [openDatabase].
 class WebStorageStrategy implements StorageStrategy {
   Uint8List _data = Uint8List(0);
   int _usedSize = 0;

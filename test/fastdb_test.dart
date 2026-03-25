@@ -14,12 +14,12 @@ void main() {
     late FastDB db;
 
     setUp(() async {
-      db = FastDB(MemoryStorageStrategy());
-      await db.open();
+      await FfastDb.disposeInstance();
+      db = await FfastDb.init(MemoryStorageStrategy());
     });
 
     tearDown(() async {
-      await db.close();
+      await FfastDb.disposeInstance();
     });
 
     test('insert and findById', () async {
@@ -165,8 +165,8 @@ void main() {
     late FastDB db;
 
     setUp(() async {
-      db = FastDB(MemoryStorageStrategy());
-      await db.open();
+      await FfastDb.disposeInstance();
+      db = await FfastDb.init(MemoryStorageStrategy());
     });
 
     tearDown(() => db.close());
@@ -197,8 +197,8 @@ void main() {
     late FastDB db;
 
     setUp(() async {
-      db = FastDB(MemoryStorageStrategy());
-      await db.open();
+      await FfastDb.disposeInstance();
+      db = await FfastDb.init(MemoryStorageStrategy());
     });
 
     tearDown(() => db.close());
@@ -468,8 +468,8 @@ void main() {
     late FastDB db;
 
     setUp(() async {
-      db = FastDB(MemoryStorageStrategy());
-      await db.open();
+      await FfastDb.disposeInstance();
+      db = await FfastDb.init(MemoryStorageStrategy());
     });
 
     tearDown(() => db.close());
@@ -704,7 +704,7 @@ void main() {
       await db.close(); // writes clean flag = 0x43
 
       // Corrupt the clean flag to simulate a crash (no clean close)
-      final raf = await File(path).open(mode: FileMode.writeOnlyAppend);
+      final raf = await File(path).open(mode: FileMode.write);
       await raf.setPosition(24);
       await raf.writeByte(0x00);
       await raf.close();
@@ -736,7 +736,7 @@ void main() {
       await db.close();
 
       // Dirty the clean flag so next open rebuilds indexes (stress test)
-      final raf = await File(path).open(mode: FileMode.writeOnlyAppend);
+      final raf = await File(path).open(mode: FileMode.write);
       await raf.setPosition(24);
       await raf.writeByte(0x00);
       await raf.close();
@@ -1059,4 +1059,93 @@ void main() {
       expect(plan, contains('NO_INDEX'));
     });
   });
+
+  group('Firebase ID preservation', () {
+    late FastDB db;
+
+    setUp(() async {
+      await FfastDb.disposeInstance();
+      db = await FfastDb.init(MemoryStorageStrategy());
+    });
+
+    tearDown(() async {
+      await FfastDb.disposeInstance();
+    });
+
+    test('preserves original Firebase ID when document has id field', () async {
+      // Simulate a document from Firebase with its own 'id' field
+      final firebaseDoc = {
+        'id': 'firebase_doc_12345',
+        'name': 'Alice',
+        'email': 'alice@example.com',
+        'timestamp': DateTime.now().millisecondsSinceEpoch,
+      };
+
+      // Insert the document - FastDB will assign its own numeric ID
+      final fastdbId = await db.insert(firebaseDoc);
+      expect(fastdbId, isA<int>());
+
+      // Retrieve the document
+      final retrieved = await db.findById(fastdbId);
+      expect(retrieved, isNotNull);
+
+      // Verify that the original Firebase ID is preserved
+      expect(retrieved['id'], equals('firebase_doc_12345'),
+          reason: 'Original Firebase ID should be preserved');
+      expect(retrieved['name'], equals('Alice'));
+      expect(retrieved['email'], equals('alice@example.com'));
+    });
+
+    test('preserves Firebase ID through update operations', () async {
+      final firebaseDoc = {
+        'id': 'firebase_user_xyz',
+        'name': 'Bob',
+        'age': 30,
+      };
+
+      final fastdbId = await db.insert(firebaseDoc);
+
+      // Update some fields
+      await db.update(fastdbId, {'age': 31});
+
+      final updated = await db.findById(fastdbId);
+      expect(updated['id'], equals('firebase_user_xyz'),
+          reason: 'Firebase ID should persist through updates');
+      expect(updated['age'], equals(31));
+      expect(updated['name'], equals('Bob'));
+    });
+
+    test('handles documents without id field normally', () async {
+      final doc = {
+        'name': 'Charlie',
+        'status': 'active',
+      };
+
+      final fastdbId = await db.insert(doc);
+      final retrieved = await db.findById(fastdbId);
+
+      // FastDB's internal ID should be added
+      expect(retrieved['id'], equals(fastdbId));
+      expect(retrieved['name'], equals('Charlie'));
+    });
+
+    test('preserves different types of Firebase IDs', () async {
+      // Test with various Firebase ID formats
+      final docs = [
+        {'id': 'firestore_abc123', 'type': 'string_id'},
+        {'id': 12345, 'type': 'numeric_id'},
+        {'id': 'users/uid_xyz/profile', 'type': 'path_id'},
+      ];
+
+      final ids = await db.insertAll(docs);
+
+      for (int i = 0; i < docs.length; i++) {
+        final retrieved = await db.findById(ids[i]);
+        expect(retrieved['id'], equals(docs[i]['id']),
+            reason: 'Should preserve ${docs[i]['type']}');
+      }
+    });
+  });
 }
+
+

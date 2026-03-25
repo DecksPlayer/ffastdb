@@ -44,8 +44,8 @@ void main() {
 
   group('FastDB Core Properties', () {
     Glados<Map<String, dynamic>>().test('Insert and findById should return identical document', (doc) async {
-      final db = FastDB(MemoryStorageStrategy());
-      await db.open();
+      await FfastDb.disposeInstance();
+      final db = await FfastDb.init(MemoryStorageStrategy());
 
       try {
         final id = await db.insert(doc);
@@ -62,13 +62,13 @@ void main() {
           }
         }
       } finally {
-        await db.close();
+        await FfastDb.disposeInstance();
       }
     });
 
     Glados2<Map<String, dynamic>, Map<String, dynamic>>().test('Update modifies document correctly', (doc1, updateDoc) async {
-      final db = FastDB(MemoryStorageStrategy());
-      await db.open();
+      await FfastDb.disposeInstance();
+      final db = await FfastDb.init(MemoryStorageStrategy());
 
       try {
         final id = await db.insert(doc1);
@@ -98,13 +98,13 @@ void main() {
           }
         }
       } finally {
-        await db.close();
+        await FfastDb.disposeInstance();
       }
     });
 
     Glados<Map<String, dynamic>>().test('Delete removes the document completely', (doc) async {
-      final db = FastDB(MemoryStorageStrategy());
-      await db.open();
+      await FfastDb.disposeInstance();
+      final db = await FfastDb.init(MemoryStorageStrategy());
 
       try {
         final id = await db.insert(doc);
@@ -114,7 +114,7 @@ void main() {
         final retrieved = await db.findById(id);
         expect(retrieved, isNull);
       } finally {
-        await db.close();
+        await FfastDb.disposeInstance();
       }
     });
   });
@@ -130,13 +130,14 @@ void main() {
       final path = '${tempDir.path}/db.fdb';
       final walPath = '${tempDir.path}/db.fdb.wal';
 
-      final db = FastDB(WalStorageStrategy(
+      await FfastDb.disposeInstance();
+      final db = await FfastDb.init(WalStorageStrategy(
         main: IoStorageStrategy(path),
         wal: IoStorageStrategy(walPath),
       ));
-      await db.open();
 
       final initialIds = await db.insertAll(testDocs);
+      await db.flush(); // Ensure all initial data is persisted before rollback test
       
       try {
         await db.transaction(() async {
@@ -159,7 +160,7 @@ void main() {
           expect(doc!['rolled_back'], isNull);
         }
       } finally {
-        await db.close();
+        await FfastDb.disposeInstance();
         await tempDir.delete(recursive: true);
       }
     });
@@ -167,9 +168,9 @@ void main() {
 
   group('Query Invariants', () {
     Glados2<List<Map<String, dynamic>>, String>().test('HashIndex finds exact matches', (docs, searchWord) async {
-      final db = FastDB(MemoryStorageStrategy());
+      await FfastDb.disposeInstance();
+      final db = await FfastDb.init(MemoryStorageStrategy());
       db.addIndex('field');
-      await db.open();
 
       // Add the searchWord to some documents exactly
       for (var i = 0; i < docs.length; i++) {
@@ -189,7 +190,7 @@ void main() {
       
       expect(resultIds.length, actualCount);
 
-      await db.close();
+      await FfastDb.disposeInstance();
     });
   });
 }

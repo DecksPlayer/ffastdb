@@ -7,6 +7,15 @@ class TypeRegistry {
   final Map<Type, int> _typeToId = {};
 
   void registerAdapter<T>(TypeAdapter<T> adapter) {
+    if (_adapters.containsKey(adapter.typeId)) {
+      final existing = _adapters[adapter.typeId]!;
+      if (existing.runtimeType != adapter.runtimeType) {
+        throw ArgumentError(
+            'TypeAdapter conflict: typeId ${adapter.typeId} is already registered '
+            'for ${existing.runtimeType}. Each adapter must have a unique typeId. '
+            '${adapter.runtimeType} must use a different typeId.');
+      }
+    }
     _adapters[adapter.typeId] = adapter;
     _typeToId[T] = adapter.typeId;
   }
