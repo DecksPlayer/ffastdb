@@ -40,16 +40,29 @@ class FastDB {
   bool _inTransaction = false;
   int _nextId = 1;
   
-  /// Marks whether this database instance has been closed.
+  /// Whether this database instance has been closed.
   /// Used to prevent operations on a closed database, especially important
   /// for the singleton pattern where users might retain references after dispose.
   bool _isClosed = false;
+
+  /// Whether this database instance is currently open and usable.
+  ///
+  /// Returns `false` after [close] has been called. Check this before
+  /// performing operations when you may hold a reference across lifecycle events.
+  bool get isOpen => !_isClosed;
 
   Future<void> _writeLock = Future.value();
 
   Future<T> _exclusive<T>(Future<T> Function() fn) {
     if (_isClosed) {
-      throw StateError('Cannot perform operations on a closed database.');
+      throw StateError(
+        'Bad state: Cannot perform operations on a closed database. '
+        'This can happen if:\n'
+        '  1. close() or disposeInstance() was called before this operation.\n'
+        '  2. A second openDatabase() call replaced the active instance.\n'
+        '  3. An async operation completed after the DB was disposed.\n'
+        'Call ffastdb.init() or openDatabase() again to reopen the database.',
+      );
     }
     if (_inTransaction) return fn();
     final next = _writeLock.then((_) => fn());
@@ -659,7 +672,11 @@ class FastDB {
   /// Get by primary key — O(log n).
   Future<dynamic> findById(int id) async {
     if (_isClosed) {
-      throw StateError('Cannot perform operations on a closed database.');
+      throw StateError(
+        'Bad state: Cannot perform operations on a closed database. '
+        'The database was closed before findById($id) could complete. '
+        'Call ffastdb.init() or openDatabase() again to reopen.',
+      );
     }
     
     // OPTIMIZATION: Try sync path first - nearly always succeeds with hot cache
@@ -702,8 +719,12 @@ class FastDB {
     return results;
   }
 
-  /// Returns a fluent QueryBuilder for chaining conditions.
-  QueryBuilder query() => QueryBuilder(_secondaryIndexes);
+  /// Returns a fluent [QueryBuilder] for chaining conditions.
+  ///
+  /// The returned builder has access to [QueryBuilder.find] and
+  /// [QueryBuilder.findFirst] which resolve full documents without
+  /// requiring a manual `findById` loop.
+  QueryBuilder query() => QueryBuilder(_secondaryIndexes, findById);
 
   Future<List<dynamic>> findWhere(List<int> Function(QueryBuilder q) fn) => find(fn);
 
@@ -881,7 +902,7 @@ class FastDB {
     if (body.isNotEmpty && (body[0] == 123 || body[0] == 91)) {
       final doc = FastSerializer.deserialize(fullData);
       // Restore original 'id' field if it was preserved (e.g., from Firebase)
-      if (doc is Map && doc.containsKey('_originalId')) {
+      if (doc.containsKey('_originalId')) {
         doc['id'] = doc.remove('_originalId');
       }
       return doc;
@@ -926,7 +947,7 @@ class FastDB {
     if (body.isNotEmpty && (body[0] == 123 || body[0] == 91)) {
       final doc = FastSerializer.deserialize(fullData);
       // Restore original 'id' field if it was preserved (e.g., from Firebase)
-      if (doc is Map && doc.containsKey('_originalId')) {
+      if (doc.containsKey('_originalId')) {
         doc['id'] = doc.remove('_originalId');
       }
       return doc;

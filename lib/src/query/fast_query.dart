@@ -31,13 +31,18 @@ class QueryResult {
 class QueryBuilder {
   final Map<String, SecondaryIndex> _indexes;
 
+  /// Optional callback to resolve a document by its internal ID.
+  /// Provided by [FastDB.query()] so that [find] and [findFirst] work
+  /// without a direct circular dependency on the DB class.
+  final Future<dynamic> Function(int id)? _fetchById;
+
   final List<List<_Condition>> _orGroups = [[]]; // AND within groups, OR between groups
   String? _sortField;
   bool _sortDesc = false;
   int? _limit;
   int? _offset;
 
-  QueryBuilder(this._indexes);
+  QueryBuilder(this._indexes, [this._fetchById]);
 
   // ─── Condition Starters ───────────────────────────────────────────────────
 
@@ -87,6 +92,77 @@ class QueryBuilder {
 
   void _addCondition(_Condition cond) {
     _orGroups.last.add(cond);
+  }
+
+  // ─── High-level Execution ─────────────────────────────────────────────────
+
+  /// Executes the query and returns the matching **documents**.
+  ///
+  /// Equivalent to calling [findIds] and fetching each document by ID.
+  /// Only available when using `db.query()` — throws [StateError] if the
+  /// builder was constructed without a database reference.
+  ///
+  /// ```dart
+  /// final docs = await db.query()
+  ///   .where('status').equals('active')
+  ///   .find();
+  /// ```
+  Future<List<dynamic>> find() async {
+    if (_fetchById == null) {
+      throw StateError(
+        'QueryBuilder.find() requires a database reference. '
+        'Use db.query().where(...).find() instead of constructing QueryBuilder directly.',
+      );
+    }
+    final ids = findIds();
+    final results = <dynamic>[];
+    for (final id in ids) {
+      final doc = await _fetchById(id);
+      if (doc != null) results.add(doc);
+    }
+    return results;
+  }
+
+  /// Returns the **first** matching document, or `null` if none match.
+  ///
+  /// More efficient than [find] when you only need one result — stops after
+  /// the first ID is resolved.
+  ///
+  /// ```dart
+  /// final user = await db.query()
+  ///   .where('email').equals('alice@example.com')
+  ///   .findFirst();
+  /// ```
+  Future<dynamic> findFirst() async {
+    if (_fetchById == null) {
+      throw StateError(
+        'QueryBuilder.findFirst() requires a database reference. '
+        'Use db.query().where(...).findFirst() instead.',
+      );
+    }
+    final ids = findIds();
+    if (ids.isEmpty) return null;
+    return _fetchById(ids.first);
+  }
+
+  /// Returns the **count** of documents matching the query.
+  ///
+  /// Uses an O(1) fast path for simple equality conditions on indexed fields
+  /// (reads directly from the index bucket without materialising the list).
+  ///
+  /// ```dart
+  /// final activeCount = db.query().where('status').equals('active').count();
+  /// ```
+  int count() {
+    // Hot path: single non-negated equals → direct bucket size, O(1)
+    if (_orGroups.length == 1 && _orGroups[0].length == 1) {
+      final cond = _orGroups[0][0];
+      if (cond is _EqualsCondition && !cond.negated) {
+        final index = _indexes[cond.field];
+        if (index != null) return index.lookup(cond.value).length;
+      }
+    }
+    return findIds().length;
   }
 
   // ─── Execution ────────────────────────────────────────────────────────────

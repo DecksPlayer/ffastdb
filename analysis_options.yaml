@@ -27,6 +27,7 @@ analyzer:
     - test/debug_test.dart.ignore
   errors:
     unawaited_futures: warning
+    curly_braces_in_flow_control_structures: ignore
 
 # For more information about the core and recommended set of lints, see
 # https://dart.dev/go/core-lints

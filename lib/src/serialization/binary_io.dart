@@ -203,7 +203,13 @@ class FastBinaryReader implements BinaryReader {
         }
         _offset += 8;
         return bd.getFloat64(0, Endian.little);
-      case _typeString: return readString();
+      case _typeString:
+        final s = readString();
+        // Check for binary sentinel prefix used by FastBinaryWriter.writeDynamic()
+        if (s.startsWith('\u0000bl:')) {
+          return base64Decode(s.substring(4)); // Skip '\u0000bl:'
+        }
+        return s;
       case _typeBool: return readUint8() == 1;
       case _typeList:
         final len = readUint32();

@@ -1,8 +1,10 @@
 import 'dart:io' show Directory;
 import 'package:path/path.dart' as p;
 import '../fastdb.dart';
+import '../storage/storage_strategy.dart';
 import '../storage/io/io_storage_strategy.dart';
 import '../storage/wal_storage_strategy.dart';
+import '../storage/encrypted_storage_strategy.dart';
 
 /// Opens (or creates) a named database in [directory].
 ///
@@ -28,17 +30,33 @@ Future<FastDB> openDatabase(
   Map<int, dynamic Function(dynamic)>? migrations,
   List<String> indexes = const [],
   List<String> sortedIndexes = const [],
+  String? encryptionKey,
 }) async {
+  // Guard: if a live instance already exists, reuse it.
+  // Calling disposeInstance() unconditionally was the root cause of
+  // "Bad state: Cannot perform operations on a closed database" errors
+  // when openDatabase / ffastdb.init was called from multiple code paths
+  // during app startup (e.g., from BLoC + repository simultaneously).
+  try {
+    return FfastDb.instance; // throws StateError if null or closed
+  } on StateError {
+    // No live instance — fall through to create one.
+  }
+
+  // Clean up any stale closed instance before opening a new one.
+  await FfastDb.disposeInstance();
+
   final dir = directory.isEmpty ? Directory.current.path : directory;
   final path = p.join(dir, '$name.fdb');
-  final storage = WalStorageStrategy(
+  StorageStrategy storage = WalStorageStrategy(
     main: IoStorageStrategy(path),
     wal: IoStorageStrategy('$path.wal'),
   );
-  
-  // Use singleton pattern - first dispose any existing instance
-  await FfastDb.disposeInstance();
-  
+
+  if (encryptionKey != null && encryptionKey.isNotEmpty) {
+    storage = EncryptedStorageStrategy(storage, encryptionKey);
+  }
+
   final db = await FfastDb.init(
     storage,
     cacheCapacity: cacheCapacity,
@@ -46,13 +64,13 @@ Future<FastDB> openDatabase(
     version: version,
     migrations: migrations,
   );
-  
+
   for (final field in indexes) {
     db.addIndex(field);
   }
   for (final field in sortedIndexes) {
     db.addSortedIndex(field);
   }
-  
+
   return db;
 }

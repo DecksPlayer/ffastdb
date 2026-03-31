@@ -1,3 +1,34 @@
+## 0.0.14
+
+### Critical Bug Fixes
+- **CRITICAL**: Fixed `openDatabase()` unconditionally calling `FfastDb.disposeInstance()` at the start
+  of every call. This caused `"Bad state: Cannot perform operations on a closed database"` errors
+  when multiple code paths (e.g., a BLoC and a repository) called `ffastdb.init()` concurrently
+  during app startup. The function now reuses the live instance if one is already open.
+- **CRITICAL (Web)**: Fixed `IndexedDbStorageStrategy` using the hardcoded key `'db_buffer'` for all
+  database instances. Opening two databases (e.g., `'users'` and `'products'`) caused their data to
+  collide in the same IndexedDB slot. Each database name now gets its own isolated key
+  (`'${name}_buffer'`).
+
+### New Features
+- `QueryBuilder.find()` — executes a query and returns the full document list directly.
+  No more manual `findById` loop. Use via `db.query().where('field').equals('value').find()`.
+- `QueryBuilder.findFirst()` — returns the first matching document or `null`, resolving only
+  one document ID for efficiency.
+- `QueryBuilder.count()` — returns the count of matching documents with an O(1) hot path
+  for simple equality queries on indexed fields (reads the index bucket size directly).
+- `FastDB.isOpen` getter — exposes whether the database instance is currently usable.
+
+### Improvements
+- Improved error message for closed-database operations: now explains the three most common
+  causes and how to recover, instead of the previous generic `"Cannot perform operations..."`.
+- `EncryptedStorageStrategy` doc comment updated with a clear security warning: it uses a
+  Vigenère-style XOR cipher (obfuscation, not cryptographic-grade encryption). Guidance for
+  using AES-256-GCM via `encrypt` / `pointycastle` is included.
+- Barrel export (`package:ffastdb/ffastdb.dart`) now includes `EncryptedStorageStrategy` and
+  the platform-appropriate storage strategy (`IoStorageStrategy` on native,
+  `IndexedDbStorageStrategy` on web) — no more imports of internal `src/` paths.
+
 ## 0.0.13
 - solve wasm issues
 ## 0.0.12

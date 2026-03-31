@@ -1,5 +1,8 @@
 import '../fastdb.dart';
+import '../storage/storage_strategy.dart';
 import '../storage/web/local_storage_strategy.dart';
+import '../storage/web/indexed_db_strategy.dart';
+import '../storage/encrypted_storage_strategy.dart';
 
 /// Opens (or creates) a named database on Web using [LocalStorageStrategy].
 ///
@@ -21,24 +24,45 @@ Future<FastDB> openDatabase(
   Map<int, dynamic Function(dynamic)>? migrations,
   List<String> indexes = const [],
   List<String> sortedIndexes = const [],
+  String? encryptionKey,
+  bool useIndexedDb = true,
 }) async {
-  // Use singleton pattern - first dispose any existing instance
+  // Guard: if a live instance already exists, reuse it.
+  // Calling disposeInstance() unconditionally was the root cause of
+  // "Bad state: Cannot perform operations on a closed database" errors
+  // when openDatabase / ffastdb.init was called from multiple code paths
+  // during app startup (e.g., from BLoC + repository simultaneously).
+  try {
+    return FfastDb.instance; // throws StateError if null or closed
+  } on StateError {
+    // No live instance — fall through to create one.
+  }
+
+  // Clean up any stale closed instance before opening a new one.
   await FfastDb.disposeInstance();
-  
+
+  StorageStrategy baseStorage = useIndexedDb
+      ? IndexedDbStorageStrategy(name)
+      : LocalStorageStrategy(name);
+
+  if (encryptionKey != null && encryptionKey.isNotEmpty) {
+    baseStorage = EncryptedStorageStrategy(baseStorage, encryptionKey);
+  }
+
   final db = await FfastDb.init(
-    LocalStorageStrategy(name),
+    baseStorage,
     cacheCapacity: cacheCapacity,
     autoCompactThreshold: autoCompactThreshold,
     version: version,
     migrations: migrations,
   );
-  
+
   for (final field in indexes) {
     db.addIndex(field);
   }
   for (final field in sortedIndexes) {
     db.addSortedIndex(field);
   }
-  
+
   return db;
 }

@@ -31,7 +31,7 @@ A high-performance, pure-Dart NoSQL database for Flutter & server-side Dart.
 
 ```yaml
 dependencies:
-  ffastdb: ^0.0.13
+  ffastdb: ^0.0.14
 ```
 
 ### Open a database
@@ -55,14 +55,20 @@ void main() async {
     dir = appDir.path;
   }
 
-  final db = await openDatabase('myapp', directory: dir, version: 1);
-  runApp(MyApp(db: db));
+final db = await openDatabase(
+  'myapp', 
+  directory: dir, 
+  version: 1,
+  encryptionKey: 'your_secret_key', // Optional: encrypts the entire DB
+  useIndexedDb: true,              // Optional: use IndexedDB instead of localStorage (Web only)
+);
+runApp(MyApp(db: db));
 }
 ```
 
-> **Web / WASM:** `directory` is automatically ignored — the library selects
-> `LocalStorageStrategy` at compile time via `dart.library.js_interop`. Data
-> persists in the browser's `localStorage` and survives page reloads.
+> **Web / WASM Security & Storage:**
+> - `useIndexedDb`: Defaults to `true`. Uses browser `IndexedDB` which is more robust and has higher limits than `localStorage`.
+> - `encryptionKey`: If provided, the entire database buffer is obfuscated using a cyclic XOR cipher before being written to the browser storage. This prevents sensitive data from being easily visible in Chrome DevTools or other inspection tools.
 
 > **Note:** `path_provider` is **not** a dependency of `ffastdb` itself — add
 > it only to your app's own `pubspec.yaml` for native targets.
@@ -71,7 +77,6 @@ void main() async {
 
 ```dart
 import 'package:ffastdb/ffastdb.dart';
-import 'package:ffastdb/src/storage/io/io_storage_strategy.dart';
 
 // Production: file on disk + WAL crash protection + file lock
 final db = await FfastDb.init(
@@ -208,7 +213,23 @@ final pageIds = db.query()
     .skip(20)
     .findIds();
 
-// ── Fetch full documents ───────────────────────────────────────────────────
+// ── Fetch full documents — direct API (new in 0.0.14) ───────────────────────
+// db.query().find() resolves documents without a manual findById loop
+final londonDocs = await db.query()
+    .where('city').equals('London')
+    .find();                           // Future<List<dynamic>>
+
+// First match only — most efficient when you need a single document
+final alice = await db.query()
+    .where('name').startsWith('Al')
+    .findFirst();                      // Future<dynamic> — null if no match
+
+// Count only — O(1) for simple equals on indexed fields
+final londonCount = db.query()
+    .where('city').equals('London')
+    .count();                          // int, synchronous
+
+// ── Fetch full documents — classic API ────────────────────────────────────
 final alice  = await db.findById(id);           // O(log n) by primary key
 final people = await db.find((q) => q.where('city').equals('London').findIds());
 final all    = await db.getAll();
@@ -398,7 +419,9 @@ FastDB
     ├── IoStorageStrategy      (Mobile / Desktop / Server — file lock + WAL)
     ├── MemoryStorageStrategy  (Tests / in-memory, zero persistence)
     ├── WebStorageStrategy     (In-memory base, no dart:io, safe for web)
-    └── LocalStorageStrategy   (Web JS / WASM — persists in browser localStorage)
+    ├── LocalStorageStrategy   (Web JS / WASM — persists in browser localStorage)
+    ├── IndexedDbStorageStrategy (Web JS / WASM — persists in browser IndexedDB)
+    └── EncryptedStorageStrategy (Wrapper — XOR obfuscation; see docs for AES guidance)
 ```
 
 ---

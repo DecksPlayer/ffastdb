@@ -1,0 +1,13 @@
+# Files excluded from the published package on pub.dev
+
+# Debug and analysis documents (not part of the public API)
+ffastdb_suggestions.md
+GC_ANALYSIS.md
+ANDROID_IOS_CORRUPTION_FIX.md
+FIREBASE_ID_FIX.md
+compact_debug.log
+test_mode.bin
+test_file_mode.dart
+
+# Local dev files
+pubspec.lock
