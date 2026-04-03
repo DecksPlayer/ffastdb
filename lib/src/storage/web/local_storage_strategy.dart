@@ -1,21 +1,11 @@
-// This file is only compiled on web (referenced exclusively from
-// open_database_web.dart which is selected via conditional export).
 import 'dart:convert';
-import 'dart:js_interop';
+import 'dart:typed_data';
+import 'package:web/web.dart' as web;
 
 import 'web_storage_strategy.dart';
 
-// ── localStorage JS interop ──────────────────────────────────────────────────
-
-extension type _LocalStorage(JSObject _) {
-  external JSString? getItem(JSString key);
-  external void setItem(JSString key, JSString value);
-  external void removeItem(JSString key);
-}
-
-@JS('localStorage')
-external _LocalStorage get _localStorage;
-
+// ── localStorage JS interop via package:web ──────────────────────────────────
+// No more manual definitions needed.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// [WebStorageStrategy] with automatic persistence to `localStorage`.
@@ -32,10 +22,28 @@ class LocalStorageStrategy extends WebStorageStrategy {
   @override
   bool get needsExplicitFlush => true;
 
+  /// True when the buffer has changed since the last [flush()].
+  /// Prevents redundant Base64 re-encodes when fastdb calls flush() multiple
+  /// times per insert/update/delete.
+  bool _dirty = false;
+
+  @override
+  Future<void> write(int offset, Uint8List data) async {
+    await super.write(offset, data);
+    _dirty = true;
+  }
+
+  @override
+  bool writeSync(int offset, Uint8List data) {
+    final result = super.writeSync(offset, data);
+    _dirty = true;
+    return result;
+  }
+
   @override
   Future<void> open() async {
     try {
-      final stored = _localStorage.getItem(_lsKey.toJS)?.toDart;
+      final stored = web.window.localStorage.getItem(_lsKey);
       if (stored != null && stored.isNotEmpty) {
         final bytes = base64Decode(stored);
         await write(0, bytes);
@@ -47,13 +55,26 @@ class LocalStorageStrategy extends WebStorageStrategy {
 
   @override
   Future<void> flush() async {
+    if (!_dirty) return;
+    _dirty = false;
     final sz = await size;
     if (sz == 0) {
-      _localStorage.removeItem(_lsKey.toJS);
+      web.window.localStorage.removeItem(_lsKey);
       return;
     }
     final snapshot = await read(0, sz);
-    _localStorage.setItem(_lsKey.toJS, base64Encode(snapshot).toJS);
+    try {
+      web.window.localStorage.setItem(_lsKey, base64Encode(snapshot));
+    } catch (_) {
+      // localStorage throws QuotaExceededError (~5 MB limit per origin).
+      // Surface a clear message instead of a silent data-loss failure.
+      throw StateError(
+        'ffastdb: localStorage quota exceeded for "$_dbName" '
+        '(${(sz / 1024).toStringAsFixed(1)} KB + Base64 overhead). '
+        'Switch to IndexedDB: '
+        'openDatabase("$_dbName", useIndexedDb: true)',
+      );
+    }
   }
 
   @override

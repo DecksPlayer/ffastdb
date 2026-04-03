@@ -57,7 +57,7 @@ class FastSerializer {
 
   // JsonEncoder must NOT be const when a toEncodable function is provided.
   static final _encoder =
-      JsonEncoder(_toEncodable).fuse(const Utf8Encoder());
+      JsonEncoder(_toEncodable).fuse(const Utf8Encoder()); // ignore: prefer_const_constructors
 
   /// Walks a decoded JSON value and restores all sentinel-encoded types.
   static dynamic _revive(dynamic v) {

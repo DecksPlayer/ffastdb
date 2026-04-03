@@ -1,48 +1,12 @@
-// This file is only compiled on web and uses IndexedDB for storage.
 import 'dart:async';
 import 'dart:js_interop';
 import 'dart:typed_data';
 
+import 'package:web/web.dart' as web;
 import '../storage_strategy.dart';
 
-// ── IndexedDB JS interop ─────────────────────────────────────────────────────
-
-@JS('indexedDB')
-external JSObject get _indexedDB;
-
-extension type _IDBFactory(JSObject _) {
-  external _IDBOpenDBRequest open(JSString name, int version);
-}
-
-extension type _IDBOpenDBRequest(JSObject _) {
-  external set onupgradeneeded(JSFunction callback);
-  external set onsuccess(JSFunction callback);
-  external set onerror(JSFunction callback);
-  external _IDBDatabase get result;
-}
-
-extension type _IDBDatabase(JSObject _) {
-  external _IDBObjectStore createObjectStore(JSString name);
-  external _IDBTransaction transaction(JSArray<JSString> stores, JSString mode);
-}
-
-extension type _IDBTransaction(JSObject _) {
-  external _IDBObjectStore objectStore(JSString name);
-  external set oncomplete(JSFunction callback);
-  external set onerror(JSFunction callback);
-}
-
-extension type _IDBObjectStore(JSObject _) {
-  external _IDBRequest get(JSAny key);
-  external _IDBRequest put(JSAny value, JSAny key);
-}
-
-extension type _IDBRequest(JSObject _) {
-  external set onsuccess(JSFunction callback);
-  external set onerror(JSFunction callback);
-  external JSAny? get result;
-}
-
+// ── IndexedDB JS interop via package:web ─────────────────────────────────────
+// No more manual definitions needed, fully standard now.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// [StorageStrategy] for Web that uses `IndexedDB` for persistence.
@@ -57,32 +21,37 @@ class IndexedDbStorageStrategy implements StorageStrategy {
   // (e.g., 'users' and 'products') in the same web application.
   final String _dataKey;
   
-  _IDBDatabase? _database;
+  web.IDBDatabase? _database;
   Uint8List _buffer = Uint8List(0);
   int _usedSize = 0;
+
+  /// True when [_buffer] has been modified since the last [flush()].
+  /// Prevents redundant IndexedDB puts when fastdb calls flush() multiple
+  /// times per operation (e.g. after every insert/update/delete).
+  bool _dirty = false;
 
   IndexedDbStorageStrategy(this._dbName) : _dataKey = '${_dbName}_buffer';
 
   @override
   Future<void> open() async {
     final completer = Completer<void>();
-    final factory = _IDBFactory(_indexedDB);
-    final request = factory.open(_dbName.toJS, 1);
+    final request = web.window.indexedDB.open(_dbName, 1);
 
-    request.onupgradeneeded = ((JSObject event) {
-      final db = request.result;
-      db.createObjectStore(_storeName.toJS);
-    }).toJS;
+    request.onupgradeneeded = (web.IDBVersionChangeEvent event) {
+      final db = request.result as web.IDBDatabase;
+      db.createObjectStore(_storeName);
+    }.toJS;
 
-    request.onsuccess = ((JSObject event) {
-      _database = request.result;
+    request.onsuccess = (web.Event event) {
+      _database = request.result as web.IDBDatabase;
       
-      // Load initial data
-      final txn = _database!.transaction([_storeName.toJS].toJS, 'readonly'.toJS);
-      final store = txn.objectStore(_storeName.toJS);
+      // Load initial data. IDB transaction can take a single string or a List.
+      // package:web sometimes expects JSAny (which can be a single string or array).
+      final txn = _database!.transaction(_storeName.toJS, 'readonly');
+      final store = txn.objectStore(_storeName);
       final getRequest = store.get(_dataKey.toJS);
       
-      getRequest.onsuccess = ((JSObject e) {
+      getRequest.onsuccess = (web.Event e) {
         final result = getRequest.result;
         if (result != null) {
           // Convert JS TypedArray back to Dart Uint8List
@@ -91,16 +60,16 @@ class IndexedDbStorageStrategy implements StorageStrategy {
           _usedSize = _buffer.length;
         }
         completer.complete();
-      }).toJS;
+      }.toJS;
       
-      getRequest.onerror = ((JSObject e) {
+      getRequest.onerror = (web.Event e) {
         completer.complete(); // Start fresh if error
-      }).toJS;
-    }).toJS;
+      }.toJS;
+    }.toJS;
 
-    request.onerror = ((JSObject event) {
+    request.onerror = (web.Event event) {
       completer.completeError('Failed to open IndexedDB');
-    }).toJS;
+    }.toJS;
 
     return completer.future;
   }
@@ -126,22 +95,31 @@ class IndexedDbStorageStrategy implements StorageStrategy {
     }
     _buffer.setRange(offset, offset + data.length, data);
     if (required > _usedSize) _usedSize = required;
+    _dirty = true;
   }
 
   @override
   Future<void> flush() async {
-    if (_database == null) return;
+    if (_database == null || !_dirty) return;
+    // Reset before the async put so writes that arrive while the IDB
+    // transaction is in-flight are captured in the next flush().
+    _dirty = false;
     
     final completer = Completer<void>();
-    final txn = _database!.transaction([_storeName.toJS].toJS, 'readwrite'.toJS);
-    final store = txn.objectStore(_storeName.toJS);
+    final txn = _database!.transaction(_storeName.toJS, 'readwrite');
+    final store = txn.objectStore(_storeName);
     
-    // We only store the used partial to save space, or a copy to avoid mutation issues
-    final snapshot = _buffer.sublist(0, _usedSize);
-    final putRequest = store.put(snapshot.toJS, _dataKey.toJS);
+    // Use a typed-data view to avoid an extra Dart-side copy of the buffer.
+    // When the backing allocation is oversized (due to doubling growth),
+    // the view limits the JS Uint8Array to only the live bytes.
+    final view = _usedSize == _buffer.length
+        ? _buffer
+        : _buffer.buffer.asUint8List(0, _usedSize);
+    final jsBuffer = view.toJS;
+    final putRequest = store.put(jsBuffer as JSAny, _dataKey.toJS);
     
-    putRequest.onsuccess = ((JSObject e) => completer.complete()).toJS;
-    putRequest.onerror = ((JSObject e) => completer.completeError('Failed to flush to IndexedDB')).toJS;
+    putRequest.onsuccess = ((web.Event e) => completer.complete()).toJS;
+    putRequest.onerror = ((web.Event e) => completer.completeError('Failed to flush to IndexedDB')).toJS;
     
     return completer.future;
   }
@@ -159,7 +137,17 @@ class IndexedDbStorageStrategy implements StorageStrategy {
 
   @override
   Future<void> truncate(int size) async {
-    if (size < _usedSize) _usedSize = size;
+    if (size >= _usedSize) return;
+    _usedSize = size;
+    // BUG FIX: Reclaim backing-buffer memory when the used size shrinks
+    // significantly (e.g. after compact()). Without this, a DB that grew
+    // to 50 MB and was then compacted to 5 MB still holds a 64 MB buffer
+    // in RAM until the page reloads — because the "file" is entirely in RAM.
+    if (_buffer.length > size + 512 * 1024) { // >512 KB overhead
+      final shrunk = Uint8List(size);
+      if (size > 0) shrunk.setRange(0, size, _buffer);
+      _buffer = shrunk;
+    }
   }
 
   // ── Synchronous fast paths ────────────────────────────────────────────────

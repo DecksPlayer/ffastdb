@@ -47,7 +47,16 @@ class WebStorageStrategy implements StorageStrategy {
 
   @override
   Future<void> truncate(int size) async {
-    if (size < _usedSize) _usedSize = size;
+    if (size >= _usedSize) return;
+    _usedSize = size;
+    // BUG FIX: Reclaim backing-buffer memory on significant size reduction
+    // (e.g. after compact()). On web the "file" is entirely in RAM, so
+    // truncate() must actually free memory, not just move a cursor.
+    if (_data.length > size + 512 * 1024) { // >512 KB overhead
+      final shrunk = Uint8List(size);
+      if (size > 0) shrunk.setRange(0, size, _data);
+      _data = shrunk;
+    }
   }
 
   // ── Synchronous fast paths ────────────────────────────────────────────────

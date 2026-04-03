@@ -15,5 +15,7 @@
 ///   return openDatabase('myapp', directory: dir.path, version: 1);
 /// }
 /// ```
+library;
+
 export 'open_database_native.dart'
     if (dart.library.js_interop) 'open_database_web.dart';

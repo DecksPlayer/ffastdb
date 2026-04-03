@@ -31,7 +31,7 @@ A high-performance, pure-Dart NoSQL database for Flutter & server-side Dart.
 
 ```yaml
 dependencies:
-  ffastdb: ^0.0.15
+  ffastdb: ^0.0.18
 ```
 
 ### Open a database

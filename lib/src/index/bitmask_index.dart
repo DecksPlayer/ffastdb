@@ -37,7 +37,7 @@ class BitmaskIndex implements SecondaryIndex {
   /// the bitset for that particular value changes (add/remove).
   final Map<dynamic, List<int>> _lookupCache = {};
 
-  BitmaskIndex(this.fieldName, {int maxDocId = 1 << 20}) // 1M docs default
+  BitmaskIndex(this.fieldName, {int maxDocId = 1 << 16}) // 64K docs default, grows automatically
       : _maxDocId = maxDocId;
 
   int get _wordCount => (_maxDocId + _bitsPerWord - 1) ~/ _bitsPerWord;

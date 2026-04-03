@@ -1,4 +1,3 @@
-import 'dart:collection';
 import '../storage/page_manager.dart';
 import 'btree_node.dart';
 
@@ -8,12 +7,12 @@ class BTree {
   final PageManager pageManager;
   int? rootPage;
 
-  /// Deserialized node object cache — avoids re-allocating List<int> objects
+  /// Deserialized node object cache — avoids re-allocating `List<int>` objects
   /// on every _readNode call for pages that are already in the LRU page cache.
   /// Updated on every _writeNode so it is always coherent with storage.
-  /// LinkedHashMap maintains insertion order so .keys.first is O(1) FIFO eviction.
-  final Map<int, BTreeNode> _nodeCache = LinkedHashMap();
-  static const int _nodeCacheCapacity = 4096;
+  /// `LinkedHashMap` maintains insertion order so .keys.first is O(1) FIFO eviction.
+  final Map<int, BTreeNode> _nodeCache = <int, BTreeNode>{};
+  static const int _nodeCacheCapacity = 512;
 
   BTree(this.pageManager);
 
@@ -254,7 +253,7 @@ class BTree {
   ///   so no node is left under-full.
   /// - An empty internal root is collapsed to its sole child.
   Future<void> delete(int key) async {
-    if (rootPage == null || rootPage == 0) return null;
+    if (rootPage == null || rootPage == 0) return;
     await _delete(rootPage!, key);
     // Collapse an empty internal root — its only child becomes the new root.
     final root = await _readNode(rootPage!);

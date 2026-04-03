@@ -39,7 +39,7 @@ class MemoryStorageStrategy implements StorageStrategy {
     final requiredSize = offset + data.length;
     if (requiredSize > _data.length) {
       // Exponential growth: double the capacity or use the required size if larger
-      int newSize = _data.length == 0 ? 1024 : _data.length;
+      int newSize = _data.isEmpty ? 1024 : _data.length;
       while (newSize < requiredSize) {
         newSize *= 2;
       }

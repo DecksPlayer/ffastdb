@@ -47,12 +47,12 @@ class QueryBuilder {
   // ─── Condition Starters ───────────────────────────────────────────────────
 
   /// Add an AND condition on [field].
-  _FieldCondition where(String field) {
-    return _FieldCondition(this, field, negated: false);
+  FieldCondition where(String field) {
+    return FieldCondition(this, field, negated: false);
   }
 
   /// Alias for fluent chaining — behaves identically to `where()`.
-  _FieldCondition and(String field) => where(field);
+  FieldCondition and(String field) => where(field);
 
   /// Start an OR group — conditions in different OR groups are unioned.
   ///
@@ -601,17 +601,17 @@ class _TrueCondition implements _Condition {
 
 // ─── Fluent condition builder ─────────────────────────────────────────────────
 
-class _FieldCondition {
+class FieldCondition {
   final QueryBuilder _builder;
   final String _field;
   final bool _negated;
 
-  _FieldCondition(this._builder, this._field, {required bool negated})
+  FieldCondition(this._builder, this._field, {required bool negated})
       : _negated = negated;
 
   /// Negate the next condition. Example: `.where('status').not().equals('deleted')`.
-  _FieldCondition not() =>
-      _FieldCondition(_builder, _field, negated: !_negated);
+  FieldCondition not() =>
+      FieldCondition(_builder, _field, negated: !_negated);
 
   QueryBuilder equals(dynamic value) {
     _builder._addCondition(_EqualsCondition(_field, value, negated: _negated));

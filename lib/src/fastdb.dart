@@ -213,7 +213,7 @@ class FastDB {
   }
 
   /// Creates a bitmask index on [fieldName].
-  void addBitmaskIndex(String fieldName, {int maxDocId = 1 << 20}) {
+  void addBitmaskIndex(String fieldName, {int maxDocId = 1 << 16}) {
     _secondaryIndexes[fieldName] = BitmaskIndex(fieldName, maxDocId: maxDocId);
   }
 
@@ -420,81 +420,51 @@ class FastDB {
     _batchEntries.clear();
 
     final ids = <int>[];
-    final serializedDocs = <Uint8List>[];
-
-    var state = _BatchState.serialize;
-    bool done = false
-
-;
 
     try {
-      while (!done) {
-        switch (state) {
-          case _BatchState.serialize:
-          for (int i = 0; i < docs.length; i++) {
-            final doc = docs[i];
-            final id = _nextId++;
-            ids.add(id);
-            serializedDocs.add(_serialize(doc, id: id));
-            if (_runningOnWeb && i > 0 && i % 500 == 0) await Future.delayed(Duration.zero);
-          }
-          if (!_inTransaction && _wal != null) await _wal!.beginTransaction();
-          state = _BatchState.write;
-          break;
+      // Assign IDs upfront (needed for secondary indexing later)
+      for (int i = 0; i < docs.length; i++) {
+        ids.add(_nextId++);
+      }
 
-        case _BatchState.write:
-          final targetStorage = dataStorage ?? storage;
-          for (int i = 0; i < serializedDocs.length; i++) {
-            final data = serializedDocs[i];
-            final offset = _dataOffset;
-            final id = ids[i];
-            if (!targetStorage.writeSync(offset, data)) {
-              await targetStorage.write(offset, data);
-            }
-            _batchEntries.add(MapEntry(id, offset));
-            _dataOffset += data.length;
-            // OPTIMIZATION: Defer secondary indexing until after primary B-Tree bulkLoad
-            if (_runningOnWeb && i > 0 && i % 500 == 0) await Future.delayed(Duration.zero);
-          }
-          state = _BatchState.indexing;
-          break;
+      if (!_inTransaction && _wal != null) await _wal!.beginTransaction();
 
-        case _BatchState.indexing:
-          await _primaryIndex.bulkLoad(_batchEntries);
-          _batchEntries.clear();
-          
-          // OPTIMIZATION: Index all documents after B-Tree is built
-          for (int i = 0; i < docs.length; i++) {
-            final doc = docs[i];
-            final id = ids[i];
-            if (doc is Map<String, dynamic>) _indexDocument(id, doc);
-          }
-          
-          state = _BatchState.finish;
-          break;
-
-        case _BatchState.finish:
-          final wal = _wal;
-          _batchMode = false;
-          await _pageManager.flushDirty();
-          await dataStorage?.flush();
-          await storage.flush();
-          await _saveHeader();
-          _disableWriteBehind();
-          if (!_inTransaction && wal != null) await wal.commit();
-          if (dataStorage == null) {
-            _dataOffset = await storage.size;
-          }
-          for (final doc in docs) {
-            _notifyWatchers(doc);
-          }
-          done = true;
-          break;
+      // Serialize and write one doc at a time to avoid accumulating all
+      // serialized bytes in RAM simultaneously (OOM fix for large batches).
+      final targetStorage = dataStorage ?? storage;
+      for (int i = 0; i < docs.length; i++) {
+        final data = _serialize(docs[i], id: ids[i]);
+        final offset = _dataOffset;
+        if (!targetStorage.writeSync(offset, data)) {
+          await targetStorage.write(offset, data);
         }
+        _batchEntries.add(MapEntry(ids[i], offset));
+        _dataOffset += data.length;
+        if (_runningOnWeb && i > 0 && i % 500 == 0) await Future.delayed(Duration.zero);
+      }
+
+      await _primaryIndex.bulkLoad(_batchEntries);
+      _batchEntries.clear();
+
+      for (int i = 0; i < docs.length; i++) {
+        if (docs[i] is Map<String, dynamic>) _indexDocument(ids[i], docs[i] as Map<String, dynamic>);
+      }
+
+      final wal = _wal;
+      _batchMode = false;
+      await _pageManager.flushDirty();
+      await dataStorage?.flush();
+      await storage.flush();
+      await _saveHeader();
+      _disableWriteBehind();
+      if (!_inTransaction && wal != null) await wal.commit();
+      if (dataStorage == null) {
+        _dataOffset = await storage.size;
+      }
+      for (final doc in docs) {
+        _notifyWatchers(doc);
       }
     } catch (e) {
-      // BUG FIX: ensure batch state is always cleaned up on exception to
-      // prevent the database from being permanently stuck in batch mode.
       _batchMode = false;
       _batchEntries.clear();
       _disableWriteBehind();
@@ -1151,7 +1121,7 @@ class FastDB {
   }
 
   /// Count of documents deleted or overwritten since last compact().
-  /// Used by auto-compact threshold logic. A Set<int> was previously used here
+  /// Used by auto-compact threshold logic. A `Set<int>` was previously used here
   /// but caused unbounded memory growth under heavy delete/update loads.
   int _deletedCount = 0;
 
@@ -1345,5 +1315,3 @@ class FastDB {
 
 /// Canonical public alias for [FastDB].
 typedef FfastDb = FastDB;
-
-enum _BatchState { serialize, write, indexing, finish }
