@@ -18,7 +18,7 @@ import '../storage/encrypted_storage_strategy.dart';
 Future<FastDB> openDatabase(
   String name, {
   String? directory,
-  int cacheCapacity = 256,
+  int cacheCapacity = 64,
   double autoCompactThreshold = 0,
   int version = 1,
   Map<int, dynamic Function(dynamic)>? migrations,

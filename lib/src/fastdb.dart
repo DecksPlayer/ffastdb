@@ -363,7 +363,10 @@ class FastDB {
       // OPTIMIZATION: Only flush and save header when storage requires it
       if (!_batchMode && storage.needsExplicitFlush) {
         await targetStorage.flush();
-        await storage.flush();
+        // When dataStorage is null, targetStorage == storage, so the flush
+        // above already covers B-Tree page writes. Skip the redundant second
+        // flush to avoid an extra IndexedDB transaction on web.
+        if (dataStorage != null) await storage.flush();
         await _saveHeader();
       }
 
@@ -551,7 +554,10 @@ class FastDB {
 
       if (!_batchMode) {
         await targetStorage.flush();
-        await storage.flush();
+        // When dataStorage is null, targetStorage == storage, so the flush
+        // above already covers B-Tree page writes. Skip the redundant second
+        // flush to avoid an extra IndexedDB transaction on web.
+        if (dataStorage != null) await storage.flush();
         await _saveHeader();
         _notifyWatchers(merged);
       }

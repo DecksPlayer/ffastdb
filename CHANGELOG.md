@@ -1,3 +1,13 @@
+## 0.0.20
+
+### Bug Fixes (Web Memory Crash)
+- **CRITICAL (Web/IndexedDB)**: Rewrote `IndexedDbStorageStrategy` with **chunked incremental flush**. Data is now stored as 64 KB chunks in IndexedDB; `flush()` only writes the chunks modified since the last flush. Previously every `insert()`/`update()`/`delete()` copied the **entire** database buffer (e.g. 50 MB) from Dart to JavaScript, causing peak memory of ~3× the DB size per flush and OOM crashes on large databases. Peak memory per flush is now O(64 KB) instead of O(DB size).
+- **Web/IndexedDB**: Backward-compatible migration — databases stored in the old single-key format (`<name>_buffer`) are loaded transparently and migrated to the chunked format on the next `flush()`.
+- **Web/IndexedDB**: `truncate()` now cleans up orphan chunk keys in IndexedDB on the next flush, preventing stale data after `compact()`.
+- **MemoryStorageStrategy**: `truncate()` now reclaims the backing `Uint8List` when the used size shrinks by more than 512 KB (matching the existing fix in `WebStorageStrategy` and `IndexedDbStorageStrategy`). Previously a database that grew to 64 MB and was compacted to 5 MB still held the 64 MB buffer in RAM.
+- **Core**: Eliminated redundant `storage.flush()` calls in `_insertImpl()` and `_updateImpl()` when `dataStorage` is null (single-file mode). On web this avoided creating an unnecessary second IndexedDB transaction per operation.
+- **Web**: Reduced default `cacheCapacity` in `openDatabase()` from 256 to 64 pages (1 MB → 256 KB). On web the entire database is already in RAM, so a large LRU page cache is redundant overhead.
+
 ## 0.0.19
 
 ### Bug Fixes (Memory)

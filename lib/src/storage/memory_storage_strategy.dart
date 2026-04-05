@@ -69,6 +69,14 @@ class MemoryStorageStrategy implements StorageStrategy {
   Future<void> truncate(int size) async {
     if (size < 0) size = 0;
     if (size < _usedSize) _usedSize = size;
+    // BUG FIX: Reclaim backing-buffer memory on significant size reduction.
+    // Without this, a database that grew to 50 MB and was then compacted to
+    // 5 MB still holds a 64 MB buffer until the process exits.
+    if (_data.length > size + 512 * 1024) {
+      final shrunk = Uint8List(size);
+      if (size > 0) shrunk.setRange(0, size, _data);
+      _data = shrunk;
+    }
   }
 
   // ── Synchronous fast paths ────────────────────────────────────────────────
