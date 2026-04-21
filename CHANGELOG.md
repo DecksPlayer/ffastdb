@@ -1,3 +1,19 @@
+## 0.0.23
+
+### Bug Fixes (Query Cache & Reindex)
+
+- **CRITICAL — Query Cache Key Bug**: Fixed query cache key generation that only included condition field types, not actual values. This caused different queries on the same field (e.g., `equals('London')` and `equals('NoCity')`) to share the same cache entry, returning stale results. Affected operations:
+  - `sumWhere()`, `avgWhere()`, `maxWhere()`: returned wrong aggregated values
+  - `updateWhere()`, `deleteWhere()`: returned wrong update/delete counts
+  - `findStream()`: yielded stale cached documents
+  - **Fix**: Cache key now includes condition values for all condition types (equals, range, contains, startsWith, isIn, isNull, fts)
+
+- **MODERATE — Reindex Cache Invalidation**: Fixed `reindex()` not clearing query cache after rebuilding indexes, causing queries to return stale cached results. Added `QueryBuilder.clearCache()` call after index rebuild.
+
+- **MODERATE — Test Cross-Contamination**: Fixed global static query cache causing test cross-contamination (one test's cached results affecting another test). Added `QueryBuilder.clearCache()` call at start of `FastDB.open()`.
+
+- **Test Results**: All 90 tests now pass (previously 11 were failing due to cache issues)
+
 ## 0.0.22
 
 ### Performance Optimizations (Batch Reads & Cache)

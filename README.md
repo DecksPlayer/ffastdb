@@ -27,11 +27,23 @@ A high-performance, pure-Dart NoSQL database for Flutter & server-side Dart.
 
 ---
 
+## 🐛 Recent Fixes (v0.0.23)
+
+**Query cache key generation** — Fixed critical bug where different queries on the same field shared the same cache result. For example, `equals('London')` and `equals('NoCity')` now correctly return different results instead of both returning the cached result from the first query. This fix resolves:
+- ✅ `sumWhere()`, `avgWhere()`, `maxWhere()` now return correct aggregated values
+- ✅ `updateWhere()`, `deleteWhere()` now return correct operation counts  
+- ✅ `findStream()` no longer yields stale cached documents
+- ✅ `reindex()` now properly invalidates cached results
+
+All 90 tests pass (previously 11+ were failing due to cache issues).
+
+---
+
 ## Getting Started
 
 ```yaml
 dependencies:
-  ffastdb: ^0.0.22
+  ffastdb: ^0.0.23
 ```
 
 ### Open a database
