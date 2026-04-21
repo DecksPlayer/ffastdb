@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:typed_data';
 import 'secondary_index.dart';
+import 'bloom_filter.dart';
 
 // Value type tags for binary serialization
 const int _tInt = 1;    // legacy: 32-bit int — kept for reading old index blobs
@@ -25,8 +26,15 @@ class HashIndex implements SecondaryIndex {
   final Map<int, dynamic> _reverse = {};
   int _size = 0;
 
+  /// Bloom Filter for fast "definitely not contains" checks on negative queries.
+  /// Dramatically speeds up queries like: .where('status').not().equals('inactive')
+  late BloomFilter<String> _bloomFilter;
+
   HashIndex(this.fieldName) {
     _buckets = List.generate(_bucketCount, (_) => <_HashEntry>[]);
+    // Create Bloom Filter with ~1% false positive rate
+    // Assumes up to 100k unique values per field
+    _bloomFilter = BloomFilter<String>(expectedSize: 100000, falsePositiveRate: 0.01);
   }
 
   // ─── FNV-1a Hash Function ─────────────────────────────────────────────────
@@ -78,6 +86,9 @@ class HashIndex implements SecondaryIndex {
     final hashCode = _hash(fieldValue);
     final bucketIdx = hashCode & (_bucketCount - 1); // Fast modulo for power of 2
     final bucket = _buckets[bucketIdx];
+    
+    // Add to Bloom Filter for fast negative query optimization
+    _bloomFilter.add(fieldValue.toString());
     
     // Check if value already exists in bucket
     for (final entry in bucket) {
@@ -135,7 +146,19 @@ class HashIndex implements SecondaryIndex {
   void clear() {
     _buckets = List.generate(_bucketCount, (_) => <_HashEntry>[]);
     _reverse.clear();
+    _bloomFilter.clear();
     _size = 0;
+  }
+
+  /// Checks if a value might be in the index using Bloom Filter.
+  /// Returns false if value is definitely NOT in index.
+  /// Returns true if value might be in index (or false positive).
+  /// 
+  /// Used to optimize negated queries: .where('status').not().equals('inactive')
+  /// If mightContainValue returns false, we can skip the negation logic.
+  bool mightContainValue(dynamic value) {
+    if (value == null) return false;
+    return _bloomFilter.mightContain(value.toString());
   }
 
   @override

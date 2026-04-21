@@ -1,0 +1,332 @@
+00:00 +0: loading test\data_types_test.dart
+00:00 +0: test\data_types_test.dart: Data Types Support supports int type
+00:00 +1: test\encryption_test.dart: EncryptedStorageStrategy Encrypted data is unreadable without correct key
+00:00 +2: test\encryption_test.dart: EncryptedStorageStrategy Encrypted data is unreadable without correct key
+00:00 +3: test\encryption_test.dart: EncryptedStorageStrategy Encrypted data is unreadable without correct key
+00:00 +4: test\encryption_test.dart: EncryptedStorageStrategy Encrypted data is unreadable without correct key
+00:00 +5: test\encryption_test.dart: EncryptedStorageStrategy Encrypted data is unreadable without correct key
+00:00 +6: test\data_types_test.dart: Data Types Support supports DateTime type (timestamp)
+00:00 +6: loading test\fts_test.dart
+ÔòöÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòù
+Ôòæ    FastDB FTS Integration Tests                      Ôòæ
+ÔòÜÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòØ
+
+Test 1: Basic FTS indexing and search
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+00:00 +7: test\encryption_test.dart: EncryptedStorageStrategy Encryption handles offsets correctly (cyclic key)
+00:00 +8: test\encryption_test.dart: EncryptedStorageStrategy Encryption handles offsets correctly (cyclic key)
+00:00 +9: test\encryption_test.dart: EncryptedStorageStrategy Encryption handles offsets correctly (cyclic key)
+00:00 +10: test\fastdb_test.dart: FastDB Core insert and findById
+00:00 +11: test\fastdb_test.dart: FastDB Core insert and findById
+00:00 +12: test\fastdb_test.dart: FastDB Core insert and findById
+00:00 +13: test\fastdb_test.dart: FastDB Core insert and findById
+00:00 +14: test\fastdb_test.dart: FastDB Core insert and findById
+00:00 +14: loading test\fts_test.dart
+Ô£ô PASS: FTS found correct documents
+00:00 +15: test\fastdb_test.dart: FastDB Core insert and findById
+00:00 +15: loading test\fts_test.dart
+
+Test 2: Multi-word FTS (AND semantics)
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+Ô£ô PASS: Multi-word AND query works
+
+Test 3: Case-insensitive search
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+Ô£ô PASS: Case-insensitive search works
+
+Test 4: Ignore short tokens (< 2 chars)
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+Ô£ô PASS: Short tokens ignored correctly
+
+Test 5: Empty/whitespace FTS query
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+Ô£ô PASS: Empty query returns no results
+
+Test 6: No matching documents
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+Ô£ô PASS: No matching documents returns empty
+
+ÔòöÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòù
+Ôòæ              TEST SUMMARY                             Ôòæ
+ÔòÜÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòØ
+Passed: 6
+Failed: 0
+Total:  6
+Status: Ô£ô ALL TESTS PASSED
+
+00:00 +16: test\gc_fixes_test.dart: GC and Memory Management Fixes deletedCount resets after compact
+00:00 +17: test\gc_fixes_test.dart: GC and Memory Management Fixes deletedCount resets after compact
+00:00 +18: test\gc_fixes_test.dart: GC and Memory Management Fixes deletedCount resets after compact
+00:00 +19: test\gc_fixes_test.dart: GC and Memory Management Fixes deletedCount resets after compact
+00:00 +20: test\gc_fixes_test.dart: GC and Memory Management Fixes deletedCount resets after compact
+00:00 +21: test\gc_fixes_test.dart: GC and Memory Management Fixes deletedCount resets after compact
+00:00 +22: test\gc_fixes_test.dart: GC and Memory Management Fixes deletedCount resets after compact
+00:00 +23: test\gc_fixes_test.dart: GC and Memory Management Fixes deletedCount resets after compact
+00:00 +24: test\gc_fixes_test.dart: GC and Memory Management Fixes deletedCount resets after compact
+00:00 +25: test\gc_fixes_test.dart: GC and Memory Management Fixes deletedCount resets after compact
+00:00 +26: test\gc_fixes_test.dart: GC and Memory Management Fixes deletedCount resets after compact
+00:00 +27: test\gc_fixes_test.dart: GC and Memory Management Fixes deletedCount resets after compact
+00:00 +28: test\gc_fixes_test.dart: GC and Memory Management Fixes deletedCount resets after compact
+00:00 +29: test\property_test.dart: FastDB Core Properties Insert and findById should return identical document (testing 100 inputs)
+00:00 +30: test\property_test.dart: FastDB Core Properties Insert and findById should return identical document (testing 100 inputs)
+00:00 +31: test\property_test.dart: FastDB Core Properties Insert and findById should return identical document (testing 100 inputs)
+00:00 +32: test\property_test.dart: FastDB Core Properties Insert and findById should return identical document (testing 100 inputs)
+00:00 +33: test\property_test.dart: FastDB Core Properties Insert and findById should return identical document (testing 100 inputs)
+00:00 +34: test\property_test.dart: FastDB Core Properties Insert and findById should return identical document (testing 100 inputs)
+00:00 +35: test\property_test.dart: FastDB Core Properties Insert and findById should return identical document (testing 100 inputs)
+00:00 +36: test\property_test.dart: FastDB Core Properties Insert and findById should return identical document (testing 100 inputs)
+00:00 +37: test\property_test.dart: FastDB Core Properties Insert and findById should return identical document (testing 100 inputs)
+00:00 +38: test\property_test.dart: FastDB Core Properties Insert and findById should return identical document (testing 100 inputs)
+00:00 +39: test\property_test.dart: FastDB Core Properties Insert and findById should return identical document (testing 100 inputs)
+00:00 +40: test\property_test.dart: FastDB Core Properties Insert and findById should return identical document (testing 100 inputs)
+00:00 +41: test\property_test.dart: FastDB Core Properties Insert and findById should return identical document (testing 100 inputs)
+00:00 +42: test\property_test.dart: FastDB Core Properties Insert and findById should return identical document (testing 100 inputs)
+00:00 +43: test\property_test.dart: FastDB Core Properties Insert and findById should return identical document (testing 100 inputs)
+00:00 +44: test\property_test.dart: FastDB Core Properties Insert and findById should return identical document (testing 100 inputs)
+00:00 +45: test\property_test.dart: FastDB Core Properties Insert and findById should return identical document (testing 100 inputs)
+00:00 +46: test\fastdb_test.dart: WAL crash recovery committed WAL data survives reopen
+00:00 +47: test\gc_fixes_test.dart: GC and Memory Management Fixes large batch insert with write-behind does not OOM
+00:00 +48: test\gc_fixes_test.dart: GC and Memory Management Fixes large batch insert with write-behind does not OOM
+00:00 +49: test\property_test.dart: FastDB Core Properties Update modifies document correctly (testing 100 inputs)
+00:00 +50: test\property_test.dart: FastDB Core Properties Update modifies document correctly (testing 100 inputs)
+00:00 +51: test\fastdb_test.dart: IoStorageStrategy data persists across multiple sessions
+00:00 +52: test\property_test.dart: FastDB Core Properties Delete removes the document completely (testing 100 inputs)
+00:00 +53: test\property_test.dart: FastDB Core Properties Delete removes the document completely (testing 100 inputs)
+00:00 +54: test\property_test.dart: FastDB Core Properties Delete removes the document completely (testing 100 inputs)
+00:00 +55: test\fastdb_test.dart: write serialization concurrent inserts do not corrupt _nextId
+00:00 +55: test\property_test.dart: Transactions Edge Cases Transaction rollback leaves DB unchanged (testing 100 inputs)
+DEBUG: Testing rollback with 7 docs
+00:00 +56: test\property_test.dart: Transactions Edge Cases Transaction rollback leaves DB unchanged (testing 100 inputs)
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_6ffadf99
+00:00 +57: test\property_test.dart: Transactions Edge Cases Transaction rollback leaves DB unchanged (testing 100 inputs)
+00:00 +58: test\property_test.dart: Transactions Edge Cases Transaction rollback leaves DB unchanged (testing 100 inputs)
+DEBUG: Testing rollback with 10 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_efac5240
+00:00 +59: test\property_test.dart: Transactions Edge Cases Transaction rollback leaves DB unchanged (testing 100 inputs)
+00:00 +60: test\property_test.dart: Transactions Edge Cases Transaction rollback leaves DB unchanged (testing 100 inputs)
+DEBUG: Testing rollback with 1 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_8aa75f54
+00:00 +61: test\property_test.dart: Transactions Edge Cases Transaction rollback leaves DB unchanged (testing 100 inputs)
+00:00 +62: test\property_test.dart: Transactions Edge Cases Transaction rollback leaves DB unchanged (testing 100 inputs)
+DEBUG: Testing rollback with 9 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_5484470c
+00:00 +63: test\property_test.dart: Transactions Edge Cases Transaction rollback leaves DB unchanged (testing 100 inputs)
+DEBUG: Testing rollback with 4 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_eef20575
+00:00 +64: test\property_test.dart: Transactions Edge Cases Transaction rollback leaves DB unchanged (testing 100 inputs)
+DEBUG: Testing rollback with 7 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_d5b3eb7
+DEBUG: Testing rollback with 6 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_98f1b2ff
+00:00 +65: test\property_test.dart: Transactions Edge Cases Transaction rollback leaves DB unchanged (testing 100 inputs)
+00:00 +66: test\property_test.dart: Transactions Edge Cases Transaction rollback leaves DB unchanged (testing 100 inputs)
+00:00 +67: test\property_test.dart: Transactions Edge Cases Transaction rollback leaves DB unchanged (testing 100 inputs)
+00:00 +68: test\property_test.dart: Transactions Edge Cases Transaction rollback leaves DB unchanged (testing 100 inputs)
+00:00 +69: test\property_test.dart: Transactions Edge Cases Transaction rollback leaves DB unchanged (testing 100 inputs)
+00:00 +70: test\property_test.dart: Transactions Edge Cases Transaction rollback leaves DB unchanged (testing 100 inputs)
+00:01 +71: test\property_test.dart: Transactions Edge Cases Transaction rollback leaves DB unchanged (testing 100 inputs)
+DEBUG: Testing rollback with 1 docs
+00:01 +72: test\property_test.dart: Transactions Edge Cases Transaction rollback leaves DB unchanged (testing 100 inputs)
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_7235394
+00:01 +73: test\property_test.dart: Transactions Edge Cases Transaction rollback leaves DB unchanged (testing 100 inputs)
+00:01 +74: test\property_test.dart: Transactions Edge Cases Transaction rollback leaves DB unchanged (testing 100 inputs)
+00:01 +75: test\property_test.dart: Transactions Edge Cases Transaction rollback leaves DB unchanged (testing 100 inputs)
+00:01 +76: test\property_test.dart: Transactions Edge Cases Transaction rollback leaves DB unchanged (testing 100 inputs)
+00:01 +77: test\property_test.dart: Transactions Edge Cases Transaction rollback leaves DB unchanged (testing 100 inputs)
+00:01 +78: test\property_test.dart: Transactions Edge Cases Transaction rollback leaves DB unchanged (testing 100 inputs)
+00:01 +79: test\property_test.dart: Transactions Edge Cases Transaction rollback leaves DB unchanged (testing 100 inputs)
+00:01 +80: test\property_test.dart: Transactions Edge Cases Transaction rollback leaves DB unchanged (testing 100 inputs)
+00:01 +81: test\property_test.dart: Transactions Edge Cases Transaction rollback leaves DB unchanged (testing 100 inputs)
+00:01 +82: test\property_test.dart: Transactions Edge Cases Transaction rollback leaves DB unchanged (testing 100 inputs)
+00:01 +83: test\property_test.dart: Transactions Edge Cases Transaction rollback leaves DB unchanged (testing 100 inputs)
+00:01 +84: test\property_test.dart: Transactions Edge Cases Transaction rollback leaves DB unchanged (testing 100 inputs)
+00:01 +85: test\property_test.dart: Transactions Edge Cases Transaction rollback leaves DB unchanged (testing 100 inputs)
+DEBUG: Testing rollback with 8 docs
+00:01 +86: test\property_test.dart: Transactions Edge Cases Transaction rollback leaves DB unchanged (testing 100 inputs)
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_d83dd4c5
+00:01 +87: test\property_test.dart: Transactions Edge Cases Transaction rollback leaves DB unchanged (testing 100 inputs)
+00:01 +88: test\property_test.dart: Transactions Edge Cases Transaction rollback leaves DB unchanged (testing 100 inputs)
+DEBUG: Testing rollback with 18 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_d0077e19
+DEBUG: Testing rollback with 10 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_87ef0732
+DEBUG: Testing rollback with 15 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_267e5f07
+DEBUG: Testing rollback with 6 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_2f181f9c
+DEBUG: Testing rollback with 19 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_9ec0d630
+DEBUG: Testing rollback with 14 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_dc31c946
+DEBUG: Testing rollback with 12 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_f9eb7c96
+DEBUG: Testing rollback with 12 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_e1fcee
+DEBUG: Testing rollback with 7 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_e4f44e26
+DEBUG: Testing rollback with 6 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_209bba5e
+DEBUG: Testing rollback with 14 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_224f5c25
+DEBUG: Testing rollback with 0 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_a4156c42
+DEBUG: Testing rollback with 22 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_fc70bd07
+DEBUG: Testing rollback with 23 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_be4530fc
+DEBUG: Testing rollback with 11 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_fdc142d5
+DEBUG: Testing rollback with 11 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_dbd3f336
+DEBUG: Testing rollback with 26 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_f04ada6f
+DEBUG: Testing rollback with 24 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_d445b19d
+DEBUG: Testing rollback with 3 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_f1bf7505
+DEBUG: Testing rollback with 34 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_219f402a
+DEBUG: Testing rollback with 5 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_5f4cc39d
+DEBUG: Testing rollback with 16 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_1f85291
+DEBUG: Testing rollback with 17 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_bf7531f1
+DEBUG: Testing rollback with 14 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_b761125a
+DEBUG: Testing rollback with 20 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_1db85112
+DEBUG: Testing rollback with 34 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_fd6d9797
+DEBUG: Testing rollback with 42 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_84da2594
+DEBUG: Testing rollback with 33 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_88abe20b
+DEBUG: Testing rollback with 44 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_89c8a341
+DEBUG: Testing rollback with 15 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_4b6c59d4
+DEBUG: Testing rollback with 36 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_5ffc3da0
+DEBUG: Testing rollback with 33 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_582620fc
+DEBUG: Testing rollback with 48 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_79a2195d
+DEBUG: Testing rollback with 51 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_60cdcfa9
+DEBUG: Testing rollback with 11 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_e6bf0115
+DEBUG: Testing rollback with 6 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_8248833e
+DEBUG: Testing rollback with 42 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_ed70d0bb
+DEBUG: Testing rollback with 6 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_ab1dc8af
+DEBUG: Testing rollback with 41 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_bd8c9dc4
+DEBUG: Testing rollback with 23 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_73bac808
+DEBUG: Testing rollback with 51 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_dc1e3918
+DEBUG: Testing rollback with 54 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_23f6753e
+DEBUG: Testing rollback with 59 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_d6f580c8
+DEBUG: Testing rollback with 27 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_185a0410
+DEBUG: Testing rollback with 5 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_eeb0e1d5
+DEBUG: Testing rollback with 20 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_956746f7
+DEBUG: Testing rollback with 37 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_cb3832f4
+DEBUG: Testing rollback with 17 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_dbdb6c08
+DEBUG: Testing rollback with 42 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_f06b4a48
+DEBUG: Testing rollback with 20 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_cbff13b9
+DEBUG: Testing rollback with 62 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_1f2fcaf7
+DEBUG: Testing rollback with 4 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_720d41a1
+DEBUG: Testing rollback with 67 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_1a77e616
+DEBUG: Testing rollback with 25 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_f7f6dfc1
+DEBUG: Testing rollback with 42 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_e319a8bb
+DEBUG: Testing rollback with 21 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_9befa350
+DEBUG: Testing rollback with 43 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_3a58989b
+DEBUG: Testing rollback with 60 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_9e5f39dd
+DEBUG: Testing rollback with 53 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_cc384a44
+DEBUG: Testing rollback with 44 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_402c77a2
+DEBUG: Testing rollback with 78 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_c678fcac
+DEBUG: Testing rollback with 66 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_45ebaa0c
+DEBUG: Testing rollback with 65 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_fe72cf90
+DEBUG: Testing rollback with 10 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_55142d41
+DEBUG: Testing rollback with 45 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_27ee5435
+DEBUG: Testing rollback with 10 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_fcb5c140
+DEBUG: Testing rollback with 61 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_624141fa
+DEBUG: Testing rollback with 36 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_b0cd836f
+DEBUG: Testing rollback with 14 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_8c277817
+DEBUG: Testing rollback with 23 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_e3bd2eef
+DEBUG: Testing rollback with 88 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_7bfe9659
+DEBUG: Testing rollback with 82 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_7f220d99
+DEBUG: Testing rollback with 57 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_fba6e1b3
+DEBUG: Testing rollback with 53 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_a5499ca4
+DEBUG: Testing rollback with 68 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_d72614b7
+DEBUG: Testing rollback with 27 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_29c39529
+DEBUG: Testing rollback with 51 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_98751b15
+DEBUG: Testing rollback with 40 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_16dce7fc
+DEBUG: Testing rollback with 49 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_b1d547fe
+DEBUG: Testing rollback with 11 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_202eb69e
+DEBUG: Testing rollback with 41 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_c73b526a
+DEBUG: Testing rollback with 16 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_91724a00
+DEBUG: Testing rollback with 90 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_41c1c4ed
+DEBUG: Testing rollback with 63 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_f5b09d77
+DEBUG: Testing rollback with 32 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_ae9c8685
+DEBUG: Testing rollback with 91 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_9a939c8b
+DEBUG: Testing rollback with 17 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_c4341bff
+DEBUG: Testing rollback with 12 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_5d734e36
+DEBUG: Testing rollback with 14 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_90810186
+DEBUG: Testing rollback with 65 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_2f5cfd3
+DEBUG: Testing rollback with 37 docs
+DEBUG: Temp Dir: C:\Users\gonoj\AppData\Local\Temp\fastdb_prop_test_75f23c33
+00:07 +89: test\property_test.dart: Query Invariants HashIndex finds exact matches (testing 100 inputs)
+00:09 +90: All tests passed!
