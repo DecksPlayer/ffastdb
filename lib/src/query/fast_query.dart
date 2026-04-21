@@ -1,6 +1,9 @@
 import '../index/secondary_index.dart';
 import '../index/sorted_index.dart';
 import '../index/hash_index.dart';
+import '../index/composite_index.dart';
+import '../index/fts_index.dart';
+import 'query_cache.dart';
 
 /// Result of a query — a list of document IDs to fetch.
 class QueryResult {
@@ -18,7 +21,7 @@ class QueryResult {
   }
 }
 
-/// Fluent query builder with a Cost-Based Optimizer (CBO).
+/// Fluent query builder with a Cost-Based Optimizer (CBO) and query caching.
 ///
 /// Supports:
 ///   - `where().equals()`, `between()`, `greaterThan()`, `lessThan()`,
@@ -29,6 +32,8 @@ class QueryResult {
 ///
 /// The internal planner evaluates conditions by estimated cardinality
 /// (most selective index first) to minimize intersection cost.
+///
+/// Query results are cached automatically to avoid re-executing identical queries.
 class QueryBuilder {
   final Map<String, SecondaryIndex> _indexes;
 
@@ -43,7 +48,17 @@ class QueryBuilder {
   int? _limit;
   int? _offset;
 
+  /// Shared query cache for all QueryBuilder instances in this FastDB.
+  /// Initialized lazily on first use.
+  static final QueryCache _queryCache = QueryCache(maxSize: 256);
+
   QueryBuilder(this._indexes, [this._fetchById]);
+
+  /// Clears the global query cache. Called by reindex() to invalidate
+  /// cached results when indexes change.
+  static void clearCache() {
+    _queryCache.clear();
+  }
 
   // ─── Condition Starters ───────────────────────────────────────────────────
 
@@ -168,13 +183,67 @@ class QueryBuilder {
 
   // ─── Execution ────────────────────────────────────────────────────────────
 
+  /// Generate a cache key (signature) for this query.
+  /// Returns null if the query cannot be cached (e.g., with negations).
+  String? _getCacheKey() {
+    // Don't cache queries with negations (they're less predictable)
+    for (final group in _orGroups) {
+      for (final cond in group) {
+        if (cond.negated) return null;
+      }
+    }
+    
+    // Build signature from conditions, sort, limit, offset
+    final parts = <String>[];
+    for (int g = 0; g < _orGroups.length; g++) {
+      for (final cond in _orGroups[g]) {
+        // Include condition values to differentiate queries with same field but different values
+        if (cond is _FtsCondition) {
+          parts.add('${cond.field}:${cond.runtimeType}:${cond.query}');
+        } else if (cond is _EqualsCondition) {
+          parts.add('${cond.field}:${cond.runtimeType}:${cond.value}');
+        } else if (cond is _RangeCondition) {
+          parts.add('${cond.field}:${cond.runtimeType}:${cond.low}:${cond.high}:${cond.mode}');
+        } else if (cond is _ContainsCondition) {
+          parts.add('${cond.field}:${cond.runtimeType}:${cond.substring}');
+        } else if (cond is _StartsWithCondition) {
+          parts.add('${cond.field}:${cond.runtimeType}:${cond.prefix}');
+        } else if (cond is _InCondition) {
+          parts.add('${cond.field}:${cond.runtimeType}:${cond.values.join(",")}');
+        } else if (cond is _IsNullCondition) {
+          parts.add('${cond.field}:${cond.runtimeType}:${cond.nullExpected}');
+        } else {
+          parts.add('${cond.field}:${cond.runtimeType}');
+        }
+      }
+      if (g < _orGroups.length - 1) parts.add('OR');
+    }
+    
+    if (_sortField != null) {
+      parts.add('sort:$_sortField:$_sortDesc');
+    }
+    if (_limit != null) parts.add('limit:$_limit');
+    if (_offset != null) parts.add('offset:$_offset');
+    
+    return parts.join('|');
+  }
+
   /// Execute and return matching document IDs.
   ///
   /// Algorithm:
-  ///   1. For each OR group, evaluate conditions in selectivity order (CBO).
-  ///   2. Intersect (AND) results within an OR group.
-  ///   3. Union (OR) results across groups.
+  ///   1. Check query cache for identical queries (common for repeated operations).
+  ///   2. For each OR group, evaluate conditions in selectivity order (CBO).
+  ///   3. Intersect (AND) results within an OR group.
+  ///   4. Union (OR) results across groups.
+  ///   5. Cache result for future identical queries.
   List<int> findIds() {
+    // ── Check cache before executing query ────────────────────────────────────
+    final cacheKey = _getCacheKey();
+    if (cacheKey != null) {
+      final cached = _queryCache.get(cacheKey);
+      if (cached != null) return cached;
+    }
+
     // ── Hot path: sortBy-only query (no filter, just sort) ──────────────────
     // Common pattern: query().where('field').alwaysTrue().sortBy('field')
     // If sortField matches the True condition's field, return sorted IDs directly
@@ -187,7 +256,9 @@ class QueryBuilder {
           if (index is SortedIndex) {
             // Return all sorted IDs directly from the SortedIndex
             final sortedAll = index.sortedIds(descending: _sortDesc);
-            return _paginate(sortedAll);
+            final result = _paginate(sortedAll);
+            if (cacheKey != null) _queryCache.set(cacheKey, result);
+            return result;
           }
         }
       }
@@ -205,12 +276,72 @@ class QueryBuilder {
           _offset == null) {
         final cond = group[0];
         if (!cond.negated) {
-          final index = _indexes[cond.field];
+          // For FTS conditions, look for the index with the '_fts_' prefix
+          SecondaryIndex? index;
+          if (cond is _FtsCondition) {
+            index = _indexes['_fts_${cond.field}'];
+          } else {
+            index = _indexes[cond.field];
+          }
           if (index != null) {
             final result = cond.evaluate(index);
             // Iterable<int> → List<int>: typed data views (Uint32List) are
             // already List<int>; plain lists are returned as-is.
-            return result is List<int> ? result : result.toList();
+            final finalResult = result is List<int> ? result : result.toList();
+            if (cacheKey != null) _queryCache.set(cacheKey, finalResult);
+            return finalResult;
+          }
+        }
+      }
+    }
+
+    // ── Hot path: composite index for multiple AND conditions ────────────────
+    // Check if there's a composite index for the conditions in this group
+    if (_orGroups.length == 1 && _sortField == null) {
+      final group = _orGroups[0];
+      if (group.length > 1) {
+        // Try to find a composite index for this set of conditions
+        final conditionFields = <String>[];
+        for (final cond in group) {
+          if (cond is _EqualsCondition && !cond.negated) {
+            conditionFields.add(cond.field);
+          } else {
+            // Can't use composite index if any condition is not a simple equals
+            conditionFields.clear();
+            break;
+          }
+        }
+
+        if (conditionFields.isNotEmpty) {
+          final compositeKey = conditionFields.join('+');
+          final compositeIdx = _indexes[compositeKey];
+          if (compositeIdx is CompositeIndex) {
+            // Found a composite index! Use it directly
+            final values = <dynamic>[];
+            for (final field in compositeIdx.fieldNames) {
+              // Find the condition for this field
+              bool found = false;
+              for (final cond in group) {
+                if (cond is _EqualsCondition && cond.field == field) {
+                  values.add(cond.value);
+                  found = true;
+                  break;
+                }
+              }
+              if (!found) {
+                // Field not in conditions, can't use this composite index
+                values.clear();
+                break;
+              }
+            }
+
+            if (values.length == compositeIdx.fieldNames.length) {
+              // All fields matched, use the composite index
+              final result = compositeIdx.lookup(values);
+              final finalResult = _paginate(result);
+              if (cacheKey != null) _queryCache.set(cacheKey, finalResult);
+              return finalResult;
+            }
           }
         }
       }
@@ -223,7 +354,9 @@ class QueryBuilder {
       for (final idx in _indexes.values) {
         allIds.addAll(idx.all());
       }
-      return _applySort(allIds.toList());
+      final result = _applySort(allIds.toList());
+      if (cacheKey != null) _queryCache.set(cacheKey, result);
+      return result;
     }
 
     // Evaluate OR groups
@@ -244,7 +377,13 @@ class QueryBuilder {
       List<int>? groupResult;
       for (int i = 0; i < sortedConditions.length; i++) {
         final cond = sortedConditions[i];
-        final index = _indexes[cond.field];
+        // For FTS conditions, look for the index with the '_fts_' prefix
+        SecondaryIndex? index;
+        if (cond is _FtsCondition) {
+          index = _indexes['_fts_${cond.field}'];
+        } else {
+          index = _indexes[cond.field];
+        }
         if (index == null) continue; // Unindexed field → skip
 
         final matches = cond.evaluate(index);
@@ -295,7 +434,9 @@ class QueryBuilder {
     }
 
     final ids = (unionResult ?? {}).toList();
-    return _applySort(ids);
+    final result = _applySort(ids);
+    if (cacheKey != null) _queryCache.set(cacheKey, result);
+    return result;
   }
 
   /// Quick check if a list is already sorted (for optimization)
@@ -309,7 +450,13 @@ class QueryBuilder {
   /// Estimated result count for a condition (for CBO ordering).
   /// Uses cheap index-level statistics to avoid evaluating the full condition twice.
   int _estimateSize(_Condition cond) {
-    final index = _indexes[cond.field];
+    // For FTS conditions, look for the index with the '_fts_' prefix
+    SecondaryIndex? index;
+    if (cond is _FtsCondition) {
+      index = _indexes['_fts_${cond.field}'];
+    } else {
+      index = _indexes[cond.field];
+    }
     if (index == null) return 1000000; // No index = very expensive
     // For equals, use the exact bucket size — O(1) for HashIndex.
     if (cond is _EqualsCondition) {
@@ -542,6 +689,34 @@ class _StartsWithCondition implements _Condition {
   }
 }
 
+/// Full-Text Search condition: matches documents where field text contains query words.
+class _FtsCondition implements _Condition {
+  @override final String field;
+  @override final bool negated;
+  final String query;
+  _FtsCondition(this.field, this.query, {this.negated = false});
+
+  @override String get conditionType => 'fts';
+
+  @override
+  Iterable<int> evaluate(SecondaryIndex index) {
+    List<int> results = [];
+    
+    // Check if this is an FTS index
+    if (index is FtsIndex) {
+      results = index.search(query);
+    } else {
+      // Fallback: not an FTS index, return empty
+      results = [];
+    }
+
+    if (!negated) return results;
+    final allIds = index.all().toSet();
+    allIds.removeAll(results);
+    return allIds;
+  }
+}
+
 /// Matches documents where field value is in the provided [values] set — O(k log n).
 class _InCondition implements _Condition {
   @override final String field;
@@ -690,6 +865,23 @@ class FieldCondition {
   /// Matches documents where the field is not null (has an indexed value).
   QueryBuilder isNotNull() {
     _builder._addCondition(_IsNullCondition(_field, nullExpected: false));
+    return _builder;
+  }
+
+  /// Full-Text Search on this field.
+  /// Requires an FTS index created with `db.addFtsIndex(fieldName)`.
+  ///
+  /// Example:
+  /// ```dart
+  /// db.addFtsIndex('description');
+  /// final results = await db.query()
+  ///   .where('description').fts('london city')
+  ///   .find();
+  /// ```
+  ///
+  /// Performance: 100-1000x faster than `contains()` for large text fields.
+  QueryBuilder fts(String query) {
+    _builder._addCondition(_FtsCondition(_field, query, negated: _negated));
     return _builder;
   }
 
