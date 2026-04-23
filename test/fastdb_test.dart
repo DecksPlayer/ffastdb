@@ -58,6 +58,60 @@ void main() {
     });
   });
 
+  // ── Regression tests: duplicate ID bugs ────────────────────────────────────
+  group('No duplicate IDs (regression)', () {
+    late FastDB db;
+
+    setUp(() async {
+      db = FastDB(MemoryStorageStrategy());
+      await db.open();
+    });
+
+    tearDown(() => db.close());
+
+    test('getAll returns no duplicate docs after sequential inserts', () async {
+      for (int i = 0; i < 5; i++) {
+        await db.insert({'n': i});
+      }
+      final all = await db.getAll();
+      expect(all.length, 5);
+      final ids = await db.rangeSearch(1, 100);
+      expect(ids.toSet().length, ids.length, reason: 'rangeSearch returned duplicate IDs');
+    }, timeout: Timeout(Duration(minutes: 1)));
+
+    test('getAll returns no duplicates after insertAll on empty db', () async {
+      await db.insertAll(List.generate(10, (i) => {'n': i}));
+      final all = await db.getAll();
+      expect(all.length, 10);
+      final ids = await db.rangeSearch(1, 100);
+      expect(ids.toSet().length, ids.length, reason: 'rangeSearch returned duplicate IDs');
+    });
+
+    test('insertAll after existing data does not duplicate old docs', () async {
+      for (int i = 0; i < 5; i++) {
+        await db.insert({'n': i});
+      }
+      await db.insertAll(List.generate(5, (i) => {'n': i + 5}));
+      final all = await db.getAll();
+      expect(all.length, 10, reason: 'Expected 10 docs, insertAll duplicated old data');
+      final ids = await db.rangeSearch(1, 100);
+      expect(ids.toSet().length, ids.length, reason: 'rangeSearch returned duplicate IDs');
+    });
+
+    test('beginBatch/commitBatch after existing data does not duplicate', () async {
+      await db.insert({'n': 0});
+      await db.insert({'n': 1});
+      await db.beginBatch();
+      await db.insert({'n': 2});
+      await db.insert({'n': 3});
+      await db.commitBatch();
+      final all = await db.getAll();
+      expect(all.length, 4, reason: 'Expected 4 docs after batch, got ${all.length}');
+      final ids = await db.rangeSearch(1, 100);
+      expect(ids.toSet().length, ids.length, reason: 'rangeSearch returned duplicate IDs');
+    });
+  });
+
   group('HashIndex queries', () {
     late FastDB db;
 
@@ -76,13 +130,13 @@ void main() {
 
     tearDown(() => db.close());
 
-    test('equals query', () {
-      final ids = db.query().where('city').equals('London').findIds();
+    test('equals query', () async {
+      final ids = await db.query().where('city').equals('London').findIds();
       expect(ids.length, 2);
     });
 
-    test('OR query across cities', () {
-      final ids = db.query()
+    test('OR query across cities', () async {
+      final ids = await db.query()
           .where('city').equals('London')
           .or()
           .where('city').equals('Paris')
@@ -90,18 +144,18 @@ void main() {
       expect(ids.length, 3);
     });
 
-    test('IN query', () {
-      final ids = db.query().where('city').isIn(['London', 'Tokyo']).findIds();
+    test('IN query', () async {
+      final ids = await db.query().where('city').isIn(['London', 'Tokyo']).findIds();
       expect(ids.length, 3);
     });
 
-    test('NOT equals query', () {
-      final ids = db.query().where('city').not().equals('London').findIds();
+    test('NOT equals query', () async {
+      final ids = await db.query().where('city').not().equals('London').findIds();
       expect(ids.length, 2); // Paris + Tokyo
     });
 
-    test('alwaysTrue returns all indexed docs', () {
-      final ids = db.query().where('city').alwaysTrue().findIds();
+    test('alwaysTrue returns all indexed docs', () async {
+      final ids = await db.query().where('city').alwaysTrue().findIds();
       expect(ids.length, 4);
     });
   });
@@ -123,13 +177,13 @@ void main() {
 
     tearDown(() => db.close());
 
-    test('range query is O(log n) with early exit', () {
-      final ids = db.query().where('age').between(25, 32).findIds();
+    test('range query is O(log n) with early exit', () async {
+      final ids = await db.query().where('age').between(25, 32).findIds();
       expect(ids.length, 2); // Bob (25) + Alice (30)
     });
 
-    test('greaterThan query', () {
-      final ids = db.query().where('age').greaterThan(29).findIds();
+    test('greaterThan query', () async {
+      final ids = await db.query().where('age').greaterThan(29).findIds();
       expect(ids.length, 2); // Alice (30) + Charlie (35)
     });
   });
@@ -150,13 +204,13 @@ void main() {
 
     tearDown(() => db.close());
 
-    test('boolean equals lookup', () {
-      final ids = db.query().where('active').equals(true).findIds();
+    test('boolean equals lookup', () async {
+      final ids = await db.query().where('active').equals(true).findIds();
       expect(ids.length, 2); // Alice + Charlie
     });
 
-    test('NOT boolean lookup', () {
-      final ids = db.query().where('active').not().equals(true).findIds();
+    test('NOT boolean lookup', () async {
+      final ids = await db.query().where('active').not().equals(true).findIds();
       expect(ids.length, 1); // Bob
     });
   });
@@ -715,7 +769,7 @@ void main() {
       final db2 = FastDB(IoStorageStrategy(path));
       db2.addIndex('city');
       await db2.open();
-      final parisIds = db2.query().where('city').equals('Paris').findIds();
+      final parisIds = await db2.query().where('city').equals('Paris').findIds();
       expect(parisIds.length, 1);
       final doc = await db2.findById(parisIds.first);
       expect(doc['name'], 'Alice');
@@ -847,12 +901,12 @@ void main() {
 
       // Add index AFTER data exists — it is empty until reindex()
       db.addIndex('city');
-      expect(db.query().where('city').equals('London').findIds(), isEmpty);
+      expect(await db.query().where('city').equals('London').findIds(), isEmpty);
 
       // Now reindex
       await db.reindex('city');
 
-      final londonIds = db.query().where('city').equals('London').findIds();
+      final londonIds = await db.query().where('city').equals('London').findIds();
       expect(londonIds.length, 2);
       await db.close();
     });
@@ -876,8 +930,8 @@ void main() {
       // Rebuild all
       await db.reindex();
 
-      expect(db.query().where('city').equals('Paris').findIds().length, 1);
-      expect(db.query().where('name').equals('Alice').findIds().length, 1);
+      expect((await db.query().where('city').equals('Paris').findIds()).length, 1);
+      expect((await db.query().where('name').equals('Alice').findIds()).length, 1);
       await db.close();
     });
 

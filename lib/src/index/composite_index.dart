@@ -1,3 +1,6 @@
+import 'dart:convert';
+import 'dart:typed_data';
+import 'package:meta/meta.dart';
 import 'secondary_index.dart';
 
 /// Composite (multi-field) index for efficient multi-condition queries.
@@ -24,6 +27,7 @@ import 'secondary_index.dart';
 ///   .where('status').equals('active')
 ///   .find();
 /// ```
+@internal
 class CompositeIndex extends SecondaryIndex {
   /// Field names that compose this index (in order).
   final List<String> fieldNames;
@@ -55,12 +59,19 @@ class CompositeIndex extends SecondaryIndex {
   }
 
   @override
+  Iterable<int> search(String operator, dynamic value) {
+    if (operator == 'equals') return lookup(value);
+    return [];
+  }
+
+  @override
   List<int> lookup(dynamic value) {
     if (value is! List) return [];
     if (value.length != fieldNames.length) return [];
 
     final key = _compositeKey(value);
-    return _entries[key] ?? [];
+    final matches = _entries[key];
+    return matches != null ? List<int>.from(matches) : [];
   }
 
   @override
@@ -130,5 +141,71 @@ class CompositeIndex extends SecondaryIndex {
     }
     // Clean up empty entries
     _entries.removeWhere((key, ids) => ids.isEmpty);
+  }
+
+  // ─── Persistence ──────────────────────────────────────────────────────────
+
+  Uint8List serialize() {
+    final buf = BytesBuilder();
+    _writeInt32(buf, fieldNames.length);
+    for (final f in fieldNames) {
+      final fBytes = Uint8List.fromList(utf8.encode(f));
+      _writeInt32(buf, fBytes.length);
+      buf.add(fBytes);
+    }
+    
+    _writeInt32(buf, _entries.length);
+    for (final entry in _entries.entries) {
+      final keyBytes = Uint8List.fromList(utf8.encode(entry.key));
+      _writeInt32(buf, keyBytes.length);
+      buf.add(keyBytes);
+      
+      _writeInt32(buf, entry.value.length);
+      for (final id in entry.value) {
+        _writeInt32(buf, id);
+      }
+    }
+    return buf.toBytes();
+  }
+
+  static CompositeIndex deserialize(Uint8List bytes) {
+    int off = 0;
+    int readInt32() {
+      final v = (bytes[off] & 0xFF) | ((bytes[off + 1] & 0xFF) << 8) |
+          ((bytes[off + 2] & 0xFF) << 16) | ((bytes[off + 3] & 0xFF) << 24);
+      off += 4;
+      return v;
+    }
+
+    final fieldCount = readInt32();
+    final fieldNames = <String>[];
+    for (int i = 0; i < fieldCount; i++) {
+      final fLen = readInt32();
+      fieldNames.add(utf8.decode(bytes.sublist(off, off + fLen)));
+      off += fLen;
+    }
+
+    final index = CompositeIndex(fieldNames);
+    final entryCount = readInt32();
+    for (int i = 0; i < entryCount; i++) {
+      final keyLen = readInt32();
+      final key = utf8.decode(bytes.sublist(off, off + keyLen));
+      off += keyLen;
+      
+      final idCount = readInt32();
+      final ids = <int>[];
+      for (int j = 0; j < idCount; j++) {
+        ids.add(readInt32());
+      }
+      index._entries[key] = ids;
+    }
+    return index;
+  }
+
+  void _writeInt32(BytesBuilder buf, int v) {
+    buf.addByte(v & 0xFF);
+    buf.addByte((v >> 8) & 0xFF);
+    buf.addByte((v >> 16) & 0xFF);
+    buf.addByte((v >> 24) & 0xFF);
   }
 }

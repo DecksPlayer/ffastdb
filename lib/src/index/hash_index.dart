@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:typed_data';
+import 'package:meta/meta.dart';
 import 'secondary_index.dart';
 import 'bloom_filter.dart';
 
@@ -13,6 +14,7 @@ const int _tInt64 = 5;  // 64-bit int — used for all new writes
 /// In-memory hash-based secondary index with persistence support.
 /// Fast O(1) lookups using optimized hash buckets for Isar-level performance.
 /// Uses FNV-1a hash for better distribution and reduced collisions.
+@internal
 class HashIndex implements SecondaryIndex {
   @override
   final String fieldName;
@@ -162,6 +164,16 @@ class HashIndex implements SecondaryIndex {
   }
 
   @override
+  Iterable<int> search(String operator, dynamic value) {
+    if (operator == 'equals') return lookup(value);
+    if (operator == 'notEquals') {
+      final matching = lookup(value).toSet();
+      return all().where((id) => !matching.contains(id));
+    }
+    return [];
+  }
+
+  @override
   List<int> lookup(dynamic value) {
     if (value == null) return [];
     
@@ -171,7 +183,8 @@ class HashIndex implements SecondaryIndex {
     
     for (final entry in bucket) {
       if (_equals(entry.value, value)) {
-        return entry.docIds;
+        // CRITICAL: Return a copy to prevent query engine from mutating the index
+        return List<int>.from(entry.docIds);
       }
     }
     return [];

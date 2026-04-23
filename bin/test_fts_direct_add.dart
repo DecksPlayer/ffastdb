@@ -18,16 +18,16 @@ void main() {
   print('');
   print('Searching directly in FtsIndex:');
   
-  var results = index.search('hello');
+  var results = index.search('fts', 'hello');
   print('  search("hello"): $results (expect [1])');
 
-  results = index.search('paris');
+  results = index.search('fts', 'paris');
   print('  search("paris"): $results (expect [2])');
 
-  results = index.search('london');
+  results = index.search('fts', 'london');
   print('  search("london"): $results (expect [1, 3])');
 
-  results = index.search('big');
+  results = index.search('fts', 'big');
   print('  search("big"): $results (expect [3])');
 
   print('');

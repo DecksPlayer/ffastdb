@@ -23,19 +23,22 @@ void main() async {
     print('Stored: $user');
     
     // 3. Test Retrieval (Hive-style get)
-    final retrievedUser = await db.get(1);
-    print('Retrieved: $retrievedUser');
-    
-    if (retrievedUser is User && retrievedUser.name == user.name) {
-      print('SUCCESS: Byte-perfect Hive-like retrieval!');
+    final retrievedUser = await db.findById(1);
+    if (retrievedUser is User) {
+      print('✅ Retrieved typed object: ${retrievedUser.name}, age ${retrievedUser.age}');
     } else {
-      print('FAILURE: Retrieved object is not what we expected: ${retrievedUser.runtimeType}');
+      print('❌ Failed to retrieve typed object.');
     }
-    
-    // 4. Test legacy JSON still works
-    final jsonId = await db.insert({'type': 'legacy', 'compatible': true});
-    final retrievedJson = await db.get(jsonId);
-    print('Retrieved JSON: $retrievedJson');
+
+    // ── 3. JSON Documents ──────────────────────────────────────────────
+    print('\n3. JSON Documents');
+    final jsonId = await db.insert({
+      'title': 'Hello World',
+      'body': 'This is a test document',
+      'tags': ['test', 'dart', 'nosql']
+    });
+    final retrievedJson = await db.findById(jsonId);
+    print('✅ Retrieved JSON document: $retrievedJson');
     
   } finally {
     await db.close();

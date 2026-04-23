@@ -44,8 +44,8 @@ void main() {
 
   group('FastDB Core Properties', () {
     Glados<Map<String, dynamic>>().test('Insert and findById should return identical document', (doc) async {
-      await FfastDb.disposeInstance();
-      final db = await FfastDb.init(MemoryStorageStrategy());
+      final db = FastDB(MemoryStorageStrategy());
+      await db.open();
 
       try {
         final id = await db.insert(doc);
@@ -54,7 +54,6 @@ void main() {
         expect(retrieved, isNotNull);
         
         for (final key in doc.keys) {
-          // Double NaN == NaN is false in Dart, handle this if Glados generates NaNs
           if (doc[key] is double && (doc[key] as double).isNaN) {
             expect((retrieved![key] as double).isNaN, isTrue);
           } else {
@@ -62,13 +61,13 @@ void main() {
           }
         }
       } finally {
-        await FfastDb.disposeInstance();
+        await db.close();
       }
     });
 
     Glados2<Map<String, dynamic>, Map<String, dynamic>>().test('Update modifies document correctly', (doc1, updateDoc) async {
-      await FfastDb.disposeInstance();
-      final db = await FfastDb.init(MemoryStorageStrategy());
+      final db = FastDB(MemoryStorageStrategy());
+      await db.open();
 
       try {
         final id = await db.insert(doc1);
@@ -78,7 +77,6 @@ void main() {
         final retrieved = await db.findById(id);
         expect(retrieved, isNotNull);
 
-        // All keys from updateDoc should be present and updated in retrieved
         for (final key in updateDoc.keys) {
            if (updateDoc[key] is double && (updateDoc[key] as double).isNaN) {
              expect((retrieved![key] as double).isNaN, isTrue);
@@ -87,7 +85,6 @@ void main() {
            }
         }
 
-        // Keys from doc1 that are NOT in updateDoc should still be present
         for (final key in doc1.keys) {
           if (!updateDoc.containsKey(key)) {
             if (doc1[key] is double && (doc1[key] as double).isNaN) {
@@ -98,13 +95,13 @@ void main() {
           }
         }
       } finally {
-        await FfastDb.disposeInstance();
+        await db.close();
       }
     });
 
     Glados<Map<String, dynamic>>().test('Delete removes the document completely', (doc) async {
-      await FfastDb.disposeInstance();
-      final db = await FfastDb.init(MemoryStorageStrategy());
+      final db = FastDB(MemoryStorageStrategy());
+      await db.open();
 
       try {
         final id = await db.insert(doc);
@@ -114,30 +111,33 @@ void main() {
         final retrieved = await db.findById(id);
         expect(retrieved, isNull);
       } finally {
-        await FfastDb.disposeInstance();
+        await db.close();
       }
     });
   });
 
   group('Transactions Edge Cases', () {
     Glados<List<Map<String, dynamic>>>().test('Transaction rollback leaves DB unchanged', (docs) async {
-      // Deep copy to prevent mutating glados input
       final testDocs = docs.map((d) => Map<String, dynamic>.from(d)).toList();
-      print('DEBUG: Testing rollback with ${testDocs.length} docs');
       
       final tempDir = await Directory.systemTemp.createTemp('fastdb_prop_test_');
-      print('DEBUG: Temp Dir: ${tempDir.path}');
       final path = '${tempDir.path}/db.fdb';
       final walPath = '${tempDir.path}/db.fdb.wal';
 
-      await FfastDb.disposeInstance();
-      final db = await FfastDb.init(WalStorageStrategy(
+      final db = FastDB(WalStorageStrategy(
         main: IoStorageStrategy(path),
         wal: IoStorageStrategy(walPath),
       ));
+      await db.open();
 
       final initialIds = await db.insertAll(testDocs);
-      await db.flush(); // Ensure all initial data is persisted before rollback test
+      await db.flush();
+      
+      if (initialIds.isEmpty) {
+        await db.close();
+        await tempDir.delete(recursive: true);
+        return;
+      }
       
       try {
         await db.transaction(() async {
@@ -154,25 +154,25 @@ void main() {
         final newIds = await db.rangeSearch(1, 100000);
         expect(newIds.length, initialIds.length);
         
-        if (initialIds.isNotEmpty) {
-          final doc = await db.findById(initialIds.last);
-          expect(doc, isNotNull);
-          expect(doc!['rolled_back'], isNull);
-        }
+        final doc = await db.findById(initialIds.last);
+        expect(doc, isNotNull);
+        expect(doc!['rolled_back'], isNull);
       } finally {
-        await FfastDb.disposeInstance();
-        await tempDir.delete(recursive: true);
+        await db.close();
+        await Future.delayed(const Duration(milliseconds: 50));
+        if (await tempDir.exists()) {
+          try { await tempDir.delete(recursive: true); } catch (_) {}
+        }
       }
     });
   });
 
   group('Query Invariants', () {
     Glados2<List<Map<String, dynamic>>, String>().test('HashIndex finds exact matches', (docs, searchWord) async {
-      await FfastDb.disposeInstance();
-      final db = await FfastDb.init(MemoryStorageStrategy());
+      final db = FastDB(MemoryStorageStrategy());
       db.addIndex('field');
+      await db.open();
 
-      // Add the searchWord to some documents exactly
       for (var i = 0; i < docs.length; i++) {
         if (i % 2 == 0) {
           docs[i]['field'] = searchWord;
@@ -180,8 +180,7 @@ void main() {
       }
 
       await db.insertAll(docs);
-
-      final resultIds = db.query().where('field').equals(searchWord).findIds();
+      final resultIds = await db.query().where('field').equals(searchWord).findIds();
       
       int actualCount = 0;
       for (final doc in docs) {
@@ -189,8 +188,7 @@ void main() {
       }
       
       expect(resultIds.length, actualCount);
-
-      await FfastDb.disposeInstance();
+      await db.close();
     });
   });
 }

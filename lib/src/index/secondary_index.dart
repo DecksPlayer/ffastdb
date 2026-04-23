@@ -1,4 +1,7 @@
+import 'package:meta/meta.dart';
+
 /// Abstract interface for secondary indexes.
+@internal
 abstract class SecondaryIndex {
   /// Name of the field this index covers.
   String get fieldName;
@@ -21,7 +24,11 @@ abstract class SecondaryIndex {
   /// Returns all (value, docId) pairs sorted by value.
   List<MapEntry<dynamic, List<int>>> sorted({bool descending = false});
 
-  /// Returns all document IDs stored in this index.
+  /// Returns all docIds that match the given operator and value.
+  /// Supported operators depend on the index type.
+  Iterable<int> search(String operator, dynamic value);
+
+  /// Returns the number of entries in this index.
   List<int> all();
 
   /// Returns the total number of indexed (docId, value) pairs.

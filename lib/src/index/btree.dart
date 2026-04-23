@@ -121,7 +121,7 @@ class BTree {
         await _splitChild(node, i, child);
         // After split: node gained a new separator key at keys[i].
         // Decide which of the two new children to descend into.
-        if (i < node.keys.length && key > node.keys[i]) i++;
+        if (i < node.keys.length && key >= node.keys[i]) i++;
         // key == separator: update the right child's leaf entry (i already correct).
       }
 
@@ -132,21 +132,50 @@ class BTree {
   }
 
   /// Bulk-loads the B-Tree from a sorted list of entries (ID -> Offset).
-  /// This is O(N) and creates a densely-packed, balanced tree.
+  ///
+  /// When the tree is empty this is a fast O(N) bottom-up build.
+  /// When the tree already has data:
+  ///   - If tree is small (< 500 entries): extract, merge, rebuild (safe memory usage).
+  ///   - If tree is large: use individual inserts (avoids OOM from extracting all entries).
+  /// This avoids both orphaning existing pages and losing median keys during splits.
   Future<void> bulkLoad(List<MapEntry<int, int>> sortedEntries) async {
     if (sortedEntries.isEmpty) return;
-    
+
+    List<MapEntry<int, int>> allEntries;
+    if (rootPage != null && rootPage != 0) {
+      // BUG FIX: If tree already has data, count existing entries first to decide strategy.
+      // Small tree (<500 entries) → extract and merge with new batch.
+      // Large tree (≥500 entries) → use individual inserts to avoid OOM.
+      final existingCount = await _countLeafEntries(rootPage!);
+      if (existingCount < 500) {
+        final existing = <MapEntry<int, int>>[];
+        await _extractLeafEntries(rootPage!, existing);
+        allEntries = _mergeSorted(existing, sortedEntries);
+      } else {
+        // Fall back to individual inserts for large trees (avoids OOM from bulk extraction).
+        for (final entry in sortedEntries) {
+          await insert(entry.key, entry.value);
+        }
+        return;
+      }
+    } else {
+      allEntries = sortedEntries;
+    }
+
+    if (allEntries.isEmpty) return;
+
+    // ── Fast O(N) bulk build ─────────────────────────────────────────────────
     // 1. Build Leaf Layer
     final targetFill = (kMaxKeys * 0.9).floor();
     final leafPages = <int>[];
     final separatorKeys = <int>[]; // First key of each leaf (except first)
 
-    for (int i = 0; i < sortedEntries.length; i += targetFill) {
-      final end = (i + targetFill < sortedEntries.length) 
-          ? i + targetFill 
-          : sortedEntries.length;
-      final chunk = sortedEntries.sublist(i, end);
-      
+    for (int i = 0; i < allEntries.length; i += targetFill) {
+      final end = (i + targetFill < allEntries.length)
+          ? i + targetFill
+          : allEntries.length;
+      final chunk = allEntries.sublist(i, end);
+
       final page = await pageManager.allocatePage();
       final node = BTreeNode(
         pageIndex: page,
@@ -163,6 +192,56 @@ class BTree {
     rootPage = await _buildInternalLayer(leafPages, separatorKeys);
   }
 
+  /// Counts the total number of entries (key-value pairs) in all leaf nodes.
+  /// Used to decide whether to extract+merge or use individual inserts.
+  Future<int> _countLeafEntries(int pageIdx) async {
+    final node = await _readNode(pageIdx);
+    if (node.isLeaf) {
+      return node.keys.length;
+    }
+    int total = 0;
+    for (final childPage in node.values) {
+      if (childPage > 0) total += await _countLeafEntries(childPage);
+    }
+    return total;
+  }
+
+  /// Recursively visits all leaf nodes and collects their (key, value) entries
+  /// in ascending key order.
+  Future<void> _extractLeafEntries(int pageIdx, List<MapEntry<int, int>> out) async {
+    final node = await _readNode(pageIdx);
+    if (node.isLeaf) {
+      for (int i = 0; i < node.keys.length; i++) {
+        out.add(MapEntry(node.keys[i], node.values[i]));
+      }
+    } else {
+      for (final childPage in node.values) {
+        if (childPage > 0) await _extractLeafEntries(childPage, out);
+      }
+    }
+  }
+
+  /// O(N+M) sorted merge of two sorted entry lists.
+  /// When both lists contain the same key, [b]'s entry wins (newer offset).
+  static List<MapEntry<int, int>> _mergeSorted(
+      List<MapEntry<int, int>> a, List<MapEntry<int, int>> b) {
+    final result = <MapEntry<int, int>>[];
+    int ia = 0, ib = 0;
+    while (ia < a.length && ib < b.length) {
+      if (a[ia].key < b[ib].key) {
+        result.add(a[ia++]);
+      } else if (a[ia].key > b[ib].key) {
+        result.add(b[ib++]);
+      } else {
+        result.add(b[ib++]); // newer entry wins
+        ia++;
+      }
+    }
+    while (ia < a.length) result.add(a[ia++]);
+    while (ib < b.length) result.add(b[ib++]);
+    return result;
+  }
+
   Future<int> _buildInternalLayer(List<int> childPages, List<int> separators) async {
     if (childPages.length == 1) return childPages[0];
 
@@ -174,15 +253,20 @@ class BTree {
     final childrenPerNode = targetFill + 1;
 
     int childIdx = 0; // index into childPages
-    int sepIdx = 0;   // index into separators
 
     while (childIdx < childPages.length) {
       final remaining = childPages.length - childIdx;
       final take = remaining < childrenPerNode ? remaining : childrenPerNode;
 
       final nodeChildren = childPages.sublist(childIdx, childIdx + take);
-      // Between `take` children there are `take - 1` separator keys.
-      final nodeKeys = separators.sublist(sepIdx, sepIdx + take - 1);
+      
+      // The keys in an internal node are the separators for children 1..N.
+      // Child 0 is the "leftmost" child and has no separator to its left in this node.
+      // The separator between child J-1 and child J is separators[childIdx + J - 1].
+      final nodeKeys = <int>[];
+      for (int j = 1; j < take; j++) {
+        nodeKeys.add(separators[childIdx + j - 1]);
+      }
 
       final page = await pageManager.allocatePage();
       final node = BTreeNode(
@@ -194,15 +278,14 @@ class BTree {
       await _writeNode(node);
       parentPages.add(page);
 
-      childIdx += take;
-      sepIdx += take - 1;
-
-      // The separator that links this parent node to the NEXT parent node
-      // is the first key of the next chunk's first child — i.e. separators[sepIdx].
-      if (childIdx < childPages.length) {
-        parentSeparators.add(separators[sepIdx]);
-        sepIdx++; // consume the inter-node separator
+      // The separator to promote to the parent layer is the one that would 
+      // have been between the last child of this node and the first child 
+      // of the NEXT node in this layer.
+      if (childIdx + take < childPages.length) {
+        parentSeparators.add(separators[childIdx + take - 1]);
       }
+      
+      childIdx += take;
     }
 
     return _buildInternalLayer(parentPages, parentSeparators);
@@ -219,20 +302,22 @@ class BTree {
     final rightNode = BTreeNode(
       pageIndex: newPage,
       isLeaf: fullChild.isLeaf,
-      keys: List.from(fullChild.keys.sublist(mid + 1)),
-      values: fullChild.isLeaf
-          ? List.from(fullChild.values.sublist(mid + 1))
-          : List.from(fullChild.values.sublist(mid + 1)),
+      keys: List.from(fullChild.keys.sublist(mid)),
+      values: List.from(fullChild.values.sublist(mid)),
     );
 
     // Promote median key to parent
-    final medianKey = fullChild.keys[mid];
+    final medianKey = rightNode.keys.first;
 
-    // Trim fullChild to left half
-    fullChild.keys.removeRange(mid, fullChild.keys.length);
     if (fullChild.isLeaf) {
+      // B+Tree style: keep median in the right child, remove from left
+      fullChild.keys.removeRange(mid, fullChild.keys.length);
       fullChild.values.removeRange(mid, fullChild.values.length);
     } else {
+      // B-Tree style: move median up, it's not needed in children
+      rightNode.keys.removeAt(0);
+      rightNode.values.removeAt(0);
+      fullChild.keys.removeRange(mid, fullChild.keys.length);
       fullChild.values.removeRange(mid + 1, fullChild.values.length);
     }
 
@@ -443,14 +528,17 @@ class BTree {
   Future<List<int>> rangeSearch(int low, int high) async {
     final results = <int>[];
     if (rootPage == null || rootPage == 0) return results;
-    await _rangeNode(rootPage!, low, high, results);
+    // seenIds prevents duplicate IDs in the output if the B-Tree has
+    // structural inconsistencies (e.g. after a failed bulkLoad or compaction).
+    final seenIds = <int>{};
+    await _rangeNode(rootPage!, low, high, results, null, seenIds);
     return results;
   }
 
-  Future<void> _rangeNode(int pageIdx, int low, int high, List<int> out, [Set<int>? visited]) async {
+  Future<void> _rangeNode(int pageIdx, int low, int high, List<int> out, [Set<int>? visited, Set<int>? seenIds]) async {
     visited ??= {};
+    seenIds ??= {};
     if (visited.contains(pageIdx)) {
-      // Debug print removed (avoid_print)
       return;
     }
     visited.add(pageIdx);
@@ -463,16 +551,14 @@ class BTree {
 
       if (!node.isLeaf && k > low) {
         if (node.values[i] > 0) {
-          await _rangeNode(node.values[i], low, high, out, visited);
-        } else {
-          // Debug print removed (avoid_print)
+          await _rangeNode(node.values[i], low, high, out, visited, seenIds);
         }
       }
 
       // All subsequent keys and right subtrees are also > high.
       if (k > high) return;
 
-      if (k >= low && node.isLeaf) out.add(k);
+      if (k >= low && node.isLeaf && seenIds.add(k)) out.add(k);
     }
 
     // Rightmost child holds keys > keys.last — only descend if it can overlap.
@@ -480,9 +566,7 @@ class BTree {
         node.values.length > node.keys.length &&
         (node.keys.isEmpty || node.keys.last < high)) {
       if (node.values.last > 0) {
-        await _rangeNode(node.values.last, low, high, out, visited);
-      } else {
-        // Debug print removed (avoid_print)
+        await _rangeNode(node.values.last, low, high, out, visited, seenIds);
       }
     }
   }

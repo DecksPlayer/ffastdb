@@ -60,7 +60,7 @@ class FastSerializer {
       JsonEncoder(_toEncodable).fuse(const Utf8Encoder()); // ignore: prefer_const_constructors
 
   /// Walks a decoded JSON value and restores all sentinel-encoded types.
-  static dynamic _revive(dynamic v) {
+  static dynamic revive(dynamic v) {
     if (v is String) {
       if (v.startsWith(_dtPrefix)) {
         return DateTime.parse(v.substring(_dtPrefix.length));
@@ -81,43 +81,52 @@ class FastSerializer {
       }
     }
     if (v is Map) {
-      return v.map((k, val) => MapEntry(k as String, _revive(val)));
+      return v.map((k, val) => MapEntry(k as String, revive(val)));
     }
-    if (v is List) return v.map(_revive).toList();
+    if (v is List) return v.map(revive).toList();
     return v;
   }
 
   /// Serializes a Map to a JSON-UTF8 binary byte array.
-  /// Includes a 4-byte little-endian length header.
+  /// Includes a 2-byte magic prefix [0x00, 0x01] and a 4-byte length header.
   static Uint8List serialize(Map<String, dynamic> doc) {
     final utf8Data = _encoder.convert(doc);
-    final data = Uint8List(4 + utf8Data.length);
+    final data = Uint8List(2 + 4 + utf8Data.length);
 
-    data[0] = utf8Data.length & 0xFF;
-    data[1] = (utf8Data.length >> 8) & 0xFF;
-    data[2] = (utf8Data.length >> 16) & 0xFF;
-    data[3] = (utf8Data.length >> 24) & 0xFF;
+    // Magic prefix
+    data[0] = 0x00;
+    data[1] = 0x01;
 
-    data.setRange(4, 4 + utf8Data.length, utf8Data);
+    final len = utf8Data.length;
+    data[2] = len & 0xFF;
+    data[3] = (len >> 8) & 0xFF;
+    data[4] = (len >> 16) & 0xFF;
+    data[5] = (len >> 24) & 0xFF;
+
+    data.setRange(6, 6 + len, utf8Data);
     return data;
   }
 
   static Map<String, dynamic> deserialize(Uint8List data) {
-    if (data.length < 4) throw ArgumentError('Data too short');
+    if (data.length < 6) throw ArgumentError('Data too short');
 
-    final length = (data[0] & 0xFF) |
-        ((data[1] & 0xFF) << 8) |
-        ((data[2] & 0xFF) << 16) |
-        ((data[3] & 0xFF) << 24);
-
-    if (data.length < 4 + length) {
-      throw ArgumentError(
-          'Data is truncated: expected offset ${4 + length}, but got ${data.length}');
+    if (data[0] != 0x00 || data[1] != 0x01) {
+      throw ArgumentError('Invalid magic prefix');
     }
 
-    final jsonStr = utf8.decode(data.sublist(4, 4 + length));
+    final length = (data[2] & 0xFF) |
+        ((data[3] & 0xFF) << 8) |
+        ((data[4] & 0xFF) << 16) |
+        ((data[5] & 0xFF) << 24);
+
+    if (data.length < 6 + length) {
+      throw ArgumentError(
+          'Data is truncated: expected offset ${6 + length}, but got ${data.length}');
+    }
+
+    final jsonStr = utf8.decode(data.sublist(6, 6 + length));
     final raw = jsonDecode(jsonStr) as Map<String, dynamic>;
-    return _revive(raw) as Map<String, dynamic>;
+    return revive(raw) as Map<String, dynamic>;
   }
 }
 

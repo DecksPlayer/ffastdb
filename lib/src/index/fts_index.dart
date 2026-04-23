@@ -1,3 +1,6 @@
+import 'dart:convert';
+import 'dart:typed_data';
+import 'package:meta/meta.dart';
 import 'secondary_index.dart';
 
 /// Full-Text Search (FTS) Index for fast text searching.
@@ -21,6 +24,7 @@ import 'secondary_index.dart';
 ///   .where('description').fts('london')
 ///   .find();
 /// ```
+@internal
 class FtsIndex extends SecondaryIndex {
   /// Maps tokens to document IDs.
   /// Example: 'london' -> [1, 5, 23, 45]
@@ -59,18 +63,76 @@ class FtsIndex extends SecondaryIndex {
     final tokens = tokenize(value);
     if (tokens.isEmpty) return;
 
+    // Deduplicate tokens for the inverted index - we only need to know
+    // IF a document contains a token, not how many times.
+    final uniqueTokens = tokens.toSet();
+
     // Store tokens for this document
-    _docTokens[docId] = tokens.toSet();
+    _docTokens[docId] = uniqueTokens;
 
     // Add to inverted index (exact tokens only)
-    for (final token in tokens) {
-      _tokenIndex.putIfAbsent(token, () => []).add(docId);
+    for (final token in uniqueTokens) {
+      final ids = _tokenIndex.putIfAbsent(token, () => []);
+      if (!ids.contains(docId)) ids.add(docId);
     }
   }
 
   /// Searches for documents matching the query tokens.
   /// Returns docs matching ALL tokens (AND semantics).
-  List<int> search(String query) {
+  @override
+  Iterable<int> search(String operator, dynamic value) {
+    if (value is! String) return [];
+    
+    switch (operator) {
+      case 'fts':
+        return _runSearch(value);
+      case 'equals':
+        // For FTS, equals is treated as "contains all words"
+        return _runSearch(value);
+      case 'startsWith':
+        final tokens = tokenize(value);
+        if (tokens.isEmpty) return [];
+        
+        Set<int>? resultSet;
+        for (final t in tokens) {
+          final matches = searchPrefix(t);
+          if (resultSet == null) {
+            resultSet = matches.toSet();
+          } else {
+            resultSet = resultSet.intersection(matches.toSet());
+          }
+          if (resultSet.isEmpty) break;
+        }
+        return resultSet?.toList() ?? [];
+
+      case 'contains':
+        final tokens = tokenize(value);
+        if (tokens.isEmpty) return [];
+
+        Set<int>? resultSet;
+        for (final t in tokens) {
+          // Find all documents containing this specific search-token as a substring
+          final tokenMatches = <int>{};
+          for (final indexedToken in _tokenIndex.keys) {
+            if (indexedToken.contains(t)) {
+              tokenMatches.addAll(_tokenIndex[indexedToken]!);
+            }
+          }
+          
+          if (resultSet == null) {
+            resultSet = tokenMatches;
+          } else {
+            resultSet = resultSet.intersection(tokenMatches);
+          }
+          if (resultSet.isEmpty) break;
+        }
+        return (resultSet?.toList() ?? [])..sort();
+      default:
+        return [];
+    }
+  }
+
+  List<int> _runSearch(String query) {
     if (query.isEmpty) return [];
 
     final tokens = tokenize(query);
@@ -93,6 +155,7 @@ class FtsIndex extends SecondaryIndex {
       if (results.isEmpty) break; // Early exit if no matches
     }
 
+    // .toList() already creates a new list, so we are safe here
     return results.toList()..sort();
   }
 
@@ -117,7 +180,7 @@ class FtsIndex extends SecondaryIndex {
   @override
   List<int> lookup(dynamic value) {
     if (value is! String) return [];
-    return search(value);
+    return _runSearch(value);
   }
 
   @override
@@ -160,22 +223,10 @@ class FtsIndex extends SecondaryIndex {
   }
 
   @override
-  List<int> all() {
-    final results = <int>{};
-    for (final ids in _tokenIndex.values) {
-      results.addAll(ids);
-    }
-    return results.toList();
-  }
+  List<int> all() => _docTokens.keys.toList();
 
   @override
-  int get size {
-    final results = <int>{};
-    for (final ids in _tokenIndex.values) {
-      results.addAll(ids);
-    }
-    return results.length;
-  }
+  int get size => _docTokens.length;
 
   @override
   void clear() {
@@ -195,6 +246,68 @@ class FtsIndex extends SecondaryIndex {
       for (final token in sortedTokens)
         MapEntry(token, _tokenIndex[token]!),
     ];
+  }
+
+  // ─── Persistence ──────────────────────────────────────────────────────────
+
+  Uint8List serialize() {
+    final buf = BytesBuilder();
+    final nameBytes = Uint8List.fromList(utf8.encode(fieldName));
+    _writeInt32(buf, nameBytes.length);
+    buf.add(nameBytes);
+    
+    _writeInt32(buf, _docTokens.length);
+    for (final entry in _docTokens.entries) {
+      _writeInt32(buf, entry.key); // docId
+      final tokens = entry.value.toList();
+      _writeInt32(buf, tokens.length);
+      for (final t in tokens) {
+        final tBytes = Uint8List.fromList(utf8.encode(t));
+        _writeInt32(buf, tBytes.length);
+        buf.add(tBytes);
+      }
+    }
+    return buf.toBytes();
+  }
+
+  static FtsIndex deserialize(Uint8List bytes) {
+    int off = 0;
+    int readInt32() {
+      final v = (bytes[off] & 0xFF) | ((bytes[off + 1] & 0xFF) << 8) |
+          ((bytes[off + 2] & 0xFF) << 16) | ((bytes[off + 3] & 0xFF) << 24);
+      off += 4;
+      return v;
+    }
+
+    final nameLen = readInt32();
+    final fieldName = utf8.decode(bytes.sublist(off, off + nameLen));
+    off += nameLen;
+    
+    final index = FtsIndex(fieldName);
+    final docCount = readInt32();
+    for (int i = 0; i < docCount; i++) {
+      final docId = readInt32();
+      final tokenCount = readInt32();
+      final tokens = <String>{};
+      for (int j = 0; j < tokenCount; j++) {
+        final tLen = readInt32();
+        final t = utf8.decode(bytes.sublist(off, off + tLen));
+        off += tLen;
+        tokens.add(t);
+        
+        // Rebuild inverted index on the fly
+        index._tokenIndex.putIfAbsent(t, () => []).add(docId);
+      }
+      index._docTokens[docId] = tokens;
+    }
+    return index;
+  }
+
+  void _writeInt32(BytesBuilder buf, int v) {
+    buf.addByte(v & 0xFF);
+    buf.addByte((v >> 8) & 0xFF);
+    buf.addByte((v >> 16) & 0xFF);
+    buf.addByte((v >> 24) & 0xFF);
   }
 
   /// Returns statistics about the FTS index.

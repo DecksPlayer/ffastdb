@@ -17,24 +17,24 @@ void main() {
 
   // Test single-word searches
   print('Single-word searches:');
-  var results = index.search('london');
+  var results = index.search('fts', 'london');
   print('Search "london": $results (expect [1, 3])');
 
-  results = index.search('big');
+  results = index.search('fts', 'big');
   print('Search "big": $results (expect [3])');
 
-  results = index.search('world');
+  results = index.search('fts', 'world');
   print('Search "world": $results (expect [1])');
 
   // Test multi-word searches
   print('\nMulti-word searches:');
-  results = index.search('london big');
+  results = index.search('fts', 'london big');
   print('Search "london big": $results (expect [3])');
 
-  results = index.search('london world');
+  results = index.search('fts', 'london world');
   print('Search "london world": $results (expect [1])');
 
-  results = index.search('london nonexistent');
+  results = index.search('fts', 'london nonexistent');
   print('Search "london nonexistent": $results (expect [])');
 
   // Debug tokenization

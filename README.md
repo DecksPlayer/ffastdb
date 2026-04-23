@@ -1,4 +1,4 @@
-# FastDB 🚀
+# FastDB 🚀 `v0.0.27`
 
 A high-performance, pure-Dart NoSQL database for Flutter & server-side Dart.
 
@@ -31,7 +31,7 @@ A high-performance, pure-Dart NoSQL database for Flutter & server-side Dart.
 
 ```yaml
 dependencies:
-  ffastdb: ^0.0.23
+  ffastdb: ^0.0.27
 ```
 
 ### Open a database
@@ -59,8 +59,12 @@ final db = await openDatabase(
   'myapp', 
   directory: dir, 
   version: 1,
+  indexes: ['status'],                        // O(1) exact match
+  sortedIndexes: ['createdAt', 'age'],        // O(log n) ranges, startsWith, sorting
+  ftsIndexes: ['description'],                // Full-Text Search
+  compositeIndexes: [['status', 'createdAt']], // Multi-field AND queries
   encryptionKey: 'your_secret_key', // Optional: encrypts the entire DB
-  useIndexedDb: true,              // Optional: use IndexedDB instead of localStorage (Web only)
+  useIndexedDb: true,               // Optional: use IndexedDB instead of localStorage (Web)
 );
 runApp(MyApp(db: db));
 }
@@ -171,13 +175,29 @@ With indexes, exact-match queries are O(1) and range queries are O(log n).
 
 ### Add secondary indexes
 
-Indexes must be registered **before** `open()` / `init()` so they are populated
-when the database loads existing data.
+The recommended way to define indexes is **declaratively** when calling `openDatabase()` or `FfastDb.init()`. This ensures that FastDB knows about all indexes before reading the disk, allowing it to automatically load their persisted state or rebuild them if missing:
 
 ```dart
-db.addIndex('city');           // HashIndex  — O(1) exact-match & isIn
-db.addSortedIndex('age');      // SortedIndex — O(log n) range & sortBy
-db.addBitmaskIndex('active');  // BitmaskIndex — bitwise AND for boolean/enum fields
+final db = await openDatabase(
+  'myapp',
+  indexes: ['city'],                           // HashIndex (O(1) exact-match)
+  sortedIndexes: ['age'],                      // SortedIndex (O(log n) range & startsWith)
+  ftsIndexes: ['description'],                 // FtsIndex (Full-Text Search)
+  compositeIndexes: [['city', 'status']],      // CompositeIndex (Multi-field AND)
+);
+```
+
+#### Manual registration (Advanced)
+
+If you are managing the database lifecycle manually without the factory methods, you must register the indexes **before** calling `await db.open()`, or call `db.reindex()` afterwards:
+
+```dart
+final db = FastDB(storage);
+db.addIndex('city');
+db.addSortedIndex('age');
+db.addFtsIndex('description');
+db.addCompositeIndex(['city', 'status']);
+await db.open(); // Reads the disk and populates the registered indexes
 ```
 
 ### Insert documents
@@ -268,8 +288,9 @@ final ids = db.query()
 // ── isIn ───────────────────────────────────────────────────────────────────
 final ids = db.query().where('city').isIn(['London', 'Tokyo']).findIds();
 
-// ── String search ─────────────────────────────────────────────────────────
-// startsWith uses O(log n) range scan on SortedIndex, O(n) scan on HashIndex
+// ── String search (Case-Insensitive in 0.0.27+) ───────────────────────────
+// startsWith uses O(log n) range scan on SortedIndex. 
+// Now case-insensitive: matches "Alice", "alice", "ALICE"
 final ids = db.query().where('name').startsWith('Al').findIds();
 final ids = db.query().where('name').contains('ice').findIds();
 
@@ -476,6 +497,27 @@ await db.reindex('city');
 
 // Rebuild all indexes at once
 await db.reindex();
+```
+
+---
+
+---
+
+## Diagnostics & Statistics
+
+You can inspect the state of your indexes and database health using the `indexes` API (new in **0.0.27**):
+
+```dart
+// Print all index stats
+for (final entry in db.indexes.all.entries) {
+  final name = entry.key;
+  final index = entry.value;
+  print('Index $name: size=${index.size}');
+  
+  if (index is FtsIndex) {
+    print('Tokens indexed: ${index.stats()}');
+  }
+}
 ```
 
 ---

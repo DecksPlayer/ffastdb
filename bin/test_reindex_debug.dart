@@ -26,7 +26,7 @@ void main() async {
   // Add index AFTER data exists
   print('\nAdding index on "city"...');
   db.addIndex('city');
-  print('  Index empty before reindex: ${db.query().where('city').equals('London').findIds()}');
+  print('  Index empty before reindex: ${await db.query().where('city').equals('London').findIds()}');
   
   // Try to manually reindex by simulating what reindex() does
   print('\nManually testing the reindex process...');
@@ -52,12 +52,12 @@ void main() async {
   }
   
   print('After reindex:');
-  final londonIds = db.query().where('city').equals('London').findIds();
+  final londonIds = await db.query().where('city').equals('London').findIds();
   print('  Query for city=London: $londonIds');
   print('  Count: ${londonIds.length}');
   
   // Try ParisQuery too
-  final parisIds = db.query().where('city').equals('Paris').findIds();
+  final parisIds = await db.query().where('city').equals('Paris').findIds();
   print('  Query for city=Paris: $parisIds');
   print('  Count: ${parisIds.length}');
   

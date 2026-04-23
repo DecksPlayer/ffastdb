@@ -28,8 +28,7 @@ class _CrudOperations {
       } else {
         await _db._primaryIndex.insert(id, offset);
       }
-
-      _db._dataOffset += data.length;
+      await _db._syncDataOffset(data.length);
 
       if (!_db._batchMode && targetStorage.needsExplicitFlush) {
         await targetStorage.flush();
@@ -37,8 +36,11 @@ class _CrudOperations {
         await _db._saveHeader();
       }
 
-      if (doc is Map<String, dynamic>) _db._indexDocument(id, doc);
-      if (!_db._batchMode) _db._notifyWatchers(doc);
+      if (doc is Map) _db._indexDocument(id, Map<String, dynamic>.from(doc));
+      if (!_db._batchMode) {
+        QueryBuilder.clearCache();
+        _db._notifyWatchers(doc);
+      }
       if (hasWal) await wal.commit();
       return id;
     } catch (e) {
@@ -50,11 +52,23 @@ class _CrudOperations {
   /// Encapsulates the logic for put() with manual key.
   Future<void> putImpl(int id, dynamic value) async {
     final oldOffset = await _db._primaryIndex.search(id);
-    if (oldOffset != null) _db._deletedCount++;
-
+    
     final wal = _db._wal;
     if (!_db._inTransaction && wal != null) await wal.beginTransaction();
+    
     try {
+      if (oldOffset != null) {
+        _db._deletedCount++;
+        final existing = await _db._readAt(oldOffset);
+        if (existing is Map) {
+          _db._removeDocument(id, Map<String, dynamic>.from(existing));
+        } else {
+          for (final idx in _db._secondaryIndexes.values) {
+            idx.removeById(id);
+          }
+        }
+      }
+
       final data = _db._serialize(value, id: id);
       final targetStorage = _db.dataStorage ?? _db.storage;
       final offset = _db._dataOffset;
@@ -62,14 +76,15 @@ class _CrudOperations {
         await targetStorage.write(offset, data);
       }
       if (_db.storage.needsExplicitFlush) await targetStorage.flush();
-      _db._dataOffset += data.length;
       await _db._primaryIndex.insert(id, offset);
+      await _db._syncDataOffset(data.length);
       if (id >= _db._nextId) _db._nextId = id + 1;
       if (_db.storage.needsExplicitFlush) {
         await _db.storage.flush();
         await _db._saveHeader();
       }
-      if (value is Map<String, dynamic>) _db._indexDocument(id, value);
+      if (value is Map) _db._indexDocument(id, Map<String, dynamic>.from(value));
+      QueryBuilder.clearCache();
       _db._notifyWatchers(value);
       if (!_db._inTransaction && wal != null) await wal.commit();
     } catch (e) {
@@ -80,7 +95,7 @@ class _CrudOperations {
 
   /// Encapsulates the logic for update() with field merging.
   Future<bool> updateImpl(int id, Map<String, dynamic> fields) async {
-    final existing = await _db.findById(id);
+    final existing = await _db._findById(id);
     if (existing == null) return false;
     if (existing is! Map) {
       throw UnsupportedError(
@@ -95,9 +110,7 @@ class _CrudOperations {
     try {
       if (oldOffset != null) _db._deletedCount++;
 
-      for (final idx in _db._secondaryIndexes.values) {
-        idx.remove(id, existing[idx.fieldName]);
-      }
+      _db._removeDocument(id, Map<String, dynamic>.from(existing));
 
       final data = _db._serialize(merged, id: id);
       final targetStorage = _db.dataStorage ?? _db.storage;
@@ -107,15 +120,15 @@ class _CrudOperations {
         await targetStorage.write(offset, data);
       }
 
-      _db._dataOffset += data.length;
-
       await _db._primaryIndex.insert(id, offset);
-      _db._indexDocument(id, merged);
+      await _db._syncDataOffset(data.length);
+      if (merged is Map) _db._indexDocument(id, Map<String, dynamic>.from(merged));
 
       if (!_db._batchMode) {
         await targetStorage.flush();
         if (_db.dataStorage != null) await _db.storage.flush();
         await _db._saveHeader();
+        QueryBuilder.clearCache();
         _db._notifyWatchers(merged);
       }
       if (!_db._inTransaction && wal != null) await wal.commit();
@@ -136,17 +149,19 @@ class _CrudOperations {
     if (!_db._inTransaction && wal != null) await wal.beginTransaction();
     try {
       await _db._primaryIndex.delete(id);
+      await _db._syncDataOffset(0);
       if (doc is Map) {
-        for (final idx in _db._secondaryIndexes.values) {
-          idx.remove(id, doc[idx.fieldName]);
-        }
+        _db._removeDocument(id, Map<String, dynamic>.from(doc));
       } else {
         for (final idx in _db._secondaryIndexes.values) {
           idx.removeById(id);
         }
       }
       _db._deletedCount++;
-      if (!_db._batchMode) await _db._saveHeader();
+      if (!_db._batchMode) {
+        await _db._saveHeader();
+        QueryBuilder.clearCache();
+      }
       if (!_db._inTransaction && wal != null) await wal.commit();
       if (_db._autoCompactThreshold > 0 && !_db._inTransaction && !_db._batchMode) {
         await _db._maybeAutoCompact();

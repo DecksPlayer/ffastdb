@@ -38,9 +38,11 @@ class QueryBuilder {
   final Map<String, SecondaryIndex> _indexes;
 
   /// Optional callback to resolve a document by its internal ID.
-  /// Provided by [FastDB.query()] so that [find] and [findFirst] work
-  /// without a direct circular dependency on the DB class.
   final Future<dynamic> Function(int id)? _fetchById;
+
+  /// Optional callback to search the primary index (B-Tree).
+  /// Used for queries with no conditions to return all documents.
+  final Future<List<int>> Function(int low, int high)? _primarySearch;
 
   final List<List<_Condition>> _orGroups = [[]]; // AND within groups, OR between groups
   String? _sortField;
@@ -49,15 +51,21 @@ class QueryBuilder {
   int? _offset;
 
   /// Shared query cache for all QueryBuilder instances in this FastDB.
-  /// Initialized lazily on first use.
   static final QueryCache _queryCache = QueryCache(maxSize: 256);
 
-  QueryBuilder(this._indexes, [this._fetchById]);
+  QueryBuilder(this._indexes, [this._fetchById, this._primarySearch]);
 
   /// Clears the global query cache. Called by reindex() to invalidate
   /// cached results when indexes change.
   static void clearCache() {
     _queryCache.clear();
+  }
+
+  /// Searches for IDs within a range (inclusive).
+  /// This is the most efficient way to get all document IDs or a subset by primary key.
+  Future<List<int>> rangeSearch(int low, int high) async {
+    if (_primarySearch == null) return [];
+    return await _primarySearch!(low, high);
   }
 
   // ─── Condition Starters ───────────────────────────────────────────────────
@@ -130,7 +138,7 @@ class QueryBuilder {
         'Use db.query().where(...).find() instead of constructing QueryBuilder directly.',
       );
     }
-    final ids = findIds();
+    final ids = await findIds();
     final results = <dynamic>[];
     for (final id in ids) {
       final doc = await _fetchById(id);
@@ -156,7 +164,7 @@ class QueryBuilder {
         'Use db.query().where(...).findFirst() instead.',
       );
     }
-    final ids = findIds();
+    final ids = await findIds();
     if (ids.isEmpty) return null;
     return _fetchById(ids.first);
   }
@@ -169,7 +177,7 @@ class QueryBuilder {
   /// ```dart
   /// final activeCount = db.query().where('status').equals('active').count();
   /// ```
-  int count() {
+  Future<int> count() async {
     // Hot path: single non-negated equals → direct bucket size, O(1)
     if (_orGroups.length == 1 && _orGroups[0].length == 1) {
       final cond = _orGroups[0][0];
@@ -178,7 +186,7 @@ class QueryBuilder {
         if (index != null) return index.lookup(cond.value).length;
       }
     }
-    return findIds().length;
+    return (await findIds()).length;
   }
 
   // ─── Execution ────────────────────────────────────────────────────────────
@@ -236,7 +244,7 @@ class QueryBuilder {
   ///   3. Intersect (AND) results within an OR group.
   ///   4. Union (OR) results across groups.
   ///   5. Cache result for future identical queries.
-  List<int> findIds() {
+  Future<List<int>> findIds() async {
     // ── Check cache before executing query ────────────────────────────────────
     final cacheKey = _getCacheKey();
     if (cacheKey != null) {
@@ -276,13 +284,7 @@ class QueryBuilder {
           _offset == null) {
         final cond = group[0];
         if (!cond.negated) {
-          // For FTS conditions, look for the index with the '_fts_' prefix
-          SecondaryIndex? index;
-          if (cond is _FtsCondition) {
-            index = _indexes['_fts_${cond.field}'];
-          } else {
-            index = _indexes[cond.field];
-          }
+          final index = _getIndexForField(cond.field, cond);
           if (index != null) {
             final result = cond.evaluate(index);
             // Iterable<int> → List<int>: typed data views (Uint32List) are
@@ -347,14 +349,10 @@ class QueryBuilder {
       }
     }
 
-    // No conditions → return all indexed docs
+    // No conditions → return all docs from primary index
     if (_orGroups.every((g) => g.isEmpty)) {
-      if (_indexes.isEmpty) return [];
-      final allIds = <int>{};
-      for (final idx in _indexes.values) {
-        allIds.addAll(idx.all());
-      }
-      final result = _applySort(allIds.toList());
+      final allIds = await (_primarySearch?.call(1, 0x7FFFFFFF) ?? Future<List<int>>.value([]));
+      final result = _applySort(allIds);
       if (cacheKey != null) _queryCache.set(cacheKey, result);
       return result;
     }
@@ -377,13 +375,7 @@ class QueryBuilder {
       List<int>? groupResult;
       for (int i = 0; i < sortedConditions.length; i++) {
         final cond = sortedConditions[i];
-        // For FTS conditions, look for the index with the '_fts_' prefix
-        SecondaryIndex? index;
-        if (cond is _FtsCondition) {
-          index = _indexes['_fts_${cond.field}'];
-        } else {
-          index = _indexes[cond.field];
-        }
+        final index = _getIndexForField(cond.field, cond);
         if (index == null) continue; // Unindexed field → skip
 
         final matches = cond.evaluate(index);
@@ -447,16 +439,8 @@ class QueryBuilder {
     return true;
   }
 
-  /// Estimated result count for a condition (for CBO ordering).
-  /// Uses cheap index-level statistics to avoid evaluating the full condition twice.
   int _estimateSize(_Condition cond) {
-    // For FTS conditions, look for the index with the '_fts_' prefix
-    SecondaryIndex? index;
-    if (cond is _FtsCondition) {
-      index = _indexes['_fts_${cond.field}'];
-    } else {
-      index = _indexes[cond.field];
-    }
+    final index = _getIndexForField(cond.field, cond);
     if (index == null) return 1000000; // No index = very expensive
     // For equals, use the exact bucket size — O(1) for HashIndex.
     if (cond is _EqualsCondition) {
@@ -465,6 +449,34 @@ class QueryBuilder {
     // For other conditions, use total index size as a rough proxy.
     // This avoids running the full condition evaluation a second time.
     return index.size;
+  }
+
+  /// Resolves the best index for a given field and condition.
+  /// Automatically falls back to FTS index for string-based queries if no
+  /// primary index is available for the field.
+  SecondaryIndex? _getIndexForField(String field, _Condition cond) {
+    // 1. FTS operator ALWAYS uses FTS index
+    if (cond is _FtsCondition) {
+      return _indexes['_fts_$field'];
+    }
+
+    // 2. Contains operator prefers FTS index (much faster, multi-word support)
+    if (cond is _ContainsCondition) {
+      final ftsIdx = _indexes['_fts_$field'];
+      if (ftsIdx != null) return ftsIdx;
+    }
+
+    // 3. Direct match (HashIndex, SortedIndex, etc.)
+    // For startsWith, we prefer SortedIndex if available for literal prefix match.
+    final direct = _indexes[field];
+    if (direct != null) return direct;
+
+    // 4. Fallback to FTS for startsWith/equals if no direct index exists
+    if (cond is _StartsWithCondition || cond is _EqualsCondition) {
+      return _indexes['_fts_$field'];
+    }
+
+    return null;
   }
 
   List<int> _applySort(List<int> ids) {
@@ -581,11 +593,8 @@ class _EqualsCondition implements _Condition {
 
   @override
   Iterable<int> evaluate(SecondaryIndex index) {
-    final matched = index.lookup(value);
-    if (!negated) return matched;
-    final allIds = index.all().toSet();
-    allIds.removeAll(matched);
-    return allIds;
+    final matched = index.search(negated ? 'notEquals' : 'equals', value);
+    return matched;
   }
 }
 
@@ -610,20 +619,7 @@ class _RangeCondition implements _Condition {
 
   @override
   Iterable<int> evaluate(SecondaryIndex index) {
-    Iterable<int> matched;
-    // Fast path: use native SortedIndex methods (O(log n + k) seek)
-    if (index is SortedIndex) {
-      matched = switch (mode) {
-        _RangeMode.greaterThan => index.greaterThan(low, inclusive: false),
-        _RangeMode.greaterOrEqual => index.greaterThan(low, inclusive: true),
-        _RangeMode.lessThan => index.lessThan(high, inclusive: false),
-        _RangeMode.lessOrEqual => index.lessThan(high, inclusive: true),
-        _RangeMode.between => index.range(low, high),
-      };
-    } else {
-      // Generic fallback via SecondaryIndex.range()
-      matched = index.range(low ?? '', high ?? '');
-    }
+    final matched = index.search(conditionType, mode == _RangeMode.between ? [low, high] : (low ?? high));
     if (!negated) return matched;
     final allIds = index.all().toSet();
     allIds.removeAll(matched);
@@ -641,15 +637,10 @@ class _ContainsCondition implements _Condition {
 
   @override
   Iterable<int> evaluate(SecondaryIndex index) {
-    final results = <int>[];
-    for (final entry in index.sorted()) {
-      if (entry.key is String && (entry.key as String).contains(substring)) {
-        results.addAll(entry.value);
-      }
-    }
-    if (!negated) return results;
+    final matched = index.search('contains', substring);
+    if (!negated) return matched;
     final allIds = index.all().toSet();
-    allIds.removeAll(results);
+    allIds.removeAll(matched);
     return allIds;
   }
 }
@@ -664,27 +655,10 @@ class _StartsWithCondition implements _Condition {
 
   @override
   Iterable<int> evaluate(SecondaryIndex index) {
-    List<int> results;
-    if (index is SortedIndex && prefix.isNotEmpty) {
-      // O(log n) prefix scan: use the natural lexicographic sort of SortedIndex.
-      // Upper bound '$prefix\uffff' covers all strings with this prefix for
-      // typical Unicode data (U+FFFF is larger than any common character).
-      results = List<int>.from(index.range(prefix, '$prefix\uffff'));
-    } else if (index is HashIndex) {
-      // O(n) bucket scan without sorting or copying the full index.
-      results = index.filterKeys(
-          (key) => key is String && key.startsWith(prefix));
-    } else {
-      results = <int>[];
-      for (final entry in index.sorted()) {
-        if (entry.key is String && (entry.key as String).startsWith(prefix)) {
-          results.addAll(entry.value);
-        }
-      }
-    }
-    if (!negated) return results;
+    final matched = index.search('startsWith', prefix);
+    if (!negated) return matched;
     final allIds = index.all().toSet();
-    allIds.removeAll(results);
+    allIds.removeAll(matched);
     return allIds;
   }
 }
@@ -700,19 +674,10 @@ class _FtsCondition implements _Condition {
 
   @override
   Iterable<int> evaluate(SecondaryIndex index) {
-    List<int> results = [];
-    
-    // Check if this is an FTS index
-    if (index is FtsIndex) {
-      results = index.search(query);
-    } else {
-      // Fallback: not an FTS index, return empty
-      results = [];
-    }
-
-    if (!negated) return results;
+    final matched = index.search('fts', query);
+    if (!negated) return matched;
     final allIds = index.all().toSet();
-    allIds.removeAll(results);
+    allIds.removeAll(matched);
     return allIds;
   }
 }

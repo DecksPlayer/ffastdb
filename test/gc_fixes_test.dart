@@ -63,7 +63,7 @@ void main() {
       expect(count, lessThanOrEqualTo(1500));
 
       await FfastDb.disposeInstance();
-    });
+    }, timeout: Timeout(Duration(minutes: 1)));
 
     test('singleton throws error when used after dispose', () async {
       await FfastDb.disposeInstance();

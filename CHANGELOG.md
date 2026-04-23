@@ -1,3 +1,66 @@
+## 0.0.27
+
+### Bug Fixes (B-Tree Stability & Indexing)
+
+- **CRITICAL — Data corruption in single-file mode fixed**: Resolved a critical issue where document data could overwrite B-Tree index pages. Implemented `_syncDataOffset()` to ensure the document write pointer is always synchronized with the underlying storage size after every structural index operation. This prevents structural corruption under high load.
+
+- **MODERATE — Fixed Indexing Type Strictness**: Corrected a bug where documents were silently skipped during indexing because of strict `Map<String, dynamic>` runtime type checks. The library now correctly supports all `Map` variants (including `Map<String, Object>` literals used in common application code).
+
+- **MODERATE — Fixed Composite Index Population**: Fixed a bug where `CompositeIndex` fields were not being correctly extracted and indexed during standard `insert()` and `put()` operations.
+
+- **CRITICAL — Fixed Index Persistence & Hot Restart failures**: Fixed an issue where `FtsIndex` and `CompositeIndex` instances were left empty in memory if they were registered manually after opening the database, causing searches to fail after a Flutter Hot Restart. `_StorageManager.loadIndexes` was updated to properly restore complex indexes and map them correctly to the query engine.
+
+- **MODERATE — Missing indexes automatically rebuilt**: `FastDB.open()` now actively checks if any registered secondary indexes are missing from the loaded storage payload. If missing indexes are detected (e.g. after a schema update), FastDB automatically triggers a background rebuild.
+
+- **MODERATE — Fixed `FtsIndex` search signature**: Updated `FtsIndex` to correctly implement the `SecondaryIndex.search(String operator, dynamic value)` interface, preventing runtime `Too few positional arguments` errors.
+
+### New Features & Improvements
+
+- **NEW — Declarative Index Registration**: Extended `openDatabase` and `FfastDb.init` to directly accept `indexes`, `sortedIndexes`, `ftsIndexes`, and `compositeIndexes`. This declarative approach guarantees that indexes are fully initialized before disk loading, resolving schema state issues during app restarts.
+- **IMPROVED — Case-Insensitive Search**: The `contains()` and `startsWith()` operators are now **case-insensitive by default**. This provides a much more intuitive user experience for string-based filtering.
+- **NEW — Index Diagnostics API**: Exposed `db.indexes.all` to allow developers to inspect active indexes, check their sizes, and retrieve internal statistics (useful for debugging and performance tuning).
+- **NEW — Public Index Types**: Exported `HashIndex`, `SortedIndex`, `FtsIndex`, `BitmaskIndex`, and `CompositeIndex` as public types.
+
+---
+
+## 0.0.26
+
+### Bug Fixes (Index Rebuild Corruption on Startup)
+
+- **CRITICAL — `reindex()` and `rebuildSecondaryIndexes()` caused duplicate index entries**: When a database from pre-0.0.24 versions opened in 0.0.23+, if the header was not marked "clean", `open()` automatically called `rebuildSecondaryIndexes()`. However, this method called `rangeSearch()` without deduplication. If `rangeSearch()` returned IDs multiple times due to B-Tree structural inconsistencies from old versions, each ID would be indexed multiple times. This corrupted secondary indexes, causing subsequent `getAll()` calls to return duplicate documents. Fixed by deduplicating `rangeSearch()` results using `LinkedHashSet` in both `reindex([field])` and `rebuildSecondaryIndexes()`.
+
+- **Test Results**: All 94 tests pass. Databases created in 0.0.22 or earlier that were opened in 0.0.23-0.0.25 should now be cleaned up by running `reindex()` or closing/reopening in 0.0.26.
+
+---
+
+## 0.0.25
+
+### Bug Fixes (Out-of-Memory on Large Batch Inserts)
+
+- **CRITICAL — `bulkLoad` with large existing trees caused OOM**: When inserting 5000+ documents into a database that already had data, the code extracted all existing entries into memory at once via `_extractLeafEntries()`, then merged and rebuilt. With 10,000+ total entries in RAM simultaneously, Dart's memory allocator was overwhelmed. Fixed by implementing a threshold strategy: trees with <500 entries use the extract-merge-rebuild approach (memory safe), while trees ≥500 entries fall back to individual inserts (no OOM, and now safe because the median-key bug from 0.0.24 is fixed). This trades some speed for memory safety on large existing datasets.
+
+- **Test Results**: All 94 tests pass including the critical "large batch insert with write-behind does not OOM" test. Batch operations of 5000+ documents now work reliably.
+
+---
+
+## 0.0.24
+
+### Bug Fixes (B-Tree Duplicate IDs)
+
+- **CRITICAL — `insertAll` / `commitBatch` after existing data caused duplicate IDs**: `bulkLoad` was replacing the B-Tree root with a freshly-built tree containing only the new entries, orphaning all previously-written pages on disk. On subsequent `getAll()` / `rangeSearch()` the old pages could still be reached via stale page references, returning IDs 3–5× duplicated. Fixed by extracting all existing leaf entries, O(N+M) merging them with the new batch, and rebuilding a single correct tree from the full combined set.
+
+- **CRITICAL — Median key data loss during leaf splits in individual inserts**: When `bulkLoad` fell back to individual `insert` calls on a non-empty tree, B-Tree leaf splits moved the median key up to the internal node and discarded its document offset. Every 128th document was silently lost. Resolved by the merge-and-rebuild strategy above which eliminates leaf splits entirely for batch operations.
+
+- **MODERATE — `rangeSearch` could return duplicate IDs on structurally inconsistent trees**: Added a `seenIds` `Set<int>` guard inside `_rangeNode` so each ID is emitted at most once regardless of tree state.
+
+- **MODERATE — `getAllImpl` did not deduplicate IDs from range scan**: `getAllImpl` now passes IDs through a `LinkedHashSet` before fetching documents, providing a second safety net against duplicates reaching the caller.
+
+- **MINOR — WAL recovery was not idempotent**: `_recover()` now compares the WAL entry bytes against what is already on disk and skips writes where the data already matches, preventing double-application of committed transactions after a crash-and-reopen cycle.
+
+- **Test Results**: All 94 tests pass; 4 new regression tests added covering all duplicate-ID scenarios.
+
+---
+
 ## 0.0.23
 
 ### Bug Fixes (Query Cache & Reindex)

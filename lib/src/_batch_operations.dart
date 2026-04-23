@@ -6,39 +6,59 @@ class _BatchOperations {
 
   _BatchOperations(this._db);
 
-  /// Executes bulk insert of multiple documents.
+  /// Executes bulk insert of multiple documents with memory-efficient chunking.
   Future<List<int>> insertAllImpl(List<dynamic> docs) async {
     if (docs.isEmpty) return [];
+    
+    // Chunk size: 5000 docs per block to limit RAM peak
+    const chunkSize = 5000;
+    
     _db._enableWriteBehind();
     _db._batchMode = true;
     _db._batchEntries.clear();
 
-    final ids = <int>[];
+    final ids = List<int>.generate(docs.length, (i) => _db._nextId++);
 
     try {
-      for (int i = 0; i < docs.length; i++) {
-        ids.add(_db._nextId++);
-      }
-
       if (!_db._inTransaction && _db._wal != null) await _db._wal!.beginTransaction();
 
       final targetStorage = _db.dataStorage ?? _db.storage;
-      for (int i = 0; i < docs.length; i++) {
-        final data = _db._serialize(docs[i], id: ids[i]);
-        final offset = _db._dataOffset;
-        if (!targetStorage.writeSync(offset, data)) {
-          await targetStorage.write(offset, data);
+      
+      // Process in chunks to keep memory usage low
+      for (int i = 0; i < docs.length; i += chunkSize) {
+        final end = (i + chunkSize < docs.length) ? i + chunkSize : docs.length;
+        
+        // 1. Write data and collect batch entries for this chunk
+        for (int j = i; j < end; j++) {
+          final data = _db._serialize(docs[j], id: ids[j]);
+          final offset = _db._dataOffset;
+          if (!targetStorage.writeSync(offset, data)) {
+            await targetStorage.write(offset, data);
+          }
+          _db._batchEntries.add(MapEntry(ids[j], offset));
+          _db._dataOffset += data.length;
         }
-        _db._batchEntries.add(MapEntry(ids[i], offset));
-        _db._dataOffset += data.length;
-        if (_runningOnWeb && i > 0 && i % 500 == 0) await Future.delayed(Duration.zero);
-      }
 
-      await _db._primaryIndex.bulkLoad(_db._batchEntries);
-      _db._batchEntries.clear();
+        // 2. Load chunk into primary index
+        await _db._primaryIndex.bulkLoad(_db._batchEntries);
+        _db._batchEntries.clear();
 
-      for (int i = 0; i < docs.length; i++) {
-        if (docs[i] is Map<String, dynamic>) _db._indexDocument(ids[i], docs[i] as Map<String, dynamic>);
+        // 3. Index chunk into secondary indexes
+        for (int j = i; j < end; j++) {
+          if (docs[j] is Map) {
+            _db._indexDocument(ids[j], Map<String, dynamic>.from(docs[j]));
+          }
+        }
+        
+        // 4. Checkpoint header to ensure _nextId recovery works if crash occurs
+        // This is crucial for Duplicate ID prevention.
+        await _db._saveHeader();
+
+        // 5. Update _dataOffset to account for any B-Tree pages allocated during bulkLoad
+        await _db._syncDataOffset(0);
+
+        // Yield to event loop to prevent blocking and allow GC
+        await Future.delayed(Duration.zero);
       }
 
       final wal = _db._wal;
@@ -47,14 +67,15 @@ class _BatchOperations {
       await _db.dataStorage?.flush();
       await _db.storage.flush();
       await _db._saveHeader();
+      QueryBuilder.clearCache();
       _db._disableWriteBehind();
+      
       if (!_db._inTransaction && wal != null) await wal.commit();
-      if (_db.dataStorage == null) {
-        _db._dataOffset = await _db.storage.size;
-      }
-      for (final doc in docs) {
-        _db._notifyWatchers(doc);
-      }
+      
+      await _db._syncDataOffset(0);
+      
+      // Notify watchers ONCE at the end of the entire batch
+      _db._notifyWatchersBatch();
     } catch (e) {
       _db._batchMode = false;
       _db._batchEntries.clear();

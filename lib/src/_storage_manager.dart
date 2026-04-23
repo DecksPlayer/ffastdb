@@ -29,6 +29,12 @@ class _StorageManager {
       } else if (entry.value is BitmaskIndex) {
         final blob = (entry.value as BitmaskIndex).serialize();
         if (blob.isNotEmpty) persistable.add((typeTag: 3, blob: blob));
+      } else if (entry.value is FtsIndex) {
+        final blob = (entry.value as FtsIndex).serialize();
+        if (blob.isNotEmpty) persistable.add((typeTag: 4, blob: blob));
+      } else if (entry.value is CompositeIndex) {
+        final blob = (entry.value as CompositeIndex).serialize();
+        if (blob.isNotEmpty) persistable.add((typeTag: 5, blob: blob));
       }
     }
     if (persistable.isEmpty) return;
@@ -61,9 +67,13 @@ class _StorageManager {
     if (prevOffset > 0 && prevLen > 0 && payload.length <= prevLen) {
       writeOffset = prevOffset;
     } else {
-      writeOffset = _db._dataOffset;
+      // Round up to next page boundary to keep B-Tree pages aligned if they grow later
+      final currentSize = await _db.storage.size;
+      writeOffset = ((currentSize + PageManager.pageSize - 1) ~/ PageManager.pageSize) * PageManager.pageSize;
     }
     await _db.storage.write(writeOffset, payload);
+    // Update data offset so subsequent writes (docs/more indexes) don't overlap
+    _db._dataOffset = writeOffset + payload.length;
     if (prevOffset > 0 && prevLen > 0 && writeOffset == prevOffset && payload.length < prevLen) {
       await _db.storage.truncate(writeOffset + payload.length);
     }
@@ -74,12 +84,14 @@ class _StorageManager {
   }
 
   /// Loads persisted secondary indexes from storage.
-  Future<void> loadIndexes() async {
+  /// Returns a set of keys for the indexes that were successfully loaded.
+  Future<Set<String>> loadIndexes() async {
+    final loadedKeys = <String>{};
     try {
       final meta = await _db.storage.read(16, 8);
       final idxOffset = _db._readInt32(meta, 0);
       final idxLength = _db._readInt32(meta, 4);
-      if (idxOffset <= 0 || idxLength <= 0) return;
+      if (idxOffset <= 0 || idxLength <= 0) return loadedKeys;
       final blob = await _db.storage.read(idxOffset, idxLength);
       int off = 0;
       final count = _db._readInt32(blob, off); off += 4;
@@ -93,6 +105,8 @@ class _StorageManager {
           case 1: idx = HashIndex.deserialize(indexBytes);
           case 2: idx = SortedIndex.deserialize(indexBytes);
           case 3: idx = BitmaskIndex.deserialize(indexBytes);
+          case 4: idx = FtsIndex.deserialize(indexBytes);
+          case 5: idx = CompositeIndex.deserialize(indexBytes);
           default: continue;
         }
         // If the user changed index type between startups (e.g. HashIndex →
@@ -102,9 +116,18 @@ class _StorageManager {
         if (existing != null && existing.runtimeType != idx.runtimeType) {
           continue;
         }
-        _db._secondaryIndexes[idx.fieldName] = idx;
+
+        String key = idx.fieldName;
+        if (idx is FtsIndex) {
+          key = '_fts_${idx.fieldName}';
+        } else if (idx is CompositeIndex) {
+          key = idx.fieldNames.join('+');
+        }
+        _db._secondaryIndexes[key] = idx;
+        loadedKeys.add(key);
       }
     } catch (_) {}
+    return loadedKeys;
   }
 
   /// Checks if auto-compaction threshold is exceeded and compacts if needed.
@@ -126,25 +149,28 @@ class _StorageManager {
   Future<void> compactImpl() async {
     final allIds = await _db._primaryIndex.rangeSearch(1, _db._nextId - 1);
     if (allIds.isEmpty) return;
-    final docs = <int, dynamic>{};
-    for (int i = 0; i < allIds.length; i++) {
-      final id = allIds[i];
-      final doc = await _db.findById(id);
-      if (doc != null) docs[id] = doc;
-      if (i > 0 && i % 250 == 0) await Future.delayed(Duration.zero);
-    }
 
     if (_db.dataStorage != null) {
-      // ── Dual-file mode: overwrite data file from scratch and truncate ────────
+      // ── OOM-Safe Streaming Compaction (Dual-file mode) ────────────────────
+      // We can overwrite the data file safely because the B-Tree index is in a 
+      // separate file (storage). This allows us to process documents one by one
+      // without buffering them all in RAM.
+      
+      // 1. Get current offsets for all IDs to ensure we don't need the B-Tree nodes 
+      // during the write phase? No, findById already does that.
+      // Since dataStorage != storage, writing to dataStorage is always safe.
+      
       int writePos = 0;
-      int i = 0;
-      for (final entry in docs.entries) {
-        final data = _db._serialize(entry.value, id: entry.key);
-        await _db.dataStorage!.write(writePos, data);
-        await _db._primaryIndex.insert(entry.key, writePos);
-        writePos += data.length;
+      for (int i = 0; i < allIds.length; i++) {
+        final id = allIds[i];
+        final doc = await _db._findById(id);
+        if (doc != null) {
+          final data = _db._serialize(doc, id: id);
+          await _db.dataStorage!.write(writePos, data);
+          await _db._primaryIndex.insert(id, writePos);
+          writePos += data.length;
+        }
         if (i > 0 && i % 250 == 0) await Future.delayed(Duration.zero);
-        i++;
       }
       _db._dataOffset = writePos;
       await _db.dataStorage!.truncate(_db._dataOffset);
@@ -153,9 +179,18 @@ class _StorageManager {
       _db._primaryIndex.clearNodeCache();
     } else {
       // ── Single-file mode: full rebuild ────────────────────────────────────
-      // B-Tree pages and document data share the same file interleaved, so there
-      // is no simple truncation point. The only correct strategy is to truncate
-      // down to just the header page and rebuild the B-Tree + doc zone from scratch.
+      // In single-file mode, B-Tree and data share the same file. 
+      // Truncating or overwriting is destructive to the index we need for findById.
+      // We must buffer the documents before rebuilding.
+      
+      final docs = <int, dynamic>{};
+      for (int i = 0; i < allIds.length; i++) {
+        final id = allIds[i];
+        final doc = await _db._findById(id);
+        if (doc != null) docs[id] = doc;
+        if (i > 0 && i % 250 == 0) await Future.delayed(Duration.zero);
+      }
+
       await _db.storage.truncate(PageManager.pageSize); // keep only the header page
       _db._pageManager.clearCache();                    // discard all cached/dirty B-Tree pages
       _db._primaryIndex.clearNodeCache();
@@ -197,10 +232,9 @@ class _StorageManager {
       int currentVersion, int targetVersion, Map<int, dynamic Function(dynamic)>? migrations) async {
     final allIds = await _db._primaryIndex.rangeSearch(1, _db._nextId - 1);
     if (allIds.isEmpty) return;
-    final docs = <int, dynamic>{};
     for (int i = 0; i < allIds.length; i++) {
       final id = allIds[i];
-      final doc = await _db.findById(id);
+      final doc = await _db._findById(id);
       if (doc != null) {
         dynamic migratedDoc = doc;
         if (migrations != null) {
@@ -210,20 +244,15 @@ class _StorageManager {
             }
           }
         }
-        docs[id] = migratedDoc;
+        
+        final targetStorage = _db.dataStorage ?? _db.storage;
+        final newOffset = _db._dataOffset;
+        final data = _db._serialize(migratedDoc, id: id);
+        await targetStorage.write(newOffset, data);
+        _db._dataOffset += data.length;
+        await _db._primaryIndex.insert(id, newOffset);
       }
       if (i > 0 && i % 250 == 0) await Future.delayed(Duration.zero);
-    }
-    int i = 0;
-    for (final entry in docs.entries) {
-      final targetStorage = _db.dataStorage ?? _db.storage;
-      final newOffset = _db._dataOffset;
-      final data = _db._serialize(entry.value, id: entry.key);
-      await targetStorage.write(newOffset, data);
-      _db._dataOffset += data.length;
-      await _db._primaryIndex.insert(entry.key, newOffset);
-      if (i > 0 && i % 250 == 0) await Future.delayed(Duration.zero);
-      i++;
     }
     _db._deletedCount = 0;
     if (_db.dataStorage != null) await _db.dataStorage!.truncate(_db._dataOffset);

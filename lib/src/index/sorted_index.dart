@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:typed_data';
+import 'package:meta/meta.dart';
 import 'secondary_index.dart';
 
 /// O(log n) sorted secondary index using flat parallel arrays.
@@ -12,6 +13,7 @@ import 'secondary_index.dart';
 ///   - `between(a, b)` — range scans
 ///   - `greaterThan / lessThan`
 ///   - `sortBy(field)`
+@internal
 class SortedIndex implements SecondaryIndex {
   @override
   final String fieldName;
@@ -86,8 +88,15 @@ class SortedIndex implements SecondaryIndex {
   @override
   void add(int docId, dynamic fieldValue) {
     if (fieldValue == null) return;
+
+    // Check if docId is already indexed for this value to avoid duplicates
+    int start = _lowerBound(fieldValue);
+    int end = _upperBound(fieldValue);
+    for (int i = start; i < end; i++) {
+      if (_docIds[i] == docId) return;
+    }
     
-    int index = _upperBound(fieldValue);
+    int index = end; // Insert at the end of the matching range
     _ensureCapacity();
     if (index < _length) {
       _docIds.setRange(index + 1, _length + 1, _docIds, index);
@@ -148,30 +157,85 @@ class SortedIndex implements SecondaryIndex {
     return Uint32List.sublistView(_docIds, start, end);
   }
 
-  /// O(log n) pure range query. Returns a view without memory copying.
+  @override
+  Iterable<int> search(String operator, dynamic value) {
+    // 1. Precise match operators (O(log n))
+    if (operator == 'equals') return lookup(value);
+    
+    if (operator == 'notEquals') {
+      final matching = lookup(value).toSet();
+      return all().where((id) => !matching.contains(id));
+    }
+
+    // 2. Range operators (O(log n))
+    switch (operator) {
+      case 'greaterThan': return greaterThan(value, inclusive: false);
+      case 'greaterOrEqualTo': 
+      case 'greaterThanOrEqualTo':
+        return greaterThan(value, inclusive: true);
+      case 'lessThan': return lessThan(value, inclusive: false);
+      case 'lessThanOrEqualTo':
+      case 'lessOrEqualTo':
+        return lessThan(value, inclusive: true);
+      case 'between':
+        if (value is List && value.length >= 2) {
+          return range(value[0], value[1]);
+        }
+        return [];
+    }
+
+    // 3. String operators (Case-Insensitive Scan)
+    if (operator == 'startsWith' || operator == 'contains') {
+      if (value is! String || value.isEmpty) return [];
+      final lower = value.toLowerCase();
+      final results = <int>{};
+
+      // For startsWith, we can optimize by starting the scan from the lowerBound
+      // but to be 100% safe with case-insensitivity, we scan all entries.
+      for (final entry in _reverse.entries) {
+        final val = entry.value;
+        if (val is String) {
+          final valLower = val.toLowerCase();
+          if (operator == 'startsWith') {
+            if (valLower.startsWith(lower)) results.add(entry.key);
+          } else {
+            if (valLower.contains(lower)) results.add(entry.key);
+          }
+        }
+      }
+      return results;
+    }
+
+    return [];
+  }
+
+  /// O(log n) pure range query. Returns a new list to prevent index corruption.
   @override
   List<int> range(dynamic low, dynamic high) {
     int start = _lowerBound(low);
     int end = _upperBound(high);
-    return Uint32List.sublistView(_docIds, start, end);
+    if (start >= end) return [];
+    // CRITICAL: Must return a copy (List.from) to prevent callers 
+    // from mutating the internal index buffer via .sort()
+    return List<int>.from(Uint32List.sublistView(_docIds, start, end));
   }
 
   /// O(log n) forward scan from [low]. Return a zero-allocation view.
   List<int> greaterThan(dynamic low, {bool inclusive = false}) {
     int start = inclusive ? _lowerBound(low) : _upperBound(low);
-    return Uint32List.sublistView(_docIds, start, _length);
+    return List<int>.from(Uint32List.sublistView(_docIds, start, _length));
   }
 
   /// O(log n) backward scan up to [high]. Return a zero-allocation view.
   List<int> lessThan(dynamic high, {bool inclusive = false}) {
     int end = inclusive ? _upperBound(high) : _lowerBound(high);
-    return Uint32List.sublistView(_docIds, 0, end);
+    return List<int>.from(Uint32List.sublistView(_docIds, 0, end));
   }
 
   /// Returns all IDs in sorted order perfectly contiguously.
   List<int> sortedIds({bool descending = false}) {
     if (_length == 0) return [];
-    if (!descending) return Uint32List.sublistView(_docIds, 0, _length);
+    if (!descending) return List<int>.from(Uint32List.sublistView(_docIds, 0, _length));
     // descending requires an allocation to reverse
     return Uint32List.sublistView(_docIds, 0, _length).reversed.toList();
   }

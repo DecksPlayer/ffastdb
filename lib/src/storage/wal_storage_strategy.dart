@@ -106,9 +106,22 @@ class WalStorageStrategy implements StorageStrategy {
     }
 
     if (hasCommit && entries.isNotEmpty) {
-      // Replay committed writes to main file
+      // Replay committed writes to main file — idempotent: skip writes whose
+      // data already matches what is on disk (handles double-recovery on crash).
       for (final entry in entries) {
-        await _main.write(entry.offset, entry.data);
+        try {
+          final existing = await _main.read(entry.offset, entry.data.length);
+          bool alreadyApplied = existing.length == entry.data.length;
+          if (alreadyApplied) {
+            for (int i = 0; i < existing.length; i++) {
+              if (existing[i] != entry.data[i]) { alreadyApplied = false; break; }
+            }
+          }
+          if (!alreadyApplied) await _main.write(entry.offset, entry.data);
+        } catch (_) {
+          // If we can't read (e.g. offset beyond EOF), just apply.
+          await _main.write(entry.offset, entry.data);
+        }
       }
       await _main.flush();
     }
@@ -289,33 +302,23 @@ class WalStorageStrategy implements StorageStrategy {
   // ─── Binary Helpers ──────────────────────────────────────────────────────
 
   int _readInt32(Uint8List b, int off) =>
-      (b[off] & 0xFF) | ((b[off + 1] & 0xFF) << 8) |
-      ((b[off + 2] & 0xFF) << 16) | ((b[off + 3] & 0xFF) << 24);
+      ByteData.sublistView(b, off, off + 4).getUint32(0, Endian.little);
 
   int _readInt64(Uint8List b, int off) =>
-      (b[off] & 0xFF) | ((b[off + 1] & 0xFF) << 8) |
-      ((b[off + 2] & 0xFF) << 16) | ((b[off + 3] & 0xFF) << 24) |
-      ((b[off + 4] & 0xFF) << 32) | ((b[off + 5] & 0xFF) << 40) |
-      ((b[off + 6] & 0xFF) << 48) | ((b[off + 7] & 0xFF) << 56);
+      ByteData.sublistView(b, off, off + 8).getUint64(0, Endian.little);
 
   void _addInt32(BytesBuilder b, int v) {
-    b.addByte(v & 0xFF);
-    b.addByte((v >> 8) & 0xFF);
-    b.addByte((v >> 16) & 0xFF);
-    b.addByte((v >> 24) & 0xFF);
+    final data = Uint8List(4);
+    ByteData.sublistView(data).setUint32(0, v, Endian.little);
+    b.add(data);
   }
 
   void _addInt32BytesBuilder(BytesBuilder b, int v) => _addInt32(b, v);
 
   void _addInt64(BytesBuilder b, int v) {
-    b.addByte(v & 0xFF);
-    b.addByte((v >> 8) & 0xFF);
-    b.addByte((v >> 16) & 0xFF);
-    b.addByte((v >> 24) & 0xFF);
-    b.addByte((v >> 32) & 0xFF);
-    b.addByte((v >> 40) & 0xFF);
-    b.addByte((v >> 48) & 0xFF);
-    b.addByte((v >> 56) & 0xFF);
+    final data = Uint8List(8);
+    ByteData.sublistView(data).setUint64(0, v, Endian.little);
+    b.add(data);
   }
 }
 

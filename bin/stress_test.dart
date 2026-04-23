@@ -41,12 +41,12 @@ void main() async {
     await db2.open(); // ← restores indexes from sidecar
 
     await test('London index restored after reopen', () async {
-      final ids = db2.query().where('city').equals('London').findIds();
+      final ids = await db2.query().where('city').equals('London').findIds();
       if (ids.length != 2) throw 'Expected 2 London docs, got ${ids.length}';
     });
 
     await test('Paris index restored after reopen', () async {
-      final ids = db2.query().where('city').equals('Paris').findIds();
+      final ids = await db2.query().where('city').equals('Paris').findIds();
       if (ids.length != 1) throw 'Expected 1 Paris doc, got ${ids.length}';
     });
 
@@ -169,7 +169,7 @@ void main() async {
     });
 
     await test('Stress test: secondary index consistent', () async {
-      final allIndexed = db.query().where('score').between(0, 1000).findIds();
+      final allIndexed = await db.query().where('score').between(0, 1000).findIds();
       final inIndex = allIndexed.length;
       final expected = liveIds.length;
       if (inIndex > expected + 5) { // allow small delta from deleted docs

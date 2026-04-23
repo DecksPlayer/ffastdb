@@ -19,7 +19,7 @@ void main() async {
 
   // Try to retrieve by ID
   print('\nTest 1: Retrieve by ID');
-  final doc1 = await db.get(id1);
+  final doc1 = await db.findById(id1);
   print('Doc 1: $doc1');
 
   // Try to scan all documents

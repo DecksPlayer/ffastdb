@@ -30,6 +30,8 @@ Future<FastDB> openDatabase(
   Map<int, dynamic Function(dynamic)>? migrations,
   List<String> indexes = const [],
   List<String> sortedIndexes = const [],
+  List<String> ftsIndexes = const [],
+  List<List<String>> compositeIndexes = const [],
   String? encryptionKey,
 }) async {
   // Guard: if a live instance already exists, reuse it.
@@ -65,6 +67,8 @@ Future<FastDB> openDatabase(
     migrations: migrations,
     indexes: indexes,
     sortedIndexes: sortedIndexes,
+    ftsIndexes: ftsIndexes,
+    compositeIndexes: compositeIndexes,
   );
 
   return db;

@@ -2,6 +2,7 @@ import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:ffastdb/ffastdb.dart';
 import 'package:path_provider/path_provider.dart';
+import 'stress_test_page.dart';
 
 // ─── Entry point ────────────────────────────────────────────────────────────
 
@@ -16,8 +17,15 @@ void main() async {
     dir = appDir.path;
   }
 
-  final db = await openDatabase('wordnotes', directory: dir, version: 1);
-  db.addSortedIndex('word');
+  final db = await openDatabase(
+    'wordnotes', 
+    directory: dir, 
+    version: 1,
+    indexes: ['type', 'userId', 'postId'],
+    sortedIndexes: ['word', 'content', 'likes'],
+    ftsIndexes: ['content'],
+    compositeIndexes: [['type', 'userId']],
+  );
 
   runApp(WordAnnotatorApp(db: db));
 }
@@ -135,6 +143,16 @@ class _WordListPageState extends State<WordListPage> {
       appBar: AppBar(
         title: const Text('Anotador de Palabras'),
         centerTitle: true,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.speed),
+            onPressed: () => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => StressTestPage(db: widget.db)),
+            ),
+            tooltip: 'Stress Test',
+          ),
+        ],
         bottom: PreferredSize(
           preferredSize: const Size.fromHeight(56),
           child: Padding(
@@ -349,7 +367,7 @@ class MyApp extends StatelessWidget {
         //
         // This works for code too, not just values: Most code changes can be
         // tested with just a hot reload.
-        colorScheme: .fromSeed(seedColor: Colors.deepPurple),
+        colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
       ),
       home: const MyHomePage(title: 'Flutter Demo Home Page'),
     );
@@ -423,7 +441,7 @@ class _MyHomePageState extends State<MyHomePage> {
           // TRY THIS: Invoke "debug painting" (choose the "Toggle Debug Paint"
           // action in the IDE, or press "p" in the console), to see the
           // wireframe for each widget.
-          mainAxisAlignment: .center,
+          mainAxisAlignment: MainAxisAlignment.center,
           children: [
             const Text('You have pushed the button this many times:'),
             Text(
