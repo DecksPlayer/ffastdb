@@ -1,6 +1,5 @@
 import 'dart:convert';
 import 'dart:typed_data';
-import 'package:meta/meta.dart';
 import 'secondary_index.dart';
 
 /// Ultra-fast bitmask index for low-cardinality fields (booleans, enums, status).
@@ -16,7 +15,6 @@ import 'secondary_index.dart';
 ///
 /// Constraint: This index is only valid for datasets up to [maxDocId] (default: 1M).
 ///   Adjust on creation for larger datasets.
-@internal
 class BitmaskIndex implements SecondaryIndex {
   @override
   final String fieldName;

@@ -1,7 +1,4 @@
-import 'package:meta/meta.dart';
-
 /// Abstract interface for secondary indexes.
-@internal
 abstract class SecondaryIndex {
   /// Name of the field this index covers.
   String get fieldName;

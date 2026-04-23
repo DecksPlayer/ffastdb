@@ -1,6 +1,5 @@
 import 'dart:convert';
 import 'dart:typed_data';
-import 'package:meta/meta.dart';
 import 'secondary_index.dart';
 import 'bloom_filter.dart';
 
@@ -14,7 +13,6 @@ const int _tInt64 = 5;  // 64-bit int — used for all new writes
 /// In-memory hash-based secondary index with persistence support.
 /// Fast O(1) lookups using optimized hash buckets for Isar-level performance.
 /// Uses FNV-1a hash for better distribution and reduced collisions.
-@internal
 class HashIndex implements SecondaryIndex {
   @override
   final String fieldName;
@@ -169,6 +167,28 @@ class HashIndex implements SecondaryIndex {
     if (operator == 'notEquals') {
       final matching = lookup(value).toSet();
       return all().where((id) => !matching.contains(id));
+    }
+    // HashIndex has no ordering — prefix/substring scans are O(n).
+    // Prefer SortedIndex (addSortedIndex) for startsWith to get O(log n).
+    if (operator == 'startsWith') {
+      if (value is! String || value.isEmpty) return all();
+      final results = <int>[];
+      for (final entry in _reverse.entries) {
+        if (entry.value is String && (entry.value as String).startsWith(value)) {
+          results.add(entry.key);
+        }
+      }
+      return results;
+    }
+    if (operator == 'contains') {
+      if (value is! String || value.isEmpty) return [];
+      final results = <int>[];
+      for (final entry in _reverse.entries) {
+        if (entry.value is String && (entry.value as String).contains(value)) {
+          results.add(entry.key);
+        }
+      }
+      return results;
     }
     return [];
   }

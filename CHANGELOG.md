@@ -1,3 +1,15 @@
+## 0.1.0
+
+### Stable Public API Release
+
+- **BREAKING — Public index types**: Removed `@internal` from `SecondaryIndex`, `HashIndex`, `SortedIndex`, `FtsIndex`, `BitmaskIndex`, and `CompositeIndex`. These are now part of the stable public API.
+- **BREAKING — `IndexManager` is now public**: The `db.indexes` getter previously returned a private `_IndexManager` type. It now returns the public `IndexManager` class, enabling proper static typing in user code.
+- **FIX — `SortedIndex.startsWith` is now O(log n)**: Replaced the O(n) `_reverse` scan with a true binary prefix search using `_lowerBound(prefix)` / `_lowerBound(nextPrefix)`. Prefix queries on `addSortedIndex` fields are now as fast as range queries.
+- **FIX — `HashIndex.startsWith` was broken (returned `[]`)**: Added `startsWith` and `contains` support to `HashIndex.search()`. O(n) scan as expected for a hash structure — use `addSortedIndex` for prefix-heavy workloads.
+- **CLEANUP — 0 `dart analyze` warnings**: Removed all unused imports, dead code (`_readAtSync`), unnecessary null assertions, and redundant type checks.
+
+---
+
 ## 0.0.27
 
 ### Bug Fixes (B-Tree Stability & Indexing)

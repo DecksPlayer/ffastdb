@@ -1,5 +1,4 @@
 import 'package:ffastdb/ffastdb.dart';
-import 'package:ffastdb/src/index/fts_index.dart';
 
 void main() async {
   final db = FastDB(MemoryStorageStrategy());

@@ -1,10 +1,10 @@
 part of 'fastdb.dart';
 
 /// Manages index registration, creation, and maintenance for FastDB.
-class _IndexManager {
+class IndexManager {
   final FastDB _db;
 
-  _IndexManager(this._db);
+  IndexManager(this._db);
 
   /// Access to all registered secondary indexes.
   Map<String, SecondaryIndex> get all => _db._secondaryIndexes;

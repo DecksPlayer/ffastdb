@@ -1,6 +1,5 @@
 import 'dart:convert';
 import 'dart:typed_data';
-import 'package:meta/meta.dart';
 import 'secondary_index.dart';
 
 /// Composite (multi-field) index for efficient multi-condition queries.
@@ -27,7 +26,6 @@ import 'secondary_index.dart';
 ///   .where('status').equals('active')
 ///   .find();
 /// ```
-@internal
 class CompositeIndex extends SecondaryIndex {
   /// Field names that compose this index (in order).
   final List<String> fieldNames;

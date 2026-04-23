@@ -1,6 +1,5 @@
 import 'dart:convert';
 import 'dart:typed_data';
-import 'package:meta/meta.dart';
 import 'secondary_index.dart';
 
 /// O(log n) sorted secondary index using flat parallel arrays.
@@ -13,7 +12,6 @@ import 'secondary_index.dart';
 ///   - `between(a, b)` — range scans
 ///   - `greaterThan / lessThan`
 ///   - `sortBy(field)`
-@internal
 class SortedIndex implements SecondaryIndex {
   @override
   final String fieldName;
@@ -184,24 +182,30 @@ class SortedIndex implements SecondaryIndex {
         return [];
     }
 
-    // 3. String operators (Case-Insensitive Scan)
-    if (operator == 'startsWith' || operator == 'contains') {
-      if (value is! String || value.isEmpty) return [];
-      final lower = value.toLowerCase();
-      final results = <int>{};
+    // 3. String operators
+    if (operator == 'startsWith') {
+      if (value is! String || value.isEmpty) return all();
+      // O(log n) binary prefix scan.
+      // All strings starting with `prefix` lie in the sorted range
+      // [prefix, nextPrefix), where nextPrefix increments the last code unit.
+      final start = _lowerBound(value);
+      final lastCode = value.codeUnitAt(value.length - 1);
+      // Compute exclusive upper bound; guard against overflow at max code unit.
+      final upperBound = lastCode < 0xFFFF
+          ? value.substring(0, value.length - 1) + String.fromCharCode(lastCode + 1)
+          : value.substring(0, value.length - 1);
+      final end = upperBound.isEmpty ? _length : _lowerBound(upperBound);
+      if (start >= end) return [];
+      return List<int>.from(Uint32List.sublistView(_docIds, start, end));
+    }
 
-      // For startsWith, we can optimize by starting the scan from the lowerBound
-      // but to be 100% safe with case-insensitivity, we scan all entries.
+    if (operator == 'contains') {
+      if (value is! String || value.isEmpty) return [];
+      // Substring match cannot use binary search — O(n) scan is unavoidable.
+      final results = <int>{};
       for (final entry in _reverse.entries) {
         final val = entry.value;
-        if (val is String) {
-          final valLower = val.toLowerCase();
-          if (operator == 'startsWith') {
-            if (valLower.startsWith(lower)) results.add(entry.key);
-          } else {
-            if (valLower.contains(lower)) results.add(entry.key);
-          }
-        }
+        if (val is String && val.contains(value)) results.add(entry.key);
       }
       return results;
     }

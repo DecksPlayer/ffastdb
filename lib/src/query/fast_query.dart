@@ -1,8 +1,6 @@
 import '../index/secondary_index.dart';
 import '../index/sorted_index.dart';
-import '../index/hash_index.dart';
 import '../index/composite_index.dart';
-import '../index/fts_index.dart';
 import 'query_cache.dart';
 
 /// Result of a query — a list of document IDs to fetch.
@@ -65,7 +63,7 @@ class QueryBuilder {
   /// This is the most efficient way to get all document IDs or a subset by primary key.
   Future<List<int>> rangeSearch(int low, int high) async {
     if (_primarySearch == null) return [];
-    return await _primarySearch!(low, high);
+    return await _primarySearch(low, high);
   }
 
   // ─── Condition Starters ───────────────────────────────────────────────────

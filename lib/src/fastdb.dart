@@ -110,14 +110,14 @@ class FastDB {
   late final _CrudOperations _crudOps;
   late final _QueryOperations _queryOps;
   late final _BatchOperations _batchOps;
-  late final _IndexManager _indexMgr;
+  late final IndexManager _indexMgr;
   late final _StorageManager _storageMgr;
 
   WalStorageStrategy? get _wal =>
       storage is WalStorageStrategy ? storage as WalStorageStrategy : null;
 
   /// Access to index management and statistics.
-  _IndexManager get indexes => _indexMgr;
+  IndexManager get indexes => _indexMgr;
 
   /// Internal constructor used by factory constructors and singleton.
   FastDB._internal(this.storage, {
@@ -133,7 +133,7 @@ class FastDB {
     _crudOps = _CrudOperations(this);
     _queryOps = _QueryOperations(this);
     _batchOps = _BatchOperations(this);
-    _indexMgr = _IndexManager(this);
+    _indexMgr = IndexManager(this);
     _storageMgr = _StorageManager(this);
   }
   
@@ -688,60 +688,7 @@ class FastDB {
   void _removeDocument(int id, Map<String, dynamic> doc) =>
       _indexMgr.removeDocument(id, doc);
 
-  // Data Reading (Sync & Async Paths)
-  
-  dynamic _readAtSync(int offset) {
-    if (offset < 0) return null;
-    final targetStorage = dataStorage ?? storage;
-    const int readAheadSize = 512;
-    final chunk = targetStorage.readSync(offset, readAheadSize);
-    if (chunk == null || chunk.length < 4) return null;
-    final length = _readInt32(chunk, 0);
-    if (length <= 0 || length > 10 * 1024 * 1024) return null;
-    final int totalSize = 4 + length + 4;
-    final Uint8List fullData;
-    if (totalSize <= chunk.length) {
-      fullData = chunk;
-    } else {
-      final full = targetStorage.readSync(offset, totalSize);
-      if (full == null) return null;
-      fullData = full;
-    }
-    if (fullData.length >= totalSize) {
-      final storedCrc = _readInt32(fullData, 4 + length);
-      if (storedCrc != _crc32(fullData.sublist(4, 4 + length))) return null;
-    }
-    final body = fullData.sublist(4, 4 + length);
-    
-    // 1. New format: magic prefix [0x00, 0x01]
-    if (body.length >= 2 && body[0] == 0x00 && body[1] == 0x01) {
-      final doc = FastSerializer.deserialize(body);
-      if (doc.containsKey('_originalId')) {
-        doc['id'] = doc.remove('_originalId');
-      }
-      return doc;
-    }
-    
-    // 2. Legacy format: starts with '{' (123) or '[' (91)
-    if (body.isNotEmpty && (body[0] == 123 || body[0] == 91)) {
-      try {
-        final jsonStr = utf8.decode(body);
-        final raw = jsonDecode(jsonStr) as Map<String, dynamic>;
-        final doc = FastSerializer.revive(raw) as Map<String, dynamic>;
-        if (doc.containsKey('_originalId')) {
-          doc['id'] = doc.remove('_originalId');
-        }
-        return doc;
-      } catch (_) {}
-    }
-    final reader = FastBinaryReader(body);
-    final doc = _registry.read(reader);
-    // Restore original 'id' field if it was preserved (e.g., from Firebase)
-    if (doc is Map && doc.containsKey('_originalId')) {
-      doc['id'] = doc.remove('_originalId');
-    }
-    return doc;
-  }
+  // Data Reading (Async Path)
 
   Future<dynamic> _readAt(int offset) async {
     if (offset < 0) return null;

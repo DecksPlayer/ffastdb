@@ -1,6 +1,5 @@
 import 'dart:convert';
 import 'dart:typed_data';
-import 'package:meta/meta.dart';
 import 'secondary_index.dart';
 
 /// Full-Text Search (FTS) Index for fast text searching.
@@ -24,7 +23,6 @@ import 'secondary_index.dart';
 ///   .where('description').fts('london')
 ///   .find();
 /// ```
-@internal
 class FtsIndex extends SecondaryIndex {
   /// Maps tokens to document IDs.
   /// Example: 'london' -> [1, 5, 23, 45]

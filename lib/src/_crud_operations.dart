@@ -122,7 +122,7 @@ class _CrudOperations {
 
       await _db._primaryIndex.insert(id, offset);
       await _db._syncDataOffset(data.length);
-      if (merged is Map) _db._indexDocument(id, Map<String, dynamic>.from(merged));
+      _db._indexDocument(id, Map<String, dynamic>.from(merged));
 
       if (!_db._batchMode) {
         await targetStorage.flush();
