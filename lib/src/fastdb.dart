@@ -754,8 +754,8 @@ class FastDB {
   Uint8List _serialize(dynamic doc, {int? id}) {
     final Uint8List payload;
     if (doc is Map) {
+      final docMap = Map<String, dynamic>.from(doc);
       Map<String, dynamic> map;
-      final docMap = doc as Map<String, dynamic>;
       
       // OPTIMIZATION: Avoid Map.from() copy if we don't need to modify
       if (id != null && docMap['id'] != id) {
