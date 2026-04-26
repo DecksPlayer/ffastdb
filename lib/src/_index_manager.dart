@@ -153,7 +153,7 @@ class IndexManager {
 
   /// Rebuilds all secondary indexes from live documents.
   /// Deduplicates IDs to prevent index corruption from B-Tree structural issues.
-  Future<void> rebuildSecondaryIndexes() async {
+  Future<void> rebuildSecondaryIndexes({void Function(double)? onProgress}) async {
     if (_db._secondaryIndexes.isEmpty) return;
     for (final idx in _db._secondaryIndexes.values) idx.clear();
     final rawIds = await _db._primaryIndex.rangeSearch(1, 0x7FFFFFFF);
@@ -172,7 +172,11 @@ class IndexManager {
         // Corrupt document — skip and continue indexing the rest.
         // It will be removed on the next compact().
       }
-      if (i > 0 && i % 250 == 0) await Future.delayed(Duration.zero);
+      if (i > 0 && i % 250 == 0) {
+        if (onProgress != null) onProgress(i / allIds.length);
+        await Future.delayed(Duration.zero);
+      }
     }
+    if (onProgress != null) onProgress(1.0);
   }
 }

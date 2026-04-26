@@ -217,6 +217,7 @@ class FastDB {
     List<String> sortedIndexes = const [],
     List<String> ftsIndexes = const [],
     List<List<String>> compositeIndexes = const [],
+    void Function(double)? onProgress,
   }) async {
     final db = FastDB._internal(
       storage,
@@ -231,7 +232,7 @@ class FastDB {
     for (final field in ftsIndexes) db.addFtsIndex(field);
     for (final fields in compositeIndexes) db.addCompositeIndex(fields);
     
-    await db.open(version: version, migrations: migrations);
+    await db.open(version: version, migrations: migrations, onProgress: onProgress);
     _instance = db; // expose singleton only after open() completes
     return db;
   }
@@ -310,6 +311,7 @@ class FastDB {
   Future<void> open({
     int version = 1,
     Map<int, dynamic Function(dynamic)>? migrations,
+    void Function(double)? onProgress,
   }) async {
     // Clear the global query cache when opening a new database.
     // This prevents query results from one database/test from contaminating another.
@@ -353,10 +355,10 @@ class FastDB {
         final missingKeys = _secondaryIndexes.keys.where((k) => !loadedKeys.contains(k)).toList();
         if (missingKeys.isNotEmpty) {
           // Some newly registered indexes weren't in the payload, rebuild them!
-          await _indexMgr.rebuildSecondaryIndexes();
+          await _indexMgr.rebuildSecondaryIndexes(onProgress: onProgress);
         }
       } else {
-        await _indexMgr.rebuildSecondaryIndexes();
+        await _indexMgr.rebuildSecondaryIndexes(onProgress: onProgress);
       }
 
       if (storage.needsExplicitFlush) {
@@ -469,11 +471,45 @@ class FastDB {
   ) => _exclusive(() async {
     final ids = await queryFn(QueryBuilder(_secondaryIndexes, findById, rangeSearch));
     if (ids.isEmpty) return 0;
-    int updated = 0;
-    for (final id in ids) {
-      if (await _crudOps.updateImpl(id, fields)) updated++;
+    
+    // Batch mode for massive updates
+    final wasInBatch = _batchMode;
+    if (!wasInBatch) {
+      await beginBatch();
     }
-    await _saveHeader();
+    
+    int updated = 0;
+    try {
+      int count = 0;
+      for (final id in ids) {
+        if (await _crudOps.updateImpl(id, fields)) updated++;
+        count++;
+        
+        // On web, flush periodically to prevent IndexedDB chunk accumulation and memory overflow
+        if (_runningOnWeb && count % 500 == 0) {
+          final targetStorage = dataStorage ?? storage;
+          await targetStorage.flush();
+          if (dataStorage != null) await storage.flush();
+          await Future.delayed(Duration.zero);
+        }
+      }
+      if (!wasInBatch) {
+        await commitBatch();
+        if (_autoCompactThreshold > 0) {
+          await _maybeAutoCompact();
+        }
+      } else {
+        await _saveHeader();
+      }
+    } catch (e) {
+      if (!wasInBatch) {
+        _batchMode = false;
+        _batchEntries.clear();
+        _pageManager.writeBehind = false;
+        // Rollback WAL if necessary (handled by transaction if in transaction)
+      }
+      rethrow;
+    }
     return updated;
   });
 
@@ -639,7 +675,16 @@ class FastDB {
 
   // ─── Reactive Watchers ────────────────────────────────────────────────────
 
-  Stream<List<int>> watch(String field) {
+  Stream<List<int>> watch(String field) async* {
+    // 1. Emit current state immediately
+    final idx = _secondaryIndexes[field];
+    if (idx != null) {
+      yield idx.all();
+    } else {
+      yield await _primaryIndex.rangeSearch(1, _nextId - 1);
+    }
+
+    // 2. Yield future updates from the broadcast controller
     if (!_watchers.containsKey(field)) {
       // BUG FIX: use onCancel to remove the controller from _watchers once
       // all listeners unsubscribe, preventing StreamControllers from
@@ -655,7 +700,7 @@ class FastDB {
       );
       _watchers[field] = ctrl;
     }
-    return _watchers[field]!.stream;
+    yield* _watchers[field]!.stream;
   }
 
   void _notifyWatchers(dynamic doc) {
@@ -831,13 +876,22 @@ class FastDB {
         if (wal != null) await wal.beginTransaction();
         try {
           int count = 0;
-          for (final id in ids) {
-            if (await _crudOps.deleteImpl(id)) count++;
+          for (int i = 0; i < ids.length; i++) {
+            if (await _crudOps.deleteImpl(ids[i])) count++;
+            if (_runningOnWeb && count % 500 == 0) {
+              await storage.flush();
+              await Future.delayed(Duration.zero);
+            }
           }
           if (wal != null) await wal.commit();
           _batchMode = false;
+          await _pageManager.flushDirty();
+          await storage.flush();
           await _saveHeader();
           QueryBuilder.clearCache();
+          if (_autoCompactThreshold > 0) {
+            await _maybeAutoCompact();
+          }
           return count;
         } catch (e) {
           _batchMode = false;

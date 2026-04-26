@@ -33,6 +33,7 @@ Future<FastDB> openDatabase(
   List<String> ftsIndexes = const [],
   List<List<String>> compositeIndexes = const [],
   String? encryptionKey,
+  void Function(double)? onProgress,
 }) async {
   // Guard: if a live instance already exists, reuse it.
   // Calling disposeInstance() unconditionally was the root cause of
@@ -69,6 +70,7 @@ Future<FastDB> openDatabase(
     sortedIndexes: sortedIndexes,
     ftsIndexes: ftsIndexes,
     compositeIndexes: compositeIndexes,
+    onProgress: onProgress,
   );
 
   return db;

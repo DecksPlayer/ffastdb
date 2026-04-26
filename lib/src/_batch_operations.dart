@@ -58,6 +58,10 @@ class _BatchOperations {
         await _db._syncDataOffset(0);
 
         // Yield to event loop to prevent blocking and allow GC
+        if (_runningOnWeb) {
+          await targetStorage.flush();
+          if (_db.dataStorage != null) await _db.storage.flush();
+        }
         await Future.delayed(Duration.zero);
       }
 

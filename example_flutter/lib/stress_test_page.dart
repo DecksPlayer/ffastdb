@@ -14,7 +14,11 @@ class QueryCondition {
   String field;
   String operator;
   String value;
-  QueryCondition({required this.field, required this.operator, required this.value});
+  QueryCondition({
+    required this.field,
+    required this.operator,
+    required this.value,
+  });
 }
 
 class StressTestPage extends StatefulWidget {
@@ -30,9 +34,10 @@ class _StressTestPageState extends State<StressTestPage> {
   bool _running = false;
   double _progress = 0;
   int _totalDocs = 0;
-  
+
   // Results from searches
   List<dynamic> _searchResults = [];
+  bool _isStreamingAll = false;
 
   // Dynamic Query Builder
   final List<QueryCondition> _conditions = [
@@ -53,7 +58,10 @@ class _StressTestPageState extends State<StressTestPage> {
 
   void _log(String msg) {
     setState(() {
-      _logs.insert(0, '${DateTime.now().toString().split(' ').last.substring(0, 8)} - $msg');
+      _logs.insert(
+        0,
+        '${DateTime.now().toString().split(' ').last.substring(0, 8)} - $msg',
+      );
     });
   }
 
@@ -90,115 +98,230 @@ class _StressTestPageState extends State<StressTestPage> {
       _log('🚀 Wiping and rebuilding Complex DB...');
       // Clear existing data to ensure a clean state for the new indexes
       await widget.db.deleteWhere((q) => q.rangeSearch(1, 0x7FFFFFFF));
-      
+
       final random = Random();
-      
+
       // 1. Indexes are now globally registered in main.dart
-      
 
       // 2. Create Users
       _log('👤 Creating 50 users...');
-      final userIds = <int>[];
-      for (int i = 0; i < 50; i++) {
-        final id = await widget.db.insert({
+      final usersToInsert = <Map<String, dynamic>>[];
+      for (int i = 0; i < 500; i++) {
+        usersToInsert.add({
           'type': 'user',
           'name': 'User $i',
           'email': 'user_$i@example.com',
           'followers': random.nextInt(1000),
-          'joinedAt': DateTime.now().subtract(Duration(days: random.nextInt(365))).millisecondsSinceEpoch,
+          'joinedAt': DateTime.now()
+              .subtract(Duration(days: random.nextInt(365)))
+              .millisecondsSinceEpoch,
         });
-        userIds.add(id);
       }
+      final userIds = await widget.db.insertAll(usersToInsert);
 
-      final phrases = [
-        "Exploring the hidden gems of the city.", "Coding is like magic but with logic.",
-        "The sun sets beautifully over the horizon.", "Fresh coffee is the best way to start the day.",
-        "Learning a new language opens up the world.", "Music has a way of healing the soul.",
-        "Photography captures moments that are gone forever.", "Traveling helps you find yourself.",
-        "Cooking is an art, baking is a science.", "The mountains are calling and I must go.",
-        "Reading a good book is like a dream you can hold.", "Kindness costs nothing but means everything.",
-        "Digital databases are the backbone of modern tech.", "FastDB is becoming really stable now.",
-        "A simple smile can change someone's day.", "The ocean waves are incredibly soothing.",
-        "Technology is best when it brings people together.", "Nature never goes out of style.",
-        "Strive for progress, not perfection.", "Innovation distinguishes between a leader and a follower.",
-        "Stay curious and keep learning.", "The best time to plant a tree was 20 years ago.",
-        "Dream big and dare to fail.", "Focus on the journey, not the destination.",
-        "Every day is a second chance.", "Believe you can and you're halfway there.",
-        "Good things take time.", "Happiness depends upon ourselves.",
-        "Life is short, make it sweet.", "Simplicity is the ultimate sophistication.",
-        "Adventure awaits around every corner.", "Autumn leaves are falling like pieces into place.",
-        "Winter is coming, stay warm.", "Spring brings new beginnings.",
-        "Summer nights are made for memories.", "Quiet the mind and the soul will speak.",
-        "Work hard in silence, let success be your noise.", "Be the change you wish to see.",
-        "Don't count the days, make the days count.", "Everything you can imagine is real.",
-        "Impossible is just an opinion.", "Keep your head in the clouds and feet on the ground.",
-        "Make today amazing.", "Never stop dreaming.", "Nothing is impossible.",
-        "Opportunities don't happen, you create them.", "Quality is not an act, it is a habit.",
-        "Success is a journey, not a destination.", "The power of imagination makes us infinite.",
-        "Wait for the right moment, but don't wait forever.", "Your only limit is your mind.",
-        "Do what you love, love what you do.", "Eat well, travel often.",
-        "Follow your heart.", "Get outside and enjoy the fresh air.",
-        "Live every moment.", "Love more, worry less.", "Positive vibes only.",
-        "Think outside the box.", "Write your own story.", "Be yourself.",
-        "Choose joy.", "Create your own sunshine.", "Do more of what makes you happy.",
-        "Enjoy the little things.", "Happy days are here again.", "Life is beautiful.",
-        "Make it happen.", "Stay humble, work hard.", "Today is a gift.",
-        "Wherever you go, go with all your heart.", "Your vibe attracts your tribe.",
-        "Art is the stored honey of the human soul.", "Be brave, be bold.",
-        "Collect moments, not things.", "Doubt kills more dreams than failure ever will.",
-        "Fear is a liar.", "Give every day the chance to be the most beautiful.",
-        "He who has a why to live can bear almost any how.", "I am the master of my fate.",
-        "Knowledge is power.", "Lead from the heart.", "No pressure, no diamonds.",
-        "One day or day one. You decide.", "Peace begins with a smile.",
-        "Realize deeply that the present moment is all you have.", "Say yes to new adventures.",
-        "The future depends on what you do today.", "Unity is strength.",
-        "Victory is sweetest when you've known defeat.", "Wake up and be awesome.",
-        "Yesterday's home runs don't win today's games.", "Zeal is the fire of the soul.",
-        "A goal without a plan is just a wish.", "Be kind to yourself.",
-        "Create something every day.", "Don't let yesterday take up too much of today.",
-        "Every moment is a fresh beginning.", "Follow your dreams.", "Go for it."
+      final basePhrases = [
+        "Exploring the hidden gems of the city.",
+        "Coding is like magic but with logic.",
+        "The sun sets beautifully over the horizon.",
+        "Fresh coffee is the best way to start the day.",
+        "Learning a new language opens up the world.",
+        "Music has a way of healing the soul.",
+        "Photography captures moments that are gone forever.",
+        "Traveling helps you find yourself.",
+        "Cooking is an art, baking is a science.",
+        "The mountains are calling and I must go.",
+        "Reading a good book is like a dream you can hold.",
+        "Kindness costs nothing but means everything.",
+        "Digital databases are the backbone of modern tech.",
+        "FastDB is becoming really stable now.",
+        "A simple smile can change someone's day.",
+        "The ocean waves are incredibly soothing.",
+        "Technology is best when it brings people together.",
+        "Nature never goes out of style.",
+        "Strive for progress, not perfection.",
+        "Innovation distinguishes between a leader and a follower.",
+        "Stay curious and keep learning.",
+        "The best time to plant a tree was 20 years ago.",
+        "Dream big and dare to fail.",
+        "Focus on the journey, not the destination.",
+        "Every day is a second chance.",
+        "Believe you can and you're halfway there.",
+        "Good things take time.",
+        "Happiness depends upon ourselves.",
+        "Life is short, make it sweet.",
+        "Simplicity is the ultimate sophistication.",
+        "Adventure awaits around every corner.",
+        "Autumn leaves are falling like pieces into place.",
+        "Winter is coming, stay warm.",
+        "Spring brings new beginnings.",
+        "Summer nights are made for memories.",
+        "Quiet the mind and the soul will speak.",
+        "Work hard in silence, let success be your noise.",
+        "Be the change you wish to see.",
+        "Don't count the days, make the days count.",
+        "Everything you can imagine is real.",
+        "Impossible is just an opinion.",
+        "Keep your head in the clouds and feet on the ground.",
+        "Make today amazing.",
+        "Never stop dreaming.",
+        "Nothing is impossible.",
+        "Opportunities don't happen, you create them.",
+        "Quality is not an act, it is a habit.",
+        "Success is a journey, not a destination.",
+        "The power of imagination makes us infinite.",
+        "Wait for the right moment, but don't wait forever.",
+        "Your only limit is your mind.",
+        "Do what you love, love what you do.",
+        "Eat well, travel often.",
+        "Follow your heart.",
+        "Get outside and enjoy the fresh air.",
+        "Live every moment.",
+        "Love more, worry less.",
+        "Positive vibes only.",
+        "Think outside the box.",
+        "Write your own story.",
+        "Be yourself.",
+        "Choose joy.",
+        "Create your own sunshine.",
+        "Do more of what makes you happy.",
+        "Enjoy the little things.",
+        "Happy days are here again.",
+        "Life is beautiful.",
+        "Make it happen.",
+        "Stay humble, work hard.",
+        "Today is a gift.",
+        "Wherever you go, go with all your heart.",
+        "Your vibe attracts your tribe.",
+        "Art is the stored honey of the human soul.",
+        "Be brave, be bold.",
+        "Collect moments, not things.",
+        "Doubt kills more dreams than failure ever will.",
+        "Fear is a liar.",
+        "Give every day the chance to be the most beautiful.",
+        "He who has a why to live can bear almost any how.",
+        "I am the master of my fate.",
+        "Knowledge is power.",
+        "Lead from the heart.",
+        "No pressure, no diamonds.",
+        "One day or day one. You decide.",
+        "Peace begins with a smile.",
+        "Realize deeply that the present moment is all you have.",
+        "Say yes to new adventures.",
+        "The future depends on what you do today.",
+        "Unity is strength.",
+        "Victory is sweetest when you've known defeat.",
+        "Wake up and be awesome.",
+        "Yesterday's home runs don't win today's games.",
+        "Zeal is the fire of the soul.",
+        "A goal without a plan is just a wish.",
+        "Be kind to yourself.",
+        "Create something every day.",
+        "Don't let yesterday take up too much of today.",
+        "Every moment is a fresh beginning.",
+        "Follow your dreams.",
+        "Go for it.",
       ];
 
-      _log('📝 Creating 500 posts with 100 possible phrases...');
-      final postIds = <int>[];
-      for (int i = 0; i < 500; i++) {
+      final subjects = [
+        'The cat',
+        'A developer',
+        'My friend',
+        'The robot',
+        'An alien',
+        'The database',
+        'A ninja',
+        'The superhero',
+        'A dinosaur',
+        'The chef',
+        'A hacker',
+        'The wizard',
+        'An astronaut',
+        'The detective',
+        'A pirate',
+      ];
+      final verbs = [
+        'jumps over',
+        'debugs',
+        'loves',
+        'destroys',
+        'creates',
+        'analyzes',
+        'hides from',
+        'fights',
+        'eats',
+        'cooks',
+        'hacks',
+        'enchants',
+        'explores',
+        'investigates',
+        'steals',
+      ];
+      final objects = [
+        'the lazy dog',
+        'the complex code',
+        'a pizza',
+        'the whole system',
+        'a beautiful artwork',
+        'the big data',
+        'the shadows',
+        'the evil villain',
+        'a giant asteroid',
+        'a tasty meal',
+        'the mainframe',
+        'a magical potion',
+        'the galaxy',
+        'a mysterious clue',
+        'the hidden treasure',
+      ];
+
+      final phrases = List.generate(400, (i) {
+        if (i < basePhrases.length) return basePhrases[i];
+        return '${subjects[random.nextInt(subjects.length)]} ${verbs[random.nextInt(verbs.length)]} ${objects[random.nextInt(objects.length)]}.';
+      });
+
+      _log('📝 Creating 100000 posts with 400 possible phrases...');
+      final postsToInsert = <Map<String, dynamic>>[];
+      for (int i = 0; i < 100000; i++) {
         final uId = userIds[random.nextInt(userIds.length)];
         final phrase = phrases[random.nextInt(phrases.length)];
-        final id = await widget.db.insert({
+        postsToInsert.add({
           'type': 'post',
           'userId': uId,
           'content': phrase,
           'likes': random.nextInt(500),
-          'timestamp': DateTime.now().subtract(Duration(hours: random.nextInt(100))).millisecondsSinceEpoch,
+          'timestamp': DateTime.now()
+              .subtract(Duration(hours: random.nextInt(100)))
+              .millisecondsSinceEpoch,
         });
-        postIds.add(id);
-        if (i % 100 == 0) setState(() => _progress = i / 500 * 0.5);
+        if (i % 5000 == 0) setState(() => _progress = i / 100000 * 0.4);
       }
+      final postIds = await widget.db.insertAll(postsToInsert);
+      setState(() => _progress = 0.5);
 
       // 4. Create Comments
       _log('💬 Creating 2000 comments...');
+      final commentsToInsert = <Map<String, dynamic>>[];
       for (int i = 0; i < 2000; i++) {
         final pId = postIds[random.nextInt(postIds.length)];
         final uId = userIds[random.nextInt(userIds.length)];
-        await widget.db.insert({
+        commentsToInsert.add({
           'type': 'comment',
           'postId': pId,
           'userId': uId,
           'text': 'Comment #$i on post $pId',
           'timestamp': DateTime.now().millisecondsSinceEpoch,
         });
-        if (i % 400 == 0) setState(() => _progress = 0.5 + (i / 2000 * 0.5));
+        if (i % 500 == 0) setState(() => _progress = 0.5 + (i / 2000 * 0.2));
       }
+      await widget.db.insertAll(commentsToInsert);
+      setState(() => _progress = 0.8);
 
       _log('✨ Complex DB Loaded Successfully!');
-      _log('🔄 Rebuilding all indexes for safety...');
-      await widget.db.reindex();
-      
       _log('📊 Post-Load Diagnostics:');
       for (final entry in widget.db.indexes.all.entries) {
         _log('   Index [${entry.key}]: size=${entry.value.size}');
       }
-      
+
       _refreshCount();
     } catch (e) {
       _log('❌ ERROR: $e');
@@ -212,23 +335,33 @@ class _StressTestPageState extends State<StressTestPage> {
 
   Future<void> _testSearches() async {
     _log('🔍 Running Relationship Queries...');
-    
+
     // 1. Find all posts from a specific user
-    final user5Posts = await widget.db.query()
-        .where('type').equals('post')
-        .where('userId').equals(5) // Assuming ID 5 is a user
+    final user5Posts = await widget.db
+        .query()
+        .where('type')
+        .equals('post')
+        .where('userId')
+        .equals(5) // Assuming ID 5 is a user
         .find();
     _log('   Found ${user5Posts.length} posts for User ID 5');
 
     // 2. Find popular posts (>400 likes) containing "apple"
-    final popularApplePosts = await widget.db.query()
-        .where('type').equals('post')
-        .where('likes').greaterThan(400)
-        .where('content').fts('apple')
+    final popularApplePosts = await widget.db
+        .query()
+        .where('type')
+        .equals('post')
+        .where('likes')
+        .greaterThan(400)
+        .where('content')
+        .fts('apple')
         .find();
     _log('   Found ${popularApplePosts.length} popular posts matching "apple"');
 
-    setState(() => _searchResults = popularApplePosts);
+    setState(() {
+      _searchResults = popularApplePosts;
+      _isStreamingAll = false;
+    });
   }
 
   Future<void> _runDynamicQuery() async {
@@ -237,22 +370,33 @@ class _StressTestPageState extends State<StressTestPage> {
     try {
       final results = await widget.db.find((q) {
         if (_conditions.isEmpty) return Future.value(<int>[]);
-        
+
         // Start with the first condition
         final first = _conditions.first;
-        var builder = _applyOperator(q.where(first.field), first.operator, first.value);
+        var builder = _applyOperator(
+          q.where(first.field),
+          first.operator,
+          first.value,
+        );
 
         // Chain the rest with AND
         for (int i = 1; i < _conditions.length; i++) {
           final cond = _conditions[i];
-          builder = _applyOperator(builder.and(cond.field), cond.operator, cond.value);
+          builder = _applyOperator(
+            builder.and(cond.field),
+            cond.operator,
+            cond.value,
+          );
         }
 
         return builder.findIds();
       });
 
       _log('   Found ${results.length} matches.');
-      setState(() => _searchResults = results);
+      setState(() {
+        _searchResults = results;
+        _isStreamingAll = false;
+      });
     } catch (e) {
       _log('❌ Query Error: $e');
     } finally {
@@ -262,15 +406,24 @@ class _StressTestPageState extends State<StressTestPage> {
 
   QueryBuilder _applyOperator(FieldCondition condition, String op, String val) {
     switch (op) {
-      case 'equals': return condition.equals(_parseValue(val));
-      case 'notEquals': return condition.not().equals(_parseValue(val));
-      case 'greaterThan': return condition.greaterThan(int.tryParse(val) ?? 0);
-      case 'lessThan': return condition.lessThan(int.tryParse(val) ?? 0);
-      case 'contains': return condition.contains(val);
-      case 'startsWith': return condition.startsWith(val);
-      case 'fts': return condition.fts(val);
-      case 'isNotNull': return condition.isNotNull();
-      default: return condition.isNotNull();
+      case 'equals':
+        return condition.equals(_parseValue(val));
+      case 'notEquals':
+        return condition.not().equals(_parseValue(val));
+      case 'greaterThan':
+        return condition.greaterThan(int.tryParse(val) ?? 0);
+      case 'lessThan':
+        return condition.lessThan(int.tryParse(val) ?? 0);
+      case 'contains':
+        return condition.contains(val);
+      case 'startsWith':
+        return condition.startsWith(val);
+      case 'fts':
+        return condition.fts(val);
+      case 'isNotNull':
+        return condition.isNotNull();
+      default:
+        return condition.isNotNull();
     }
   }
 
@@ -288,7 +441,7 @@ class _StressTestPageState extends State<StressTestPage> {
     try {
       final results = await widget.db.find((q) {
         QueryBuilder builder;
-        
+
         // 1. Start with Type
         if (_selectedType != 'all') {
           builder = q.where('type').equals(_selectedType);
@@ -315,7 +468,10 @@ class _StressTestPageState extends State<StressTestPage> {
       });
 
       _log('   Found ${results.length} matches.');
-      setState(() => _searchResults = results);
+      setState(() {
+        _searchResults = results;
+        _isStreamingAll = false;
+      });
     } catch (e) {
       _log('❌ Search Error: $e');
     } finally {
@@ -330,12 +486,17 @@ class _StressTestPageState extends State<StressTestPage> {
     for (final entry in widget.db.indexes.all.entries) {
       final idx = entry.value;
       String type = 'UNKNOWN';
-      if (idx is FtsIndex) type = 'FTS';
-      else if (idx is HashIndex) type = 'HASH';
-      else if (idx is SortedIndex) type = 'SORT';
-      else if (idx is BitmaskIndex) type = 'MASK';
-      else if (idx is CompositeIndex) type = 'COMP';
-      
+      if (idx is FtsIndex)
+        type = 'FTS';
+      else if (idx is HashIndex)
+        type = 'HASH';
+      else if (idx is SortedIndex)
+        type = 'SORT';
+      else if (idx is BitmaskIndex)
+        type = 'MASK';
+      else if (idx is CompositeIndex)
+        type = 'COMP';
+
       _log('   [$type] ${entry.key}: size=${idx.size}');
       if (idx is FtsIndex) {
         _log('     -> ${idx.stats()}');
@@ -349,7 +510,7 @@ class _StressTestPageState extends State<StressTestPage> {
     try {
       final posts = await widget.db.query().where('type').equals('post').find();
       final counts = <String, int>{};
-      
+
       for (final p in posts) {
         final content = p['content']?.toString() ?? '';
         counts[content] = (counts[content] ?? 0) + 1;
@@ -367,8 +528,13 @@ class _StressTestPageState extends State<StressTestPage> {
       final duplicateIds = <int>[];
       if (duplicates.isNotEmpty) {
         final mostRepeated = duplicates.first.key;
-        final matchingIds = await widget.db.find((q) => q.where('content').equals(mostRepeated).findIds());
-        setState(() => _searchResults = matchingIds);
+        final matchingIds = await widget.db.find(
+          (q) => q.where('content').equals(mostRepeated).findIds(),
+        );
+        setState(() {
+          _searchResults = matchingIds;
+          _isStreamingAll = false;
+        });
       }
     } catch (e) {
       _log('❌ Error checking duplicates: $e');
@@ -378,33 +544,30 @@ class _StressTestPageState extends State<StressTestPage> {
   }
 
   Future<void> _searchAll() async {
-    _log('🔍 Fetching all documents...');
-    setState(() => _running = true);
-    try {
-      final all = await widget.db.getAll();
-      _log('   Retrieved ${all.length} documents.');
-      setState(() => _searchResults = all);
-    } catch (e) {
-      _log('❌ ERROR: $e');
-    } finally {
-      setState(() => _running = false);
-    }
+    _log('📡 Toggling Streaming for all documents...');
+    setState(() => _isStreamingAll = true);
   }
 
   Future<void> _evolveSchema() async {
     _log('🧬 Evolving Schema: Adding "isFeatured" field to all posts...');
     setState(() => _running = true);
-    
+
     try {
       final updated = await widget.db.updateWhere(
         (q) => q.where('type').equals('post').findIds(),
         {'isFeatured': true, 'v': 2}, // Adding new fields!
       );
       _log('✅ Updated $updated posts with new fields.');
-      
+
       // Verify one
-      final sample = await widget.db.query().where('type').equals('post').findFirst();
-      _log('   Sample post after evolution: ${sample?['isFeatured'] == true ? "HAS isFeatured" : "MISSING"}');
+      final sample = await widget.db
+          .query()
+          .where('type')
+          .equals('post')
+          .findFirst();
+      _log(
+        '   Sample post after evolution: ${sample?['isFeatured'] == true ? "HAS isFeatured" : "MISSING"}',
+      );
     } catch (e) {
       _log('❌ ERROR: $e');
     } finally {
@@ -413,15 +576,27 @@ class _StressTestPageState extends State<StressTestPage> {
   }
 
   Future<void> _manualInsert() async {
-    final controller = TextEditingController(text: '{"type": "custom", "name": "Test", "data": {"key": "value"}}');
+    final controller = TextEditingController(
+      text: '{"type": "custom", "name": "Test", "data": {"key": "value"}}',
+    );
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (_) => AlertDialog(
         title: const Text('Insert Custom JSON'),
-        content: TextField(controller: controller, maxLines: 5, decoration: const InputDecoration(border: OutlineInputBorder())),
+        content: TextField(
+          controller: controller,
+          maxLines: 5,
+          decoration: const InputDecoration(border: OutlineInputBorder()),
+        ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
-          TextButton(onPressed: () => Navigator.pop(context, true), child: const Text('Insert')),
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Insert'),
+          ),
         ],
       ),
     );
@@ -443,10 +618,18 @@ class _StressTestPageState extends State<StressTestPage> {
       context: context,
       builder: (_) => AlertDialog(
         title: const Text('Factory Reset'),
-        content: const Text('This will COMPLETELY WIPE the database file and RESTART the instance. Use this if the database is corrupted.'),
+        content: const Text(
+          'This will COMPLETELY WIPE the database file and RESTART the instance. Use this if the database is corrupted.',
+        ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
-          TextButton(onPressed: () => Navigator.pop(context, true), child: const Text('WIPE EVERYTHING')),
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('WIPE EVERYTHING'),
+          ),
         ],
       ),
     );
@@ -457,24 +640,27 @@ class _StressTestPageState extends State<StressTestPage> {
         _log('🧨 Wiping storage strategies...');
         // Truncate to 0
         await widget.db.storage.truncate(0);
-        if (widget.db.dataStorage != null) await widget.db.dataStorage!.truncate(0);
-        
+        if (widget.db.dataStorage != null)
+          await widget.db.dataStorage!.truncate(0);
+
         _log('♻️ Re-initializing database...');
         await FfastDb.disposeInstance();
-        
+
         // On web we don't have a path, just a name
-        // We can just call openDatabase from main.dart if we had it, 
+        // We can just call openDatabase from main.dart if we had it,
         // but here we can just reload the page or tell the user.
         _log('✅ Database wiped. Please RELOAD the page/app to continue.');
-        
+
         if (mounted) {
           showDialog(
-            context: context, 
+            context: context,
             barrierDismissible: false,
             builder: (_) => const AlertDialog(
               title: Text('Reset Complete'),
-              content: Text('The database has been physically wiped. Please reload the application to start fresh.'),
-            )
+              content: Text(
+                'The database has been physically wiped. Please reload the application to start fresh.',
+              ),
+            ),
           );
         }
       } catch (e) {
@@ -482,6 +668,44 @@ class _StressTestPageState extends State<StressTestPage> {
       } finally {
         setState(() => _running = false);
       }
+    }
+  }
+
+  Future<void> _massiveUpdate() async {
+    _log('⚡ Massive Update: Modifying all posts...');
+    setState(() => _running = true);
+    try {
+      final start = DateTime.now();
+      final updated = await widget.db
+          .updateWhere((q) => q.where('type').equals('post').findIds(), {
+            'massivelyUpdated': true,
+            'lastUpdateTs': DateTime.now().millisecondsSinceEpoch,
+          });
+      final duration = DateTime.now().difference(start).inMilliseconds;
+      _log('✅ Updated $updated posts in $duration ms.');
+      _refreshCount();
+    } catch (e) {
+      _log('❌ ERROR: $e');
+    } finally {
+      setState(() => _running = false);
+    }
+  }
+
+  Future<void> _massiveDelete() async {
+    _log('🗑️ Massive Delete: Deleting all posts...');
+    setState(() => _running = true);
+    try {
+      final start = DateTime.now();
+      final deleted = await widget.db.deleteWhere(
+        (q) => q.where('type').equals('post').findIds(),
+      );
+      final duration = DateTime.now().difference(start).inMilliseconds;
+      _log('✅ Deleted $deleted posts in $duration ms.');
+      _refreshCount();
+    } catch (e) {
+      _log('❌ ERROR: $e');
+    } finally {
+      setState(() => _running = false);
     }
   }
 
@@ -505,8 +729,17 @@ class _StressTestPageState extends State<StressTestPage> {
         title: const Text('Complex DB Validator'),
         actions: [
           IconButton(icon: const Icon(Icons.refresh), onPressed: _refreshCount),
-          IconButton(icon: const Icon(Icons.warning_amber_rounded), onPressed: _factoryReset, color: Colors.orange, tooltip: 'Factory Reset (Corrupted DB)'),
-          IconButton(icon: const Icon(Icons.delete_forever), onPressed: _clearAll, tooltip: 'Clear All Docs'),
+          IconButton(
+            icon: const Icon(Icons.warning_amber_rounded),
+            onPressed: _factoryReset,
+            color: Colors.orange,
+            tooltip: 'Factory Reset (Corrupted DB)',
+          ),
+          IconButton(
+            icon: const Icon(Icons.delete_forever),
+            onPressed: _clearAll,
+            tooltip: 'Clear All Docs',
+          ),
         ],
       ),
       body: Column(
@@ -518,7 +751,10 @@ class _StressTestPageState extends State<StressTestPage> {
               mainAxisAlignment: MainAxisAlignment.spaceAround,
               children: [
                 _StatTile(label: 'Total Docs', value: '$_totalDocs'),
-                _StatTile(label: 'Search Results', value: '${_searchResults.length}'),
+                _StatTile(
+                  label: 'Search Results',
+                  value: '${_searchResults.length}',
+                ),
               ],
             ),
           ),
@@ -534,9 +770,20 @@ class _StressTestPageState extends State<StressTestPage> {
                     Row(
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
-                        const Text('🛠️ Dynamic Query Builder', style: TextStyle(fontWeight: FontWeight.bold)),
+                        const Text(
+                          '🛠️ Dynamic Query Builder',
+                          style: TextStyle(fontWeight: FontWeight.bold),
+                        ),
                         TextButton.icon(
-                          onPressed: () => setState(() => _conditions.add(QueryCondition(field: 'type', operator: 'equals', value: ''))),
+                          onPressed: () => setState(
+                            () => _conditions.add(
+                              QueryCondition(
+                                field: 'type',
+                                operator: 'equals',
+                                value: '',
+                              ),
+                            ),
+                          ),
                           icon: const Icon(Icons.add),
                           label: const Text('Add Condition'),
                         ),
@@ -550,16 +797,46 @@ class _StressTestPageState extends State<StressTestPage> {
                         padding: const EdgeInsets.only(bottom: 8.0),
                         child: Row(
                           children: [
-                            if (i > 0) const Padding(padding: EdgeInsets.symmetric(horizontal: 4), child: Text('AND', style: TextStyle(fontSize: 10, color: Colors.blue, fontWeight: FontWeight.bold))),
+                            if (i > 0)
+                              const Padding(
+                                padding: EdgeInsets.symmetric(horizontal: 4),
+                                child: Text(
+                                  'AND',
+                                  style: TextStyle(
+                                    fontSize: 10,
+                                    color: Colors.blue,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                              ),
                             Expanded(
                               flex: 2,
                               child: DropdownButton<String>(
                                 isExpanded: true,
                                 value: cond.field,
-                                style: const TextStyle(fontSize: 12, color: Colors.black),
-                                items: ['type', 'userId', 'postId', 'likes', 'content', 'isFeatured', 'username']
-                                    .map((f) => DropdownMenuItem(value: f, child: Text(f))).toList(),
-                                onChanged: (v) => setState(() => cond.field = v!),
+                                style: const TextStyle(
+                                  fontSize: 12,
+                                  color: Colors.black,
+                                ),
+                                items:
+                                    [
+                                          'type',
+                                          'userId',
+                                          'postId',
+                                          'likes',
+                                          'content',
+                                          'isFeatured',
+                                          'username',
+                                        ]
+                                        .map(
+                                          (f) => DropdownMenuItem(
+                                            value: f,
+                                            child: Text(f),
+                                          ),
+                                        )
+                                        .toList(),
+                                onChanged: (v) =>
+                                    setState(() => cond.field = v!),
                               ),
                             ),
                             const SizedBox(width: 4),
@@ -568,10 +845,30 @@ class _StressTestPageState extends State<StressTestPage> {
                               child: DropdownButton<String>(
                                 isExpanded: true,
                                 value: cond.operator,
-                                style: const TextStyle(fontSize: 12, color: Colors.black),
-                                items: ['equals', 'notEquals', 'greaterThan', 'lessThan', 'contains', 'startsWith', 'fts', 'isNotNull']
-                                    .map((o) => DropdownMenuItem(value: o, child: Text(o))).toList(),
-                                onChanged: (v) => setState(() => cond.operator = v!),
+                                style: const TextStyle(
+                                  fontSize: 12,
+                                  color: Colors.black,
+                                ),
+                                items:
+                                    [
+                                          'equals',
+                                          'notEquals',
+                                          'greaterThan',
+                                          'lessThan',
+                                          'contains',
+                                          'startsWith',
+                                          'fts',
+                                          'isNotNull',
+                                        ]
+                                        .map(
+                                          (o) => DropdownMenuItem(
+                                            value: o,
+                                            child: Text(o),
+                                          ),
+                                        )
+                                        .toList(),
+                                onChanged: (v) =>
+                                    setState(() => cond.operator = v!),
                               ),
                             ),
                             const SizedBox(width: 4),
@@ -579,13 +876,21 @@ class _StressTestPageState extends State<StressTestPage> {
                               flex: 3,
                               child: TextField(
                                 style: const TextStyle(fontSize: 12),
-                                decoration: const InputDecoration(hintText: 'Value', isDense: true),
+                                decoration: const InputDecoration(
+                                  hintText: 'Value',
+                                  isDense: true,
+                                ),
                                 onChanged: (v) => cond.value = v,
                               ),
                             ),
                             IconButton(
-                              icon: const Icon(Icons.remove_circle_outline, color: Colors.red, size: 20),
-                              onPressed: () => setState(() => _conditions.removeAt(i)),
+                              icon: const Icon(
+                                Icons.remove_circle_outline,
+                                color: Colors.red,
+                                size: 20,
+                              ),
+                              onPressed: () =>
+                                  setState(() => _conditions.removeAt(i)),
                             ),
                           ],
                         ),
@@ -598,7 +903,9 @@ class _StressTestPageState extends State<StressTestPage> {
                         onPressed: _running ? null : _runDynamicQuery,
                         icon: const Icon(Icons.play_arrow),
                         label: const Text('EXECUTE DYNAMIC QUERY'),
-                        style: ElevatedButton.styleFrom(backgroundColor: Colors.blue[100]),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.blue[100],
+                        ),
                       ),
                     ),
                   ],
@@ -647,6 +954,18 @@ class _StressTestPageState extends State<StressTestPage> {
                   label: const Text('Manual Insert'),
                   onPressed: _running ? null : _manualInsert,
                 ),
+                ActionChip(
+                  avatar: const Icon(Icons.flash_on, size: 16),
+                  label: const Text('Massive Update'),
+                  onPressed: _running ? null : _massiveUpdate,
+                  backgroundColor: Colors.yellow[200],
+                ),
+                ActionChip(
+                  avatar: const Icon(Icons.delete_sweep, size: 16),
+                  label: const Text('Massive Delete'),
+                  onPressed: _running ? null : _massiveDelete,
+                  backgroundColor: Colors.red[200],
+                ),
               ],
             ),
           ),
@@ -662,8 +981,18 @@ class _StressTestPageState extends State<StressTestPage> {
                     child: ListView.builder(
                       itemCount: _logs.length,
                       itemBuilder: (_, i) => Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                        child: Text(_logs[i], style: const TextStyle(color: Colors.greenAccent, fontSize: 10, fontFamily: 'monospace')),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 8,
+                          vertical: 2,
+                        ),
+                        child: Text(
+                          _logs[i],
+                          style: const TextStyle(
+                            color: Colors.greenAccent,
+                            fontSize: 10,
+                            fontFamily: 'monospace',
+                          ),
+                        ),
                       ),
                     ),
                   ),
@@ -671,51 +1000,100 @@ class _StressTestPageState extends State<StressTestPage> {
                 // Results side
                 Expanded(
                   flex: 1,
-                  child: ListView.builder(
-                    itemCount: _searchResults.length,
-                    itemBuilder: (_, i) {
-                      final item = _searchResults[i];
-                      final type = item['type']?.toString().toUpperCase() ?? 'UNK';
-                      
-                      String title = 'No content';
-                      String subtitle = '';
-                      Color color = Colors.grey;
-
-                      if (item['type'] == 'user') {
-                        title = item['name']?.toString() ?? 'Unknown User';
-                        subtitle = item['email']?.toString() ?? '';
-                        color = Colors.blue;
-                      } else if (item['type'] == 'post') {
-                        title = item['content']?.toString() ?? 'Empty Post';
-                        subtitle = 'Likes: ${item['likes']} | Featured: ${item['isFeatured']}';
-                        color = Colors.green;
-                      } else if (item['type'] == 'comment') {
-                        title = item['content']?.toString() ?? 'Empty Comment';
-                        subtitle = 'On Post: ${item['postId']}';
-                        color = Colors.orange;
-                      }
-
-                      return Card(
-                        margin: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
-                        child: ListTile(
-                          dense: true,
-                          leading: CircleAvatar(
-                            radius: 12,
-                            backgroundColor: color.withAlpha(50),
-                            child: Text(type[0], style: TextStyle(color: color, fontSize: 10, fontWeight: FontWeight.bold)),
-                          ),
-                          title: Text(title, style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold), maxLines: 1, overflow: TextOverflow.ellipsis),
-                          subtitle: Text(subtitle, style: const TextStyle(fontSize: 9)),
-                          trailing: Text('#${item['id']}', style: const TextStyle(fontSize: 8, color: Colors.grey)),
+                  child: _isStreamingAll
+                      ? StreamBuilder<List<dynamic>>(
+                          stream: widget.db
+                              .watch('type')
+                              .asyncMap((_) => widget.db.getAll()),
+                          builder: (context, snapshot) {
+                            if (!snapshot.hasData)
+                              return const Center(
+                                child: CircularProgressIndicator(),
+                              );
+                            final docs = snapshot.data!;
+                            return ListView.builder(
+                              prototypeItem: _buildResultItem({
+                                'type': 'post',
+                                'id': 0,
+                                'content': 'A',
+                                'likes': 0,
+                                'isFeatured': false,
+                              }),
+                              itemCount: docs.length,
+                              itemBuilder: (_, i) => _buildResultItem(docs[i]),
+                            );
+                          },
+                        )
+                      : ListView.builder(
+                          prototypeItem: _buildResultItem({
+                            'type': 'post',
+                            'id': 0,
+                            'content': 'A',
+                            'likes': 0,
+                            'isFeatured': false,
+                          }),
+                          itemCount: _searchResults.length,
+                          itemBuilder: (_, i) =>
+                              _buildResultItem(_searchResults[i]),
                         ),
-                      );
-                    },
-                  ),
                 ),
               ],
             ),
           ),
         ],
+      ),
+    );
+  }
+
+  Widget _buildResultItem(dynamic item) {
+    if (item == null) return const SizedBox.shrink();
+    final type = item['type']?.toString().toUpperCase() ?? 'UNK';
+
+    String title = 'No content';
+    String subtitle = '';
+    Color color = Colors.grey;
+
+    if (item['type'] == 'user') {
+      title = item['name']?.toString() ?? 'Unknown User';
+      subtitle = item['email']?.toString() ?? '';
+      color = Colors.blue;
+    } else if (item['type'] == 'post') {
+      title = item['content']?.toString() ?? 'Empty Post';
+      subtitle = 'Likes: ${item['likes']} | Featured: ${item['isFeatured']}';
+      color = Colors.green;
+    } else if (item['type'] == 'comment') {
+      title = item['content']?.toString() ?? 'Empty Comment';
+      subtitle = 'On Post: ${item['postId']}';
+      color = Colors.orange;
+    }
+
+    return Card(
+      margin: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+      child: ListTile(
+        dense: true,
+        leading: CircleAvatar(
+          radius: 12,
+          backgroundColor: color.withAlpha(50),
+          child: Text(
+            type.isNotEmpty ? type[0] : '?',
+            style: TextStyle(
+              color: color,
+              fontSize: 10,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+        ),
+        title: Text(
+          title,
+          style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold),
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+        ),
+        subtitle: Text(subtitle, style: const TextStyle(fontSize: 9)),
+        trailing: Text(
+          '#${item['id']}',
+          style: const TextStyle(fontSize: 8, color: Colors.grey),
+        ),
       ),
     );
   }
@@ -730,7 +1108,12 @@ class _StatTile extends StatelessWidget {
   Widget build(BuildContext context) {
     return Column(
       children: [
-        Text(value, style: Theme.of(context).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.bold)),
+        Text(
+          value,
+          style: Theme.of(
+            context,
+          ).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.bold),
+        ),
         Text(label, style: Theme.of(context).textTheme.bodySmall),
       ],
     );

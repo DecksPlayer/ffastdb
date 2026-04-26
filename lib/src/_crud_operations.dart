@@ -54,7 +54,8 @@ class _CrudOperations {
     final oldOffset = await _db._primaryIndex.search(id);
     
     final wal = _db._wal;
-    if (!_db._inTransaction && wal != null) await wal.beginTransaction();
+    final hasWal = !_db._inTransaction && !_db._batchMode && wal != null;
+    if (hasWal) await wal.beginTransaction();
     
     try {
       if (oldOffset != null) {
@@ -75,20 +76,20 @@ class _CrudOperations {
       if (!targetStorage.writeSync(offset, data)) {
         await targetStorage.write(offset, data);
       }
-      if (_db.storage.needsExplicitFlush) await targetStorage.flush();
+      if (!_db._batchMode && _db.storage.needsExplicitFlush) await targetStorage.flush();
       await _db._primaryIndex.insert(id, offset);
       await _db._syncDataOffset(data.length);
       if (id >= _db._nextId) _db._nextId = id + 1;
-      if (_db.storage.needsExplicitFlush) {
+      if (!_db._batchMode && _db.storage.needsExplicitFlush) {
         await _db.storage.flush();
         await _db._saveHeader();
       }
       if (value is Map) _db._indexDocument(id, Map<String, dynamic>.from(value));
       QueryBuilder.clearCache();
       _db._notifyWatchers(value);
-      if (!_db._inTransaction && wal != null) await wal.commit();
+      if (hasWal) await wal.commit();
     } catch (e) {
-      if (!_db._inTransaction && wal != null) await wal.rollback();
+      if (hasWal) await wal.rollback();
       rethrow;
     }
   }
@@ -106,7 +107,8 @@ class _CrudOperations {
     final merged = Map<String, dynamic>.from(existing as Map<String, dynamic>)..addAll(fields);
 
     final wal = _db._wal;
-    if (!_db._inTransaction && wal != null) await wal.beginTransaction();
+    final hasWal = !_db._inTransaction && !_db._batchMode && wal != null;
+    if (hasWal) await wal.beginTransaction();
     try {
       if (oldOffset != null) _db._deletedCount++;
 
@@ -131,10 +133,10 @@ class _CrudOperations {
         QueryBuilder.clearCache();
         _db._notifyWatchers(merged);
       }
-      if (!_db._inTransaction && wal != null) await wal.commit();
+      if (hasWal) await wal.commit();
       return true;
     } catch (e) {
-      if (!_db._inTransaction && wal != null) await wal.rollback();
+      if (hasWal) await wal.rollback();
       rethrow;
     }
   }
@@ -146,7 +148,8 @@ class _CrudOperations {
     if (_db.dataStorage == null && offset < PageManager.pageSize) return false;
     final doc = await _db._readAt(offset);
     final wal = _db._wal;
-    if (!_db._inTransaction && wal != null) await wal.beginTransaction();
+    final hasWal = !_db._inTransaction && !_db._batchMode && wal != null;
+    if (hasWal) await wal.beginTransaction();
     try {
       await _db._primaryIndex.delete(id);
       await _db._syncDataOffset(0);
@@ -162,13 +165,13 @@ class _CrudOperations {
         await _db._saveHeader();
         QueryBuilder.clearCache();
       }
-      if (!_db._inTransaction && wal != null) await wal.commit();
+      if (hasWal) await wal.commit();
       if (_db._autoCompactThreshold > 0 && !_db._inTransaction && !_db._batchMode) {
         await _db._maybeAutoCompact();
       }
       return true;
     } catch (e) {
-      if (!_db._inTransaction && wal != null) await wal.rollback();
+      if (hasWal) await wal.rollback();
       rethrow;
     }
   }
