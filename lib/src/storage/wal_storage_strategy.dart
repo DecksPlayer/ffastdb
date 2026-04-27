@@ -78,20 +78,24 @@ class WalStorageStrategy implements StorageStrategy {
         offset += 25;
 
         if (type == _kEntryCommit) {
-          // Verify the COMMIT marker's own checksum (4 bytes follow the 25-byte header)
+          // Verify the COMMIT marker's own checksum (4 bytes follow the 25-byte header).
+          // ALWAYS advance past the CRC slot, even if truncated — otherwise offset
+          // never moves and the loop spins forever (mobile infinite-loop bug).
           if (offset + 4 <= raw.length) {
             final storedCrc = _readInt32(raw, offset);
             final computedCrc = _crc32(raw.sublist(offset - 25, offset));
             if (storedCrc == computedCrc) hasCommit = true;
-            offset += 4;
           }
+          // Advance regardless — clamped to raw.length if truncated.
+          offset += 4;
           continue;
         }
 
         if (type == _kEntryWrite) {
-          if (offset + length > raw.length) break; // Truncated entry
+          // Need room for data + trailing 4-byte CRC.
+          if (offset + length + 4 > raw.length) break; // Truncated entry
           final data = raw.sublist(offset, offset + length);
-          
+
           // Verify checksum
           final storedCrc = _readInt32(raw, offset + length);
           final computedCrc = _crc32(raw.sublist(offset - 25, offset + length));
@@ -99,7 +103,11 @@ class WalStorageStrategy implements StorageStrategy {
 
           entries.add(_WalEntry(txId: txId, offset: writeOffset, data: data));
           offset += length + 4; // data + checksum
+          continue;
         }
+
+        // Unknown entry type — corrupt WAL, stop parsing.
+        break;
       }
     } catch (_) {
       // Truncated or corrupt WAL — discard the incomplete transaction

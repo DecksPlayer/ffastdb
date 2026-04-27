@@ -1062,7 +1062,7 @@ class _StressTestPageState extends State<StressTestPage> {
       subtitle = 'Likes: ${item['likes']} | Featured: ${item['isFeatured']}';
       color = Colors.green;
     } else if (item['type'] == 'comment') {
-      title = item['content']?.toString() ?? 'Empty Comment';
+      title = (item['text'] ?? item['content'])?.toString() ?? 'Empty Comment';
       subtitle = 'On Post: ${item['postId']}';
       color = Colors.orange;
     }
