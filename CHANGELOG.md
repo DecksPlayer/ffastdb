@@ -1,3 +1,22 @@
+## 0.1.2
+
+### Bug Fixes (WAL & B-Tree Stability on Mobile)
+
+- **CRITICAL — Fixed infinite loop in WAL binary recovery on Android/iOS**: When a COMMIT marker's trailing 4-byte CRC was truncated (i.e. the file ended between the 25-byte header and its checksum), `_recover()` advanced `offset` only inside the `if (offset + 4 <= raw.length)` guard, then `continue`-d back to the `while` — re-matching the same magic bytes forever. Fixed by moving `offset += 4` outside the `if` so the parser always advances past the COMMIT entry, even when truncated.
+- **CRITICAL — Fixed Stack Overflow in `BTree._insertNonFull` on corrupt databases**: The recursive descent could cause a Dart VM stack overflow (~55 000 frames) when B-Tree page pointers formed a cycle due to a previously corrupt WAL recovery. Converted `_insertNonFull` to an **iterative loop** with a `visited` page-index set that detects cycles immediately and throws a clear `StateError` instead of crashing the VM.
+- **FIX — `_WalEntry` truncation check now includes CRC bytes**: The `_kEntryWrite` truncation guard previously checked `offset + length > raw.length`, ignoring the 4 trailing CRC bytes. A write entry whose data fit exactly but left no room for the CRC would throw a `RangeError` inside the `catch (_)` silently. Now checks `offset + length + 4 > raw.length`.
+- **FIX — Unknown WAL entry types now break the parse loop**: Previously an unrecognized `type` byte would leave `offset` unchanged and spin the `while` loop forever. Added an explicit `break` after the `_kEntryWrite` block for unknown types.
+
+---
+
+## 0.1.1
+
+### Bug Fixes
+
+- **FIX — Fixed cumulative sum stream**: Resolved an issue where the reactive stream returned by aggregation watchers was accumulating values across emissions instead of replacing them, causing incorrect cumulative totals on repeated events.
+
+---
+
 ## 0.1.0
 
 ### Stable Public API Release
