@@ -54,13 +54,30 @@ class WalStorageStrategy implements StorageStrategy {
   }
 
   /// Reads the WAL file and replays committed transactions to main storage.
+  ///
+  /// Each call to [commit()] writes one or more WRITE entries followed by a
+  /// COMMIT marker to the WAL file.  Between checkpoints the WAL can therefore
+  /// contain several completed transactions followed by a partial (uncommitted)
+  /// transaction that was interrupted by a crash.
+  ///
+  /// The old implementation collected **all** WRITE entries and set `hasCommit`
+  /// if **any** COMMIT was present.  That meant that uncommitted entries from a
+  /// later transaction were replayed whenever an earlier transaction had
+  /// committed — causing silent corruption.
+  ///
+  /// The correct approach tracks "pending" entries per transaction.  A COMMIT
+  /// moves the pending list to the committed list; any entries still pending at
+  /// the end of the file are discarded.
   Future<void> _recover() async {
     final walSize = await _wal.size;
     if (walSize == 0) { _walPos = 0; return; }
 
     final raw = await _wal.read(0, walSize);
-    final entries = <_WalEntry>[];
-    bool hasCommit = false;
+
+    // Committed entries across all fully-committed transactions.
+    final committedEntries = <_WalEntry>[];
+    // Entries belonging to the transaction currently being parsed (not yet committed).
+    final pendingEntries = <_WalEntry>[];
     int offset = 0;
 
     try {
@@ -81,13 +98,22 @@ class WalStorageStrategy implements StorageStrategy {
           // Verify the COMMIT marker's own checksum (4 bytes follow the 25-byte header).
           // ALWAYS advance past the CRC slot, even if truncated — otherwise offset
           // never moves and the loop spins forever (mobile infinite-loop bug).
+          bool commitValid = false;
           if (offset + 4 <= raw.length) {
             final storedCrc = _readInt32(raw, offset);
             final computedCrc = _crc32(raw.sublist(offset - 25, offset));
-            if (storedCrc == computedCrc) hasCommit = true;
+            commitValid = (storedCrc == computedCrc);
           }
           // Advance regardless — clamped to raw.length if truncated.
           offset += 4;
+
+          if (commitValid) {
+            // Move all pending entries for this transaction to the committed list.
+            committedEntries.addAll(pendingEntries);
+          }
+          // Whether valid or not, clear pending — entries without a valid COMMIT
+          // are discarded (uncommitted transaction, e.g. crash mid-commit).
+          pendingEntries.clear();
           continue;
         }
 
@@ -101,7 +127,11 @@ class WalStorageStrategy implements StorageStrategy {
           final computedCrc = _crc32(raw.sublist(offset - 25, offset + length));
           if (storedCrc != computedCrc) break; // Checksum mismatch = corrupt
 
-          entries.add(_WalEntry(txId: txId, offset: writeOffset, data: data));
+          // Suppress unused variable warning — txId is stored in the file for
+          // forensic / debugging purposes but grouping is done via pending list.
+          // ignore: unused_local_variable
+          final _ = txId;
+          pendingEntries.add(_WalEntry(txId: txId, offset: writeOffset, data: data));
           offset += length + 4; // data + checksum
           continue;
         }
@@ -110,13 +140,14 @@ class WalStorageStrategy implements StorageStrategy {
         break;
       }
     } catch (_) {
-      // Truncated or corrupt WAL — discard the incomplete transaction
+      // Truncated or corrupt WAL — discard the incomplete transaction.
     }
+    // Any remaining pendingEntries are from an uncommitted transaction — discard them.
 
-    if (hasCommit && entries.isNotEmpty) {
+    if (committedEntries.isNotEmpty) {
       // Replay committed writes to main file — idempotent: skip writes whose
       // data already matches what is on disk (handles double-recovery on crash).
-      for (final entry in entries) {
+      for (final entry in committedEntries) {
         try {
           final existing = await _main.read(entry.offset, entry.data.length);
           bool alreadyApplied = existing.length == entry.data.length;
@@ -176,10 +207,13 @@ class WalStorageStrategy implements StorageStrategy {
     _txOpen = false;
     _txEntries.clear();
 
-    // 4. Checkpoint if WAL is large
-    if (await _wal.size > 1024 * 1024) {
-      await _checkpoint();
-    }
+    // Checkpoint after every commit: truncate the WAL so it never accumulates
+    // entries from more than one transaction.  The old approach (checkpoint only
+    // when WAL > 1 MB) left dozens of committed transactions in the WAL,
+    // which — combined with the multi-tx recovery bug that has now been fixed —
+    // was the primary source of corruption.  Even with that bug fixed, keeping
+    // the WAL small reduces recovery time and memory pressure on restart.
+    await _checkpoint();
   }
 
   /// Rolls back the current transaction (discards buffered writes).

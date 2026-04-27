@@ -1,3 +1,14 @@
+## 0.2.4
+
+### Bug Fixes (WAL Corruption & Multi-Isolate Stability)
+
+- **CRITICAL — Fixed WAL recovery replaying uncommitted transactions**: The `_recover()` method used a single `hasCommit` flag across the entire WAL file. If TX1 was committed and TX2 was interrupted mid-flight (e.g. app killed), recovery would set `hasCommit = true` and replay **all** entries — including the uncommitted ones from TX2 — silently corrupting the B-Tree. Fixed by tracking `pendingEntries` per transaction: a COMMIT marker moves pending → committed; entries still pending at EOF are discarded.
+- **CRITICAL — WAL now checkpoints after every commit**: Previously the WAL only truncated when it exceeded 1 MB, leaving dozens of committed transactions accumulated in a single file. Combined with the multi-tx recovery bug above, this was the primary source of database corruption on mobile. The WAL is now truncated after every `commit()` call, ensuring it never holds more than one transaction at a time and recovery is instantaneous.
+- **FIX — Stale `.fdb.port` file causes SocketException on reopen**: If the Owner isolate crashed or closed the database without calling `coordinator.stop()`, the `.fdb.port` sidecar file was left on disk. The next `openDatabase()` call would find the port, try to connect, and throw a `SocketException`. Fixed by adding `IsolateCoordinator.isPortAlive()` — a 200 ms probe that verifies the socket is accepting connections before entering proxy mode. Stale port files are deleted automatically.
+- **FIX — `.fdb.port` not cleaned up in tests**: `persistence_test.dart` tearDown/setUp did not include `.fdb.port` in the file cleanup list, causing cross-test contamination when running the full suite. Added to the cleanup set.
+
+---
+
 ## 0.1.2
 
 ### Bug Fixes (WAL & B-Tree Stability on Mobile)

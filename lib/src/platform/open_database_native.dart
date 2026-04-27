@@ -5,22 +5,9 @@ import '../storage/storage_strategy.dart';
 import '../storage/io/io_storage_strategy.dart';
 import '../storage/wal_storage_strategy.dart';
 import '../storage/encrypted_storage_strategy.dart';
+import 'isolate_coordinator.dart';
 
 /// Opens (or creates) a named database in [directory].
-///
-/// Uses [IoStorageStrategy] + [WalStorageStrategy] for full durability and
-/// crash recovery. A `.fdb`, `.fdb.wal`, and `.fdb.lock` sidecar are created
-/// inside [directory].
-///
-/// [directory] is optional. When omitted (or empty), defaults to the current
-/// working directory. On web/WASM this parameter is ignored automatically
-/// (see `open_database_web.dart`).
-///
-/// [indexes] registers hash (O(1) equality) secondary indexes on the listed
-/// fields before the database file is opened, so they are populated during
-/// startup from persisted or rebuilt state.
-///
-/// [sortedIndexes] registers sorted (O(log n) range/order) secondary indexes.
 Future<FastDB> openDatabase(
   String name, {
   String directory = '',
@@ -35,22 +22,43 @@ Future<FastDB> openDatabase(
   String? encryptionKey,
   void Function(double)? onProgress,
 }) async {
-  // Guard: if a live instance already exists, reuse it.
-  // Calling disposeInstance() unconditionally was the root cause of
-  // "Bad state: Cannot perform operations on a closed database" errors
-  // when openDatabase / ffastdb.init was called from multiple code paths
-  // during app startup (e.g., from BLoC + repository simultaneously).
   try {
-    return FfastDb.instance; // throws StateError if null or closed
+    return FfastDb.instance;
   } on StateError {
-    // No live instance — fall through to create one.
+    // No live instance in this isolate.
   }
-
-  // Clean up any stale closed instance before opening a new one.
-  await FfastDb.disposeInstance();
 
   final dir = directory.isEmpty ? Directory.current.path : directory;
   final path = p.join(dir, '$name.fdb');
+
+  // Multi-Isolate Support: Check if another Isolate is already managing this DB.
+  final ownerPort = await IsolateCoordinator.findOwnerPort(name, dir);
+  if (ownerPort != null) {
+    // Validate the socket server is actually alive before committing to proxy
+    // mode.  A stale .fdb.port file left by a crashed owner isolate (or a
+    // test that closed the DB without calling coordinator.stop()) would
+    // otherwise cause every subsequent open to get a SocketException.
+    final portAlive = await IsolateCoordinator.isPortAlive(ownerPort);
+    if (portAlive) {
+      // We are a Proxy isolate.
+      StorageStrategy storage = WalStorageStrategy(
+        main: IoStorageStrategy(path),
+        wal: IoStorageStrategy('$path.wal'),
+      );
+      final db = FastDB(storage);
+      // Injected proxy handler: forwards to the Socket server.
+      db.setProxyHandler((type, params) => SocketProxy(ownerPort).call(type, params));
+      await db.open(version: version);
+      return db;
+    } else {
+      // Stale port file — delete it and fall through to normal open.
+      await IsolateCoordinator.deletePortFile(name, dir);
+    }
+  }
+
+  // Normal open as the Owner isolate
+  await FfastDb.disposeInstance();
+
   StorageStrategy storage = WalStorageStrategy(
     main: IoStorageStrategy(path),
     wal: IoStorageStrategy('$path.wal'),
@@ -73,5 +81,9 @@ Future<FastDB> openDatabase(
     onProgress: onProgress,
   );
 
+  // Register this instance as the Owner (start socket server)
+  final coordinator = IsolateCoordinator(name, dir, db);
+  await coordinator.register();
+  
   return db;
 }

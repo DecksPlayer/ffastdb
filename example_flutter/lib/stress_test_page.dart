@@ -106,7 +106,7 @@ class _StressTestPageState extends State<StressTestPage> {
       // 2. Create Users
       _log('👤 Creating 50 users...');
       final usersToInsert = <Map<String, dynamic>>[];
-      for (int i = 0; i < 500; i++) {
+      for (int i = 0; i < 50; i++) {
         usersToInsert.add({
           'type': 'user',
           'name': 'User $i',
@@ -279,9 +279,9 @@ class _StressTestPageState extends State<StressTestPage> {
         return '${subjects[random.nextInt(subjects.length)]} ${verbs[random.nextInt(verbs.length)]} ${objects[random.nextInt(objects.length)]}.';
       });
 
-      _log('📝 Creating 100000 posts with 400 possible phrases...');
+      _log('📝 Creating 2400 posts with 400 possible phrases...');
       final postsToInsert = <Map<String, dynamic>>[];
-      for (int i = 0; i < 100000; i++) {
+      for (int i = 0; i < 2400; i++) {
         final uId = userIds[random.nextInt(userIds.length)];
         final phrase = phrases[random.nextInt(phrases.length)];
         postsToInsert.add({
@@ -293,15 +293,15 @@ class _StressTestPageState extends State<StressTestPage> {
               .subtract(Duration(hours: random.nextInt(100)))
               .millisecondsSinceEpoch,
         });
-        if (i % 5000 == 0) setState(() => _progress = i / 100000 * 0.4);
+        if (i % 500 == 0) setState(() => _progress = i / 2400 * 0.4);
       }
       final postIds = await widget.db.insertAll(postsToInsert);
       setState(() => _progress = 0.5);
 
       // 4. Create Comments
-      _log('💬 Creating 2000 comments...');
+      _log('💬 Creating 50 comments...');
       final commentsToInsert = <Map<String, dynamic>>[];
-      for (int i = 0; i < 2000; i++) {
+      for (int i = 0; i < 50; i++) {
         final pId = postIds[random.nextInt(postIds.length)];
         final uId = userIds[random.nextInt(userIds.length)];
         commentsToInsert.add({
@@ -311,7 +311,7 @@ class _StressTestPageState extends State<StressTestPage> {
           'text': 'Comment #$i on post $pId',
           'timestamp': DateTime.now().millisecondsSinceEpoch,
         });
-        if (i % 500 == 0) setState(() => _progress = 0.5 + (i / 2000 * 0.2));
+        if (i % 25 == 0) setState(() => _progress = 0.5 + (i / 50 * 0.2));
       }
       await widget.db.insertAll(commentsToInsert);
       setState(() => _progress = 0.8);

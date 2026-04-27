@@ -67,6 +67,11 @@ class FastDB {
   /// Used to prevent operations on a closed database, especially important
   /// for the singleton pattern where users might retain references after dispose.
   bool _isClosed = false;
+  
+  /// If not null, this instance is a Proxy forwarding writes to another Isolate.
+  Future<dynamic> Function(String type, Map<String, dynamic> params)? _proxyHandler;
+  bool get isProxy => _proxyHandler != null;
+  void setProxyHandler(Future<dynamic> Function(String type, Map<String, dynamic> params) handler) => _proxyHandler = handler;
 
   /// Whether this database instance is currently open and usable.
   ///
@@ -79,13 +84,12 @@ class FastDB {
   Future<T> _exclusive<T>(Future<T> Function() fn) {
     if (_isClosed) {
       throw StateError(
-        'Bad state: Cannot perform operations on a closed database. '
-        'This can happen if:\n'
-        '  1. close() or disposeInstance() was called before this operation.\n'
-        '  2. A second openDatabase() call replaced the active instance.\n'
-        '  3. An async operation completed after the DB was disposed.\n'
-        'Call ffastdb.init() or openDatabase() again to reopen the database.',
-      );
+        'Bad state: Cannot perform operations on a closed database.');
+    }
+    if (isProxy) {
+      // In proxy mode, we don't need a local lock because the owner isolate 
+      // will serialize the operations in its own event loop.
+      return fn();
     }
     if (_inTransaction) return fn();
     final next = _writeLock.then((_) async {
@@ -102,6 +106,10 @@ class FastDB {
 
   final List<MapEntry<int, int>> _batchEntries = [];
   int _dataOffset = 0;
+
+  Future<dynamic> _proxyCall(String type, Map<String, dynamic> params) async {
+    return await _proxyHandler!(type, params);
+  }
 
   int _schemaVersion = 1;
   double _autoCompactThreshold = 0;
@@ -415,10 +423,16 @@ class FastDB {
   // ─── CRUD Operations ──────────────────────────────────────────────────────
   // Single-document create, read, update, delete operations.
 
-  Future<int> insert(dynamic doc) => _exclusive(() => _crudOps.insertImpl(doc));
+  Future<int> insert(dynamic doc) {
+    if (isProxy) return _proxyCall('insert', {'doc': doc}).then((v) => v as int);
+    return _exclusive(() => _crudOps.insertImpl(doc));
+  }
 
   /// Hive-style put with manual key.
-  Future<void> put(int id, dynamic value) => _exclusive(() => _putImpl(id, value));
+  Future<void> put(int id, dynamic value) {
+    if (isProxy) return _proxyCall('put', {'id': id, 'value': value}).then((_) {});
+    return _exclusive(() => _putImpl(id, value));
+  }
 
   Future<void> _putImpl(int id, dynamic value) => _crudOps.putImpl(id, value);
 
@@ -514,8 +528,10 @@ class FastDB {
   });
 
   /// Updates a single document by ID.
-  Future<bool> update(int id, Map<String, dynamic> fields) =>
-      _exclusive(() => _crudOps.updateImpl(id, fields));
+  Future<bool> update(int id, Map<String, dynamic> fields) {
+    if (isProxy) return _proxyCall('update', {'id': id, 'fields': fields}).then((v) => v as bool);
+    return _exclusive(() => _crudOps.updateImpl(id, fields));
+  }
 
   /// Executes [fn] as an atomic transaction.
   Future<T> transaction<T>(Future<T> Function() fn) {
@@ -858,7 +874,10 @@ class FastDB {
 
   // ─── Delete ────────────────────────────────────────────────────────────────
 
-  Future<bool> delete(int id) => _exclusive(() => _crudOps.deleteImpl(id));
+  Future<bool> delete(int id) {
+    if (isProxy) return _proxyCall('delete', {'id': id}).then((v) => v as bool);
+    return _exclusive(() => _crudOps.deleteImpl(id));
+  }
 
   /// Count of documents deleted or overwritten since last compact().
   /// Used by auto-compact threshold logic. A `Set<int>` was previously used here

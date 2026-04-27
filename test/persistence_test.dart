@@ -8,7 +8,7 @@ void main() {
     
     tearDown(() async {
       await FfastDb.disposeInstance();
-      for (final ext in ['.fdb', '.fidx', '.fdb.wal', '.fdb.lock']) {
+      for (final ext in ['.fdb', '.fidx', '.fdb.wal', '.fdb.lock', '.fdb.port']) {
         final f = File('$dbPath$ext');
         if (f.existsSync()) f.deleteSync();
       }
@@ -16,7 +16,7 @@ void main() {
 
     setUp(() async {
       await FfastDb.disposeInstance();
-      for (final ext in ['.fdb', '.fidx', '.fdb.wal', '.fdb.lock']) {
+      for (final ext in ['.fdb', '.fidx', '.fdb.wal', '.fdb.lock', '.fdb.port']) {
         final f = File('$dbPath$ext');
         if (f.existsSync()) f.deleteSync();
       }
