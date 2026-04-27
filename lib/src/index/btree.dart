@@ -97,21 +97,17 @@ class BTree {
   }
 
   /// Inserts into a node that is guaranteed NOT full.
-  Future<void> _insertNonFull(BTreeNode node, int key, int value) async {
-    if (node.isLeaf) {
-      // Binary search for the insertion position — O(log n) instead of O(n).
-      final pos = _lowerBound(node.keys, key);
-      if (pos < node.keys.length && node.keys[pos] == key) {
-        // Update existing key in-place; no shift needed.
-        node.values[pos] = value;
-      } else {
-        // Insert preserving order; List.insert is native O(n) memmove.
-        node.keys.insert(pos, key);
-        node.values.insert(pos, value);
-      }
-      await _writeNode(node);
-    } else {
-      // Upper bound: first child whose left separator is > key.
+  ///
+  /// Implemented **iteratively** to avoid stack overflows on deep trees or
+  /// when a corrupt WAL leaves circular page-pointer references in the B-Tree.
+  /// A [visited] set catches any page cycle and throws a clear [StateError]
+  /// instead of recursing until the Dart VM crashes.
+  Future<void> _insertNonFull(BTreeNode startNode, int key, int value) async {
+    BTreeNode node = startNode;
+    final visited = <int>{node.pageIndex};
+
+    while (!node.isLeaf) {
+      // Cycle detection — corrupt tree guard.
       int i = _upperBound(node.keys, key);
 
       BTreeNode? child = _readNodeSync(node.values[i]);
@@ -119,16 +115,37 @@ class BTree {
 
       if (child.isFull) {
         await _splitChild(node, i, child);
-        // After split: node gained a new separator key at keys[i].
-        // Decide which of the two new children to descend into.
+        // After split: node gained a new separator at keys[i].
+        // Choose which half to descend into.
         if (i < node.keys.length && key >= node.keys[i]) i++;
-        // key == separator: update the right child's leaf entry (i already correct).
       }
 
       BTreeNode? targetChild = _readNodeSync(node.values[i]);
       targetChild ??= await _readNode(node.values[i]);
-      await _insertNonFull(targetChild, key, value);
+
+      // Cycle detection — stop before infinite descent.
+      if (!visited.add(targetChild.pageIndex)) {
+        throw StateError(
+          'FastDB BTree: circular page reference detected at page '
+          '${targetChild.pageIndex}. The database file may be corrupt. '
+          'Delete the .fdb and .fdb.wal files to start fresh.',
+        );
+      }
+
+      node = targetChild;
     }
+
+    // node is now a leaf — insert here.
+    final pos = _lowerBound(node.keys, key);
+    if (pos < node.keys.length && node.keys[pos] == key) {
+      // Update existing key in-place; no shift needed.
+      node.values[pos] = value;
+    } else {
+      // Insert preserving order; List.insert is native O(n) memmove.
+      node.keys.insert(pos, key);
+      node.values.insert(pos, value);
+    }
+    await _writeNode(node);
   }
 
   /// Bulk-loads the B-Tree from a sorted list of entries (ID -> Offset).
