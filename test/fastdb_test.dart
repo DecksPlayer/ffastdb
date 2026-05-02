@@ -1181,7 +1181,8 @@ void main() {
       final retrieved = await db.findById(fastdbId);
 
       // FastDB's internal ID should be added
-      expect(retrieved['id'], equals(fastdbId));
+      expect(retrieved['ffdbID'], equals(fastdbId));
+      expect(retrieved['id'], isNull);
       expect(retrieved['name'], equals('Charlie'));
     });
 

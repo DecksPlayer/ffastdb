@@ -1,3 +1,8 @@
+## 0.2.7
+
+## Usage Update
+- **CHANGED — Native Internal ID Migrated to `ffdbID`**: The database now stores its internal numeric ID in the `ffdbID` key instead of `id`. This safely fully segregates FastDB IDs from user IDs (like Firebase `id`), eliminating the need for `_originalId` workarounds. Legacy documents with `id` are migrated automatically on read.
+
 ## 0.2.6
 
 ### Reliability and Usage Updates

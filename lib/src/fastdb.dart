@@ -62,18 +62,18 @@ class FastDB {
 
   // Reactive watchers: field → StreamController
   final Map<String, StreamController<List<int>>> _watchers = {};
-  
+
   late final OperationLog _opLog;
 
   bool _batchMode = false;
   bool _inTransaction = false;
   int _nextId = 1;
-  
+
   /// Whether this database instance has been closed.
   /// Used to prevent operations on a closed database, especially important
   /// for the singleton pattern where users might retain references after dispose.
   bool _isClosed = false;
-  
+
   /// Whether this database instance is currently open and usable.
   ///
   /// Returns `false` after [close] has been called. Check this before
@@ -85,13 +85,15 @@ class FastDB {
   Future<T> _exclusive<T>(Future<T> Function() fn) {
     if (_isClosed) {
       throw StateError(
-        'Bad state: Cannot perform operations on a closed database.');
+        'Bad state: Cannot perform operations on a closed database.',
+      );
     }
     if (_inTransaction) return fn();
     final next = _writeLock.then((_) async {
       if (_isClosed) {
         throw StateError(
-            'Bad state: Cannot perform operations on a closed database.');
+          'Bad state: Cannot perform operations on a closed database.',
+        );
       }
       // Synchronize data offset before every exclusive operation to ensure
       // B-Tree page allocations and document writes don't overlap.
@@ -124,7 +126,8 @@ class FastDB {
   IndexManager get indexes => _indexMgr;
 
   /// Internal constructor used by factory constructors and singleton.
-  FastDB._internal(this.storage, {
+  FastDB._internal(
+    this.storage, {
     this.dataStorage,
     int cacheCapacity = 2048,
     double autoCompactThreshold = double.minPositive,
@@ -132,8 +135,8 @@ class FastDB {
     _autoCompactThreshold = autoCompactThreshold;
     _pageManager = PageManager(storage, cacheCapacity: cacheCapacity);
     _primaryIndex = BTree(_pageManager);
-    
-    // Initialize sequential operation log. 
+
+    // Initialize sequential operation log.
     // Ensure the log is in the same directory as the main DB file.
     String? logPath;
     StorageStrategy? current = storage;
@@ -150,7 +153,7 @@ class FastDB {
       }
     }
     _opLog = logPath == null ? OperationLog.disabled() : OperationLog(logPath);
-    
+
     // Initialize helper classes for modularized operations
     _crudOps = _CrudOperations(this);
     _queryOps = _QueryOperations(this);
@@ -158,18 +161,19 @@ class FastDB {
     _indexMgr = IndexManager(this);
     _storageMgr = _StorageManager(this);
   }
-  
+
   /// Creates a FastDB instance directly.
-  /// 
+  ///
   /// **For most applications**, use [FfastDb.init()] with the singleton pattern instead.
-  /// Use this constructor when you need multiple isolated database instances 
+  /// Use this constructor when you need multiple isolated database instances
   /// (e.g., benchmarks, advanced use cases, or non-singleton scenarios).
   ///
   /// Provide [dataStorage] to separate documents from B-Tree pages for max performance.
   /// Set [autoCompactThreshold] (0–1) to trigger automatic compaction whenever the
   /// ratio of deleted documents exceeds that fraction. E.g. `0.3` = compact when
   /// more than 30% of slots are deleted. Disabled by default (0).
-  factory FastDB(StorageStrategy storage, {
+  factory FastDB(
+    StorageStrategy storage, {
     StorageStrategy? dataStorage,
     int cacheCapacity = 2048,
     double autoCompactThreshold = double.minPositive,
@@ -181,11 +185,12 @@ class FastDB {
       autoCompactThreshold: autoCompactThreshold,
     );
   }
-  
+
   /// Constructor for testing purposes - directly creates a FastDB instance.
   /// **WARNING**: In production code, use [FfastDb.init()] instead.
   @visibleForTesting
-  factory FastDB.forTesting(StorageStrategy storage, {
+  factory FastDB.forTesting(
+    StorageStrategy storage, {
     StorageStrategy? dataStorage,
     int cacheCapacity = 2048,
     double autoCompactThreshold = double.minPositive,
@@ -206,11 +211,13 @@ class FastDB {
   static FastDB get instance {
     if (_instance == null) {
       throw StateError(
-          'FfastDb not initialized. Call `await FfastDb.init(storage)` first.');
+        'FfastDb not initialized. Call `await FfastDb.init(storage)` first.',
+      );
     }
     if (_instance!._isClosed) {
       throw StateError(
-          'FfastDb instance has been closed. Call `await FfastDb.init(storage)` again.');
+        'FfastDb instance has been closed. Call `await FfastDb.init(storage)` again.',
+      );
     }
     return _instance!;
   }
@@ -253,8 +260,12 @@ class FastDB {
     for (final field in sortedIndexes) db.addSortedIndex(field);
     for (final field in ftsIndexes) db.addFtsIndex(field);
     for (final fields in compositeIndexes) db.addCompositeIndex(fields);
-    
-    await db.open(version: version, migrations: migrations, onProgress: onProgress);
+
+    await db.open(
+      version: version,
+      migrations: migrations,
+      onProgress: onProgress,
+    );
     _instance = db; // expose singleton only after open() completes
     return db;
   }
@@ -279,7 +290,8 @@ class FastDB {
   // ─── Setup ────────────────────────────────────────────────────────────────
 
   /// Registers a custom type adapter (Hive-style).
-  void registerAdapter<T>(TypeAdapter<T> adapter) => _indexMgr.registerAdapter(adapter);
+  void registerAdapter<T>(TypeAdapter<T> adapter) =>
+      _indexMgr.registerAdapter(adapter);
 
   /// Creates an O(1) hash-based secondary index on [fieldName].
   void addIndex(String fieldName) => _indexMgr.addIndex(fieldName);
@@ -338,7 +350,7 @@ class FastDB {
     // Clear the global query cache when opening a new database.
     // This prevents query results from one database/test from contaminating another.
     QueryBuilder.clearCache();
-    
+
     _schemaVersion = version;
     await storage.open();
     await _opLog.open();
@@ -350,7 +362,10 @@ class FastDB {
 
     if (size < PageManager.pageSize) {
       final header = Uint8List(PageManager.pageSize);
-      header[0] = 70; header[1] = 68; header[2] = 66; header[3] = 50; // "FDB2"
+      header[0] = 70;
+      header[1] = 68;
+      header[2] = 66;
+      header[3] = 50; // "FDB2"
       _nextId = 1;
       _writeInt32(header, 12, _schemaVersion);
       await storage.write(0, header);
@@ -360,9 +375,10 @@ class FastDB {
       final header = await storage.read(0, 25);
       if (header.length >= 4 && header[3] == 49) {
         throw StateError(
-            'FastDB: Database format v1 (FDB1, no checksums) is not compatible '
-            'with the current version (FDB2, CRC32 per document). '
-            'Delete the database files to create a new database.');
+          'FastDB: Database format v1 (FDB1, no checksums) is not compatible '
+          'with the current version (FDB2, CRC32 per document). '
+          'Delete the database files to create a new database.',
+        );
       }
       _nextId = _readInt32(header, 8);
       _primaryIndex.rootPage = _readInt32(header, 4);
@@ -375,7 +391,9 @@ class FastDB {
       final isClean = header.length >= 25 && header[24] == 0x43;
       if (isClean) {
         final loadedKeys = await _loadIndexes();
-        final missingKeys = _secondaryIndexes.keys.where((k) => !loadedKeys.contains(k)).toList();
+        final missingKeys = _secondaryIndexes.keys
+            .where((k) => !loadedKeys.contains(k))
+            .toList();
         if (missingKeys.isNotEmpty) {
           // Some newly registered indexes weren't in the payload, rebuild them!
           await _indexMgr.rebuildSecondaryIndexes(onProgress: onProgress);
@@ -440,13 +458,13 @@ class FastDB {
   /// Closes the database and releases all resources.
   Future<void> close() async {
     if (_isClosed) return; // Already closed
-    
+
     // Use the exclusive lock to ensure all pending writes are finished before closing.
     // We cannot use _exclusive() helper because it checks _isClosed.
     final next = _writeLock.then((_) async {
       if (_isClosed) return;
       _isClosed = true;
-      
+
       await _saveIndexes();
       if (storage.needsExplicitFlush) {
         await storage.write(24, Uint8List(1)..[0] = 0x43);
@@ -496,7 +514,8 @@ class FastDB {
   // ─── Batch & Transaction Operations ────────────────────────────────────────
   // Bulk inserts, batch modes, and atomic transactions.
 
-  Future<List<int>> insertAll(List<dynamic> docs) => _exclusive(() => _batchOps.insertAllImpl(docs));
+  Future<List<int>> insertAll(List<dynamic> docs) =>
+      _exclusive(() => _batchOps.insertAllImpl(docs));
 
   Future<void> beginBatch() async {
     _batchMode = true;
@@ -540,22 +559,24 @@ class FastDB {
     FutureOr<List<int>> Function(QueryBuilder q) queryFn,
     Map<String, dynamic> fields,
   ) => _exclusive(() async {
-    final ids = await queryFn(QueryBuilder(_secondaryIndexes, findById, rangeSearch));
+    final ids = await queryFn(
+      QueryBuilder(_secondaryIndexes, findById, rangeSearch),
+    );
     if (ids.isEmpty) return 0;
-    
+
     // Batch mode for massive updates
     final wasInBatch = _batchMode;
     if (!wasInBatch) {
       await beginBatch();
     }
-    
+
     int updated = 0;
     try {
       int count = 0;
       for (final id in ids) {
         if (await _crudOps.updateImpl(id, fields)) updated++;
         count++;
-        
+
         // On web, flush periodically to prevent IndexedDB chunk accumulation and memory overflow
         if (_runningOnWeb && count % 500 == 0) {
           final targetStorage = dataStorage ?? storage;
@@ -599,9 +620,9 @@ class FastDB {
       final savedNextId = _nextId;
       final savedRoot = _primaryIndex.rootPage;
       final wal = _wal;
-      
+
       if (wal != null) await wal.beginTransaction();
-      
+
       try {
         await beginBatch();
         final result = await fn();
@@ -636,17 +657,21 @@ class FastDB {
   }
 
   /// Find all documents matching a query.
-  Future<List<dynamic>> find(FutureOr<List<int>> Function(QueryBuilder q) queryFn) =>
-      _exclusive(() => _queryOps.findImpl(queryFn));
+  Future<List<dynamic>> find(
+    FutureOr<List<int>> Function(QueryBuilder q) queryFn,
+  ) => _exclusive(() => _queryOps.findImpl(queryFn));
 
   /// Returns a fluent [QueryBuilder] for chaining conditions.
   ///
   /// The returned builder has access to [QueryBuilder.find] and
   /// [QueryBuilder.findFirst] which resolve full documents without
   /// requiring a manual `findById` loop.
-  QueryBuilder query() => QueryBuilder(_secondaryIndexes, _findById, _rangeSearch);
+  QueryBuilder query() =>
+      QueryBuilder(_secondaryIndexes, _findById, _rangeSearch);
 
-  Future<List<dynamic>> findWhere(Future<List<int>> Function(QueryBuilder q) fn) => find(fn);
+  Future<List<dynamic>> findWhere(
+    Future<List<int>> Function(QueryBuilder q) fn,
+  ) => find(fn);
 
   /// Returns all documents in the database.
   Future<List<dynamic>> getAll() => _exclusive(() => _queryOps.getAllImpl());
@@ -661,19 +686,26 @@ class FastDB {
   Future<List<int>> rangeSearch(int low, int high) =>
       _exclusive(() => _rangeSearch(low, high));
 
-  Future<List<int>> _rangeSearch(int low, int high) => _primaryIndex.rangeSearch(low, high);
+  Future<List<int>> _rangeSearch(int low, int high) =>
+      _primaryIndex.rangeSearch(low, high);
 
   // ─── Aggregations ─────────────────────────────────────────────────────────
 
-  Future<int> countWhere(FutureOr<List<int>> Function(QueryBuilder q) queryFn) =>
-      _exclusive(() async =>
-          (await queryFn(QueryBuilder(_secondaryIndexes, _findById, _rangeSearch))).length);
+  Future<int> countWhere(
+    FutureOr<List<int>> Function(QueryBuilder q) queryFn,
+  ) => _exclusive(
+    () async => (await queryFn(
+      QueryBuilder(_secondaryIndexes, _findById, _rangeSearch),
+    )).length,
+  );
 
   Future<num> sumWhere(
     FutureOr<List<int>> Function(QueryBuilder q) queryFn,
     String field,
   ) => _exclusive(() async {
-    final ids = await queryFn(QueryBuilder(_secondaryIndexes, _findById, _rangeSearch));
+    final ids = await queryFn(
+      QueryBuilder(_secondaryIndexes, _findById, _rangeSearch),
+    );
     num total = 0;
     for (final id in ids) {
       final doc = await _findById(id);
@@ -689,7 +721,9 @@ class FastDB {
     FutureOr<List<int>> Function(QueryBuilder q) queryFn,
     String field,
   ) => _exclusive(() async {
-    final ids = await queryFn(QueryBuilder(_secondaryIndexes, _findById, _rangeSearch));
+    final ids = await queryFn(
+      QueryBuilder(_secondaryIndexes, _findById, _rangeSearch),
+    );
     if (ids.isEmpty) return null;
     num total = 0;
     int count = 0;
@@ -697,7 +731,10 @@ class FastDB {
       final doc = await _findById(id);
       if (doc is Map<String, dynamic>) {
         final v = doc[field];
-        if (v is num) { total += v; count++; }
+        if (v is num) {
+          total += v;
+          count++;
+        }
       }
     }
     return count == 0 ? null : total / count;
@@ -707,13 +744,16 @@ class FastDB {
     FutureOr<List<int>> Function(QueryBuilder q) queryFn,
     String field,
   ) => _exclusive(() async {
-    final ids = await queryFn(QueryBuilder(_secondaryIndexes, _findById, _rangeSearch));
+    final ids = await queryFn(
+      QueryBuilder(_secondaryIndexes, _findById, _rangeSearch),
+    );
     dynamic min;
     for (final id in ids) {
       final doc = await _findById(id);
       if (doc is Map<String, dynamic>) {
         final v = doc[field];
-        if (v != null && (min == null || (v as Comparable).compareTo(min) < 0)) min = v;
+        if (v != null && (min == null || (v as Comparable).compareTo(min) < 0))
+          min = v;
       }
     }
     return min;
@@ -723,22 +763,30 @@ class FastDB {
     FutureOr<List<int>> Function(QueryBuilder q) queryFn,
     String field,
   ) => _exclusive(() async {
-    final ids = await queryFn(QueryBuilder(_secondaryIndexes, _findById, _rangeSearch));
+    final ids = await queryFn(
+      QueryBuilder(_secondaryIndexes, _findById, _rangeSearch),
+    );
     dynamic max;
     for (final id in ids) {
       final doc = await _findById(id);
       if (doc is Map<String, dynamic>) {
         final v = doc[field];
-        if (v != null && (max == null || (v as Comparable).compareTo(max) > 0)) max = v;
+        if (v != null && (max == null || (v as Comparable).compareTo(max) > 0))
+          max = v;
       }
     }
     return max;
   });
 
   /// Lazy stream of documents matching [queryFn] — yields one at a time.
-  Stream<dynamic> findStream(FutureOr<List<int>> Function(QueryBuilder q) queryFn) async* {
-    if (_isClosed) throw StateError('Cannot perform operations on a closed database.');
-    final ids = await queryFn(QueryBuilder(_secondaryIndexes, _findById, _rangeSearch));
+  Stream<dynamic> findStream(
+    FutureOr<List<int>> Function(QueryBuilder q) queryFn,
+  ) async* {
+    if (_isClosed)
+      throw StateError('Cannot perform operations on a closed database.');
+    final ids = await queryFn(
+      QueryBuilder(_secondaryIndexes, _findById, _rangeSearch),
+    );
     for (final id in ids) {
       final doc = await _findById(id);
       if (doc != null) yield doc;
@@ -798,7 +846,7 @@ class FastDB {
   // ─── Internal Helpers ─────────────────────────────────────────────────────
 
   // Indexing & Document Management
-  
+
   void _indexDocument(int id, Map<String, dynamic> doc) =>
       _indexMgr.indexDocument(id, doc);
 
@@ -818,8 +866,9 @@ class FastDB {
     if (length <= 0) return null;
     if (length > 10 * 1024 * 1024) {
       throw StateError(
-          'FastDB: Document at offset $offset has length $length bytes '
-          '(exceeds 10 MB). This likely indicates file corruption.');
+        'FastDB: Document at offset $offset has length $length bytes '
+        '(exceeds 10 MB). This likely indicates file corruption.',
+      );
     }
     // BUG FIX: read 4 extra bytes for the trailing CRC32 checksum.
     final int totalSize = 4 + length + 4;
@@ -835,57 +884,59 @@ class FastDB {
       if (storedCrc != _crc32(fullData.sublist(4, 4 + length))) return null;
     }
     final body = fullData.sublist(4, 4 + length);
-    
+
+    // Migration helper for backwards compatibility
+    void migrateLegacyDoc(Map<dynamic, dynamic> doc) {
+      if (!doc.containsKey('ffdbID') && doc.containsKey('id')) {
+        doc['ffdbID'] = doc['id'];
+        if (doc.containsKey('_originalId')) {
+          doc['id'] = doc.remove('_originalId');
+        } else {
+          doc.remove('id');
+        }
+      }
+    }
+
     // 1. New format: magic prefix [0x00, 0x01]
     if (body.length >= 2 && body[0] == 0x00 && body[1] == 0x01) {
       final doc = FastSerializer.deserialize(body);
-      if (doc.containsKey('_originalId')) {
-        doc['id'] = doc.remove('_originalId');
-      }
+      if (doc is Map) migrateLegacyDoc(doc);
       return doc;
     }
-    
+
     // 2. Legacy format: starts with '{' (123) or '[' (91)
     if (body.isNotEmpty && (body[0] == 123 || body[0] == 91)) {
       try {
         final jsonStr = utf8.decode(body);
         final raw = jsonDecode(jsonStr) as Map<String, dynamic>;
         final doc = FastSerializer.revive(raw) as Map<String, dynamic>;
-        if (doc.containsKey('_originalId')) {
-          doc['id'] = doc.remove('_originalId');
-        }
+        migrateLegacyDoc(doc);
         return doc;
       } catch (_) {}
     }
     final reader = FastBinaryReader(body);
     final doc = _registry.read(reader);
     // Restore original 'id' field if it was preserved (e.g., from Firebase)
-    if (doc is Map && doc.containsKey('_originalId')) {
-      doc['id'] = doc.remove('_originalId');
-    }
+    if (doc is Map) migrateLegacyDoc(doc);
     return doc;
   }
 
   // Serialization & Encoding
-  
+
   Uint8List _serialize(dynamic doc, {int? id}) {
     final Uint8List payload;
     if (doc is Map) {
       final docMap = Map<String, dynamic>.from(doc);
       Map<String, dynamic> map;
-      
+
       // OPTIMIZATION: Avoid Map.from() copy if we don't need to modify
-      if (id != null && docMap['id'] != id) {
+      if (id != null && docMap['ffdbID'] != id) {
         map = Map<String, dynamic>.from(docMap);
-        // Preserve original 'id' field (e.g., from Firebase) before overwriting
-        if (docMap.containsKey('id')) {
-          map['_originalId'] = docMap['id'];
-        }
-        map['id'] = id;
+        map['ffdbID'] = id;
       } else {
         map = docMap;
       }
-      
+
       payload = FastSerializer.serialize(map);
     } else if (_registry.getTypeId(doc.runtimeType) != null) {
       // Registered TypeAdapter path — fast binary format.
@@ -899,17 +950,17 @@ class FastDB {
         final json = (doc as dynamic).toJson();
         map = Map<String, dynamic>.from(json as Map);
       } catch (_) {
-        map = {'value': doc.toString(), 'runtimeType': doc.runtimeType.toString()};
+        map = {
+          'value': doc.toString(),
+          'runtimeType': doc.runtimeType.toString(),
+        };
       }
       if (id != null) {
-        if (map.containsKey('id') && map['id'] != id) {
-          map['_originalId'] = map['id'];
-        }
-        map['id'] = id;
+        map['ffdbID'] = id;
       }
       payload = FastSerializer.serialize(map);
     }
-    
+
     final result = Uint8List(4 + payload.length + 4);
     _writeInt32(result, 0, payload.length);
     result.setRange(4, 4 + payload.length, payload);
@@ -919,7 +970,7 @@ class FastDB {
   }
 
   // Storage Management (Headers, Indexes, Persistence)
-  
+
   Future<void> _saveHeader() => _storageMgr.saveHeader();
 
   // ─── Index Persistence ─────────────────────────────────────────────────────
@@ -940,41 +991,44 @@ class FastDB {
   int _deletedCount = 0;
 
   /// Deletes all documents matching [queryFn] in a single atomic transaction.
-  Future<int> deleteWhere(FutureOr<List<int>> Function(QueryBuilder q) queryFn) =>
-      _exclusive(() async {
-        final ids = List<int>.from(await queryFn(QueryBuilder(_secondaryIndexes, _findById, _rangeSearch)));
-        if (ids.isEmpty) return 0;
-        final wal = _wal;
-        _inTransaction = true;
-        _batchMode = true; // Use batch mode to avoid redundant disk writes per item
-        if (wal != null) await wal.beginTransaction();
-        try {
-          int count = 0;
-          for (int i = 0; i < ids.length; i++) {
-            if (await _crudOps.deleteImpl(ids[i])) count++;
-            if (_runningOnWeb && count % 500 == 0) {
-              await storage.flush();
-              await Future.delayed(Duration.zero);
-            }
-          }
-          if (wal != null) await wal.commit();
-          _batchMode = false;
-          await _pageManager.flushDirty();
+  Future<int> deleteWhere(
+    FutureOr<List<int>> Function(QueryBuilder q) queryFn,
+  ) => _exclusive(() async {
+    final ids = List<int>.from(
+      await queryFn(QueryBuilder(_secondaryIndexes, _findById, _rangeSearch)),
+    );
+    if (ids.isEmpty) return 0;
+    final wal = _wal;
+    _inTransaction = true;
+    _batchMode = true; // Use batch mode to avoid redundant disk writes per item
+    if (wal != null) await wal.beginTransaction();
+    try {
+      int count = 0;
+      for (int i = 0; i < ids.length; i++) {
+        if (await _crudOps.deleteImpl(ids[i])) count++;
+        if (_runningOnWeb && count % 500 == 0) {
           await storage.flush();
-          await _saveHeader();
-          QueryBuilder.clearCache();
-          if (_autoCompactThreshold > 0) {
-            await _maybeAutoCompact();
-          }
-          return count;
-        } catch (e) {
-          _batchMode = false;
-          if (wal != null) await wal.rollback();
-          rethrow;
-        } finally {
-          _inTransaction = false;
+          await Future.delayed(Duration.zero);
         }
-      });
+      }
+      if (wal != null) await wal.commit();
+      _batchMode = false;
+      await _pageManager.flushDirty();
+      await storage.flush();
+      await _saveHeader();
+      QueryBuilder.clearCache();
+      if (_autoCompactThreshold > 0) {
+        await _maybeAutoCompact();
+      }
+      return count;
+    } catch (e) {
+      _batchMode = false;
+      if (wal != null) await wal.rollback();
+      rethrow;
+    } finally {
+      _inTransaction = false;
+    }
+  });
 
   Future<void> _maybeAutoCompact() => _storageMgr.maybeAutoCompact();
 
@@ -985,14 +1039,18 @@ class FastDB {
   // ─── Migrations ────────────────────────────────────────────────────────────
 
   Future<void> _runMigrations(
-      int currentVersion, int targetVersion, Map<int, dynamic Function(dynamic)>? migrations) =>
-      _storageMgr.runMigrations(currentVersion, targetVersion, migrations);
+    int currentVersion,
+    int targetVersion,
+    Map<int, dynamic Function(dynamic)>? migrations,
+  ) => _storageMgr.runMigrations(currentVersion, targetVersion, migrations);
 
   // ─── Header Utils ──────────────────────────────────────────────────────────
 
   int _readInt32(Uint8List b, int off) =>
-      (b[off] & 0xFF) | ((b[off + 1] & 0xFF) << 8) |
-      ((b[off + 2] & 0xFF) << 16) | ((b[off + 3] & 0xFF) << 24);
+      (b[off] & 0xFF) |
+      ((b[off + 1] & 0xFF) << 8) |
+      ((b[off + 2] & 0xFF) << 16) |
+      ((b[off + 3] & 0xFF) << 24);
 
   void _writeInt32(Uint8List b, int off, int v) {
     b[off] = v & 0xFF;
