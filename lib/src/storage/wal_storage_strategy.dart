@@ -44,6 +44,9 @@ class WalStorageStrategy implements StorageStrategy {
   })  : _main = main,
         _wal = wal;
 
+  /// Returns the underlying main storage strategy.
+  StorageStrategy get main => _main;
+
   // ─── Open / Recover ──────────────────────────────────────────────────────
 
   @override

@@ -33,16 +33,10 @@ class IoStorageStrategy implements StorageStrategy {
     // open, so we must read the length first via a stat() call, not via the
     // RandomAccessFile handle.
     final preOpenSize = await dbFile.length();
-    // On Android and iOS, FileMode.append causes corruption because setPosition()
-    // is ignored for writes — all writes are forced to EOF regardless of position.
-    // On Windows, FileMode.write truncates the file (CreateAlways), losing all data.
-    // Solution: use FileMode.append on non-mobile platforms (no truncation, random
-    // writes work via setPosition), and FileMode.write on mobile (no O_APPEND flag,
-    // random writes work, and O_CREAT without O_TRUNC doesn't truncate on POSIX).
-    final mode = (Platform.isAndroid || Platform.isIOS)
-        ? FileMode.write
-        : FileMode.append;
-    _file = await dbFile.open(mode: mode);
+    // Open in append mode to avoid truncation, but then use setPosition() 
+    // for random access. FileMode.write truncates existing files.
+    _file = await dbFile.open(mode: FileMode.append);
+    await _file!.setPosition(0);
     _cachedSize = preOpenSize;
 
     // Acquire an exclusive file lock (blocks other processes)

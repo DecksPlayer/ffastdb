@@ -23,6 +23,9 @@ class EncryptedStorageStrategy implements StorageStrategy {
   EncryptedStorageStrategy(this._base, String encryptionKey)
       : _key = encryptionKey.codeUnits;
 
+  /// Returns the underlying base storage strategy.
+  StorageStrategy get storage => _base;
+
   void _cipher(Uint8List data, int offset) {
     if (_key.isEmpty) return;
     for (int i = 0; i < data.length; i++) {

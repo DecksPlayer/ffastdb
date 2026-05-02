@@ -6,15 +6,19 @@ class _CrudOperations {
 
   _CrudOperations(this._db);
 
-  /// Encapsulates the logic for insert() without assigning ID upfront.
-  /// Called by FastDB.insert() after acquiring the exclusive lock.
   Future<int> insertImpl(dynamic doc) async {
     final wal = _db._wal;
     final hasWal = !_db._inTransaction && !_db._batchMode && wal != null;
+    final id = _db._nextId++;
+    
+    // Log operation before starting
+    if (!_db._inTransaction && !_db._batchMode) {
+      await _db._opLog.log('insert', id: id, data: doc);
+    }
+
     if (hasWal) await wal.beginTransaction();
     
     try {
-      final id = _db._nextId++;
       final data = _db._serialize(doc, id: id);
       final targetStorage = _db.dataStorage ?? _db.storage;
       final offset = _db._dataOffset;
@@ -42,6 +46,7 @@ class _CrudOperations {
         _db._notifyWatchers(doc);
       }
       if (hasWal) await wal.commit();
+      if (!_db._inTransaction && !_db._batchMode) await _db._opLog.clear();
       return id;
     } catch (e) {
       if (hasWal) await wal.rollback();
@@ -53,6 +58,11 @@ class _CrudOperations {
   Future<void> putImpl(int id, dynamic value) async {
     final oldOffset = await _db._primaryIndex.search(id);
     
+    // Log operation before starting
+    if (!_db._inTransaction && !_db._batchMode) {
+      await _db._opLog.log('put', id: id, data: value);
+    }
+
     final wal = _db._wal;
     final hasWal = !_db._inTransaction && !_db._batchMode && wal != null;
     if (hasWal) await wal.beginTransaction();
@@ -88,6 +98,7 @@ class _CrudOperations {
       QueryBuilder.clearCache();
       _db._notifyWatchers(value);
       if (hasWal) await wal.commit();
+      if (!_db._inTransaction && !_db._batchMode) await _db._opLog.clear();
     } catch (e) {
       if (hasWal) await wal.rollback();
       rethrow;
@@ -105,6 +116,11 @@ class _CrudOperations {
     }
     final oldOffset = await _db._primaryIndex.search(id);
     final merged = Map<String, dynamic>.from(existing as Map<String, dynamic>)..addAll(fields);
+
+    // Log operation before starting
+    if (!_db._inTransaction && !_db._batchMode) {
+      await _db._opLog.log('update', id: id, data: fields);
+    }
 
     final wal = _db._wal;
     final hasWal = !_db._inTransaction && !_db._batchMode && wal != null;
@@ -134,6 +150,7 @@ class _CrudOperations {
         _db._notifyWatchers(merged);
       }
       if (hasWal) await wal.commit();
+      if (!_db._inTransaction && !_db._batchMode) await _db._opLog.clear();
       return true;
     } catch (e) {
       if (hasWal) await wal.rollback();
@@ -147,6 +164,11 @@ class _CrudOperations {
     if (offset == null) return false;
     if (_db.dataStorage == null && offset < PageManager.pageSize) return false;
     final doc = await _db._readAt(offset);
+    // Log operation before starting
+    if (!_db._inTransaction && !_db._batchMode) {
+      await _db._opLog.log('delete', id: id);
+    }
+
     final wal = _db._wal;
     final hasWal = !_db._inTransaction && !_db._batchMode && wal != null;
     if (hasWal) await wal.beginTransaction();
@@ -166,6 +188,7 @@ class _CrudOperations {
         QueryBuilder.clearCache();
       }
       if (hasWal) await wal.commit();
+      if (!_db._inTransaction && !_db._batchMode) await _db._opLog.clear();
       if (_db._autoCompactThreshold > 0 && !_db._inTransaction && !_db._batchMode) {
         await _db._maybeAutoCompact();
       }

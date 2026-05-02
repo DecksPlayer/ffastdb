@@ -10,6 +10,7 @@ const int _typeList = 4;
 const int _typeMap = 5;
 const int _typeDouble = 6;
 const int _typeDateTime = 7;
+const int _typeByteList = 8;
 
 class FastBinaryWriter implements BinaryWriter {
   final BytesBuilder _builder = BytesBuilder();
@@ -96,9 +97,8 @@ class FastBinaryWriter implements BinaryWriter {
       bd.setInt32(4, hi, Endian.little);
       _builder.add(bd.buffer.asUint8List());
     } else if (value is Uint8List) {
-      writeUint8(_typeString);
-      // Encode as Base64 string so it round-trips cleanly
-      writeString('\u0000bl:${base64Encode(value)}');
+      writeUint8(_typeByteList);
+      writeByteList(value);
     } else {
       // Try Firebase duck-typing before giving up.
       // 1) Timestamp → DateTime
@@ -235,6 +235,8 @@ class FastBinaryReader implements BinaryReader {
         final dtHi = bdDt.getInt32(4, Endian.little);
         return DateTime.fromMillisecondsSinceEpoch(
             dtHi * 0x100000000 + dtLoUnsigned);
+      case _typeByteList:
+        return readByteList();
       default:
         throw UnsupportedError('Unsupported type ID: $type');
     }

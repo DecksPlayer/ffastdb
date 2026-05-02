@@ -1,3 +1,21 @@
+## 0.2.6
+
+### Reliability and Usage Updates
+
+- **NEW — Sequential operation log for write recovery**: Added a `.log` sidecar file that records `insert`, `put`, `update`, and `delete` operations before applying them to the main database. Pending operations are replayed automatically on startup after an interrupted write.
+- **IMPROVED — Native `Uint8List` storage**: Binary payloads are now stored as raw bytes in the main database format instead of being encoded as Base64 strings, reducing storage overhead and improving large-binary performance.
+- **CHANGED — Single-owner native access model**: Removed the transparent multi-isolate socket proxy path. On native platforms, a database file is now documented and treated as having one active owner at a time.
+- **FIX — Safer close/write synchronization**: Close now waits behind the write lock so shutdown cannot race with pending exclusive writes.
+- **FIX — Safer storage opening semantics**: Native file opening now avoids truncation while still resetting the cursor for random-access writes.
+
+## 0.2.5
+
+### Bug Fixes (B-Tree Corruption & Recovery)
+
+- **FIX — Added cycle detection to B-Tree traversal**: B-Tree traversal functions (`searchSync`, `search`, `_countLeafEntries`, `_extractLeafEntries`) now detect circular page references (cycles). If a cycle is detected, the function immediately returns `null` or throws a `StateError` with a helpful message, preventing infinite loops and StackOverflow errors caused by corrupt index pages.
+- **FIX — Improved WAL recovery error messages**: Enhanced `_recover()` to provide more context when encountering corrupted or truncated WAL entries. Errors now include the offset, size, and type of the problematic entry, aiding in diagnosis.
+- **MODERATE — Updated B-Tree rebuilding logic**: Refined `_rebuild()` to use iterative traversals instead of recursive ones for counting and extracting leaf entries. This prevents StackOverflow errors on very deep index trees.
+
 ## 0.2.4
 
 ### Bug Fixes (WAL Corruption & Multi-Isolate Stability)

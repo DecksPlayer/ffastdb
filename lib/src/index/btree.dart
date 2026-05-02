@@ -24,6 +24,7 @@ class BTree {
   int? searchSync(int key) {
     if (rootPage == null || rootPage == 0) return null;
     int pageIdx = rootPage!;
+    final visited = <int>{pageIdx};
     while (true) {
       final node = _nodeCache[pageIdx];
       if (node == null) return null; // cache miss — caller falls back to async
@@ -36,6 +37,7 @@ class BTree {
       } else {
         pageIdx = node.values[i];
       }
+      if (pageIdx == 0 || !visited.add(pageIdx)) return null;
     }
   }
   /// Returns the value (offset) for [key], or null if not found.
@@ -43,6 +45,7 @@ class BTree {
   Future<int?> search(int key) async {
     if (rootPage == null || rootPage == 0) return null;
     int pageIdx = rootPage!;
+    final visited = <int>{pageIdx};
     while (true) {
       BTreeNode? node = _readNodeSync(pageIdx);
       node ??= await _readNode(pageIdx); // async only on cold-cache miss
@@ -55,6 +58,10 @@ class BTree {
       } else {
         pageIdx = node.values[i]; // follow left child
       }
+      if (pageIdx == 0 || !visited.add(pageIdx)) {
+        // Corrupt tree: child points to page 0 or forms a cycle.
+        return null; 
+      }
     }
   }
 
@@ -62,7 +69,7 @@ class BTree {
 
   /// Inserts [key] → [value]. Automatically splits nodes when full.
   Future<void> insert(int key, int value) async {
-    if (rootPage == null) {
+    if (rootPage == null || rootPage == 0) {
       // First insert: create the root leaf node.
       final page = await pageManager.allocatePage();
       final root = BTreeNode(
@@ -120,8 +127,16 @@ class BTree {
         if (i < node.keys.length && key >= node.keys[i]) i++;
       }
 
-      BTreeNode? targetChild = _readNodeSync(node.values[i]);
-      targetChild ??= await _readNode(node.values[i]);
+      int childPage = node.values[i];
+      if (childPage == 0) {
+        throw StateError(
+          'FastDB BTree: circular page reference detected at page 0. '
+          'The database file may be corrupt. Delete the .fdb and .fdb.wal files to start fresh.',
+        );
+      }
+
+      BTreeNode? targetChild = _readNodeSync(childPage);
+      targetChild ??= await _readNode(childPage);
 
       // Cycle detection — stop before infinite descent.
       if (!visited.add(targetChild.pageIndex)) {
@@ -211,21 +226,27 @@ class BTree {
 
   /// Counts the total number of entries (key-value pairs) in all leaf nodes.
   /// Used to decide whether to extract+merge or use individual inserts.
-  Future<int> _countLeafEntries(int pageIdx) async {
+  Future<int> _countLeafEntries(int pageIdx, [Set<int>? visited]) async {
+    visited ??= {};
+    if (!visited.add(pageIdx)) return 0;
+    
     final node = await _readNode(pageIdx);
     if (node.isLeaf) {
       return node.keys.length;
     }
     int total = 0;
     for (final childPage in node.values) {
-      if (childPage > 0) total += await _countLeafEntries(childPage);
+      if (childPage > 0) total += await _countLeafEntries(childPage, visited);
     }
     return total;
   }
 
   /// Recursively visits all leaf nodes and collects their (key, value) entries
   /// in ascending key order.
-  Future<void> _extractLeafEntries(int pageIdx, List<MapEntry<int, int>> out) async {
+  Future<void> _extractLeafEntries(int pageIdx, List<MapEntry<int, int>> out, [Set<int>? visited]) async {
+    visited ??= {};
+    if (!visited.add(pageIdx)) return;
+    
     final node = await _readNode(pageIdx);
     if (node.isLeaf) {
       for (int i = 0; i < node.keys.length; i++) {
@@ -233,7 +254,7 @@ class BTree {
       }
     } else {
       for (final childPage in node.values) {
-        if (childPage > 0) await _extractLeafEntries(childPage, out);
+        if (childPage > 0) await _extractLeafEntries(childPage, out, visited);
       }
     }
   }

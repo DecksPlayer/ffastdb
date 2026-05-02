@@ -6,6 +6,7 @@ import 'package:meta/meta.dart';
 import 'storage/storage_strategy.dart';
 import 'storage/page_manager.dart';
 import 'storage/wal_storage_strategy.dart';
+import 'storage/encrypted_storage_strategy.dart';
 import 'index/btree.dart';
 import 'index/hash_index.dart';
 import 'index/sorted_index.dart';
@@ -18,6 +19,9 @@ import 'serialization/type_adapter.dart';
 import 'serialization/type_registry.dart';
 import 'index/secondary_index.dart';
 import 'serialization/binary_io.dart';
+import 'storage/operation_log.dart'
+    if (dart.library.js_interop) 'storage/operation_log_web.dart';
+import 'storage/io/io_storage_strategy.dart';
 
 part '_crud_operations.dart';
 part '_query_operations.dart';
@@ -58,6 +62,8 @@ class FastDB {
 
   // Reactive watchers: field → StreamController
   final Map<String, StreamController<List<int>>> _watchers = {};
+  
+  late final OperationLog _opLog;
 
   bool _batchMode = false;
   bool _inTransaction = false;
@@ -68,11 +74,6 @@ class FastDB {
   /// for the singleton pattern where users might retain references after dispose.
   bool _isClosed = false;
   
-  /// If not null, this instance is a Proxy forwarding writes to another Isolate.
-  Future<dynamic> Function(String type, Map<String, dynamic> params)? _proxyHandler;
-  bool get isProxy => _proxyHandler != null;
-  void setProxyHandler(Future<dynamic> Function(String type, Map<String, dynamic> params) handler) => _proxyHandler = handler;
-
   /// Whether this database instance is currently open and usable.
   ///
   /// Returns `false` after [close] has been called. Check this before
@@ -86,13 +87,12 @@ class FastDB {
       throw StateError(
         'Bad state: Cannot perform operations on a closed database.');
     }
-    if (isProxy) {
-      // In proxy mode, we don't need a local lock because the owner isolate 
-      // will serialize the operations in its own event loop.
-      return fn();
-    }
     if (_inTransaction) return fn();
     final next = _writeLock.then((_) async {
+      if (_isClosed) {
+        throw StateError(
+            'Bad state: Cannot perform operations on a closed database.');
+      }
       // Synchronize data offset before every exclusive operation to ensure
       // B-Tree page allocations and document writes don't overlap.
       if (dataStorage == null) {
@@ -106,10 +106,6 @@ class FastDB {
 
   final List<MapEntry<int, int>> _batchEntries = [];
   int _dataOffset = 0;
-
-  Future<dynamic> _proxyCall(String type, Map<String, dynamic> params) async {
-    return await _proxyHandler!(type, params);
-  }
 
   int _schemaVersion = 1;
   double _autoCompactThreshold = 0;
@@ -136,6 +132,24 @@ class FastDB {
     _autoCompactThreshold = autoCompactThreshold;
     _pageManager = PageManager(storage, cacheCapacity: cacheCapacity);
     _primaryIndex = BTree(_pageManager);
+    
+    // Initialize sequential operation log. 
+    // Ensure the log is in the same directory as the main DB file.
+    String? logPath;
+    StorageStrategy? current = storage;
+    while (current != null) {
+      if (current is IoStorageStrategy) {
+        logPath = '${current.path}.log';
+        break;
+      } else if (current is WalStorageStrategy) {
+        current = current.main;
+      } else if (current is EncryptedStorageStrategy) {
+        current = current.storage;
+      } else {
+        break;
+      }
+    }
+    _opLog = logPath == null ? OperationLog.disabled() : OperationLog(logPath);
     
     // Initialize helper classes for modularized operations
     _crudOps = _CrudOperations(this);
@@ -327,6 +341,7 @@ class FastDB {
     
     _schemaVersion = version;
     await storage.open();
+    await _opLog.open();
 
     if (!storage.needsExplicitFlush) _pageManager.writeBehind = true;
 
@@ -385,32 +400,76 @@ class FastDB {
       await _runMigrations(currentVersion, _schemaVersion, migrations);
       await _saveHeader();
     }
+
+    // RECOVERY: Replay any pending operations from the sequential log.
+    await _replayOpLog();
+  }
+
+  Future<void> _replayOpLog() async {
+    final ops = await _opLog.readAll();
+    if (ops.isEmpty) return;
+
+    for (final op in ops) {
+      try {
+        switch (op.type) {
+          case 'insert':
+            // Use put to ensure the same ID is reused if possible, or just insert
+            if (op.id != null) {
+              await _putImpl(op.id!, op.data);
+            } else {
+              await _crudOps.insertImpl(op.data);
+            }
+            break;
+          case 'put':
+            await _putImpl(op.id!, op.data);
+            break;
+          case 'update':
+            await _crudOps.updateImpl(op.id!, op.data as Map<String, dynamic>);
+            break;
+          case 'delete':
+            await _crudOps.deleteImpl(op.id!);
+            break;
+        }
+      } catch (_) {
+        // Skip failed replays
+      }
+    }
+    await _opLog.clear();
   }
 
   /// Closes the database and releases all resources.
   Future<void> close() async {
     if (_isClosed) return; // Already closed
-    _isClosed = true;
     
-    await _saveIndexes();
-    if (storage.needsExplicitFlush) {
-      await storage.write(24, Uint8List(1)..[0] = 0x43);
-    }
-    await _saveHeader();
-    await _pageManager.flushDirty();
-    await storage.flush();
-    await storage.close();
-    await dataStorage?.flush();
-    await dataStorage?.close();
-    final watchersCopy = _watchers.values.toList();
-    _watchers.clear();
-    for (final c in watchersCopy) {
-      await c.close();
-    }
+    // Use the exclusive lock to ensure all pending writes are finished before closing.
+    // We cannot use _exclusive() helper because it checks _isClosed.
+    final next = _writeLock.then((_) async {
+      if (_isClosed) return;
+      _isClosed = true;
+      
+      await _saveIndexes();
+      if (storage.needsExplicitFlush) {
+        await storage.write(24, Uint8List(1)..[0] = 0x43);
+      }
+      await _saveHeader();
+      await _pageManager.flushDirty();
+      await storage.flush();
+      await storage.close();
+      await dataStorage?.flush();
+      await dataStorage?.close();
+      await _opLog.close();
+      final watchersCopy = _watchers.values.toList();
+      _watchers.clear();
+      for (final c in watchersCopy) {
+        await c.close();
+      }
 
-    if (identical(_instance, this)) {
-      _instance = null;
-    }
+      if (identical(_instance, this)) {
+        _instance = null;
+      }
+    });
+    _writeLock = next.then((_) {}, onError: (_) {});
+    return next;
   }
 
   /// Flushes the header and all pending page writes to disk.
@@ -424,13 +483,11 @@ class FastDB {
   // Single-document create, read, update, delete operations.
 
   Future<int> insert(dynamic doc) {
-    if (isProxy) return _proxyCall('insert', {'doc': doc}).then((v) => v as int);
     return _exclusive(() => _crudOps.insertImpl(doc));
   }
 
   /// Hive-style put with manual key.
   Future<void> put(int id, dynamic value) {
-    if (isProxy) return _proxyCall('put', {'id': id, 'value': value}).then((_) {});
     return _exclusive(() => _putImpl(id, value));
   }
 
@@ -529,7 +586,6 @@ class FastDB {
 
   /// Updates a single document by ID.
   Future<bool> update(int id, Map<String, dynamic> fields) {
-    if (isProxy) return _proxyCall('update', {'id': id, 'fields': fields}).then((v) => v as bool);
     return _exclusive(() => _crudOps.updateImpl(id, fields));
   }
 
@@ -875,7 +931,6 @@ class FastDB {
   // ─── Delete ────────────────────────────────────────────────────────────────
 
   Future<bool> delete(int id) {
-    if (isProxy) return _proxyCall('delete', {'id': id}).then((v) => v as bool);
     return _exclusive(() => _crudOps.deleteImpl(id));
   }
 

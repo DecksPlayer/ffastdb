@@ -1,4 +1,4 @@
-# FFastDB 🚀 `v0.2.4`
+# FFastDB 🚀 `v0.2.6`
 
 A high-performance, pure-Dart NoSQL database for Flutter & server-side Dart.
 
@@ -11,6 +11,7 @@ A high-performance, pure-Dart NoSQL database for Flutter & server-side Dart.
 
 | Feature | FastDB | Hive | Isar |
 |---|---|---|---|
+| Sequential operation log | ✅ | ❌ | ❌ |
 | Pure Dart | ✅ | ✅ | ❌ (native) |
 | No code generation | ✅ | ❌ | ❌ |
 | B-Tree primary index | ✅ | ❌ | ✅ |
@@ -18,7 +19,7 @@ A high-performance, pure-Dart NoSQL database for Flutter & server-side Dart.
 | Write-Ahead Log (WAL) | ✅ | ❌ | ✅ |
 | Crash recovery | ✅ | ❌ | ✅ |
 | File locking | ✅ | ❌ | ✅ |
-| Fluent QueryBuilder | ✅ | ❌ | ✅ |
+| Fluent QueryBuilder | ✅ | ✅ | ✅ |
 | Reactive watchers | ✅ | ✅ | ✅ |
 | Transactions | ✅ | ❌ | ✅ |
 | `DateTime` support | ✅ | ✅ | ✅ |
@@ -31,8 +32,12 @@ A high-performance, pure-Dart NoSQL database for Flutter & server-side Dart.
 
 ```yaml
 dependencies:
-  ffastdb: ^0.2.4
+  ffastdb: ^0.2.6
 ```
+
+> **Native isolate note:** Transparent write proxying between isolates was removed.
+> On Android, iOS, macOS, Linux, and Windows, treat a database file as having a
+> single active owner at a time.
 
 ### Open a database
 
@@ -229,7 +234,7 @@ FastDB supports all common Dart and Firebase data types with automatic serializa
 - **Primitives**: `int`, `double`, `String`, `bool`, `null`
 - **Date/Time**: `DateTime` (stored as milliseconds since epoch)
 - **Collections**: `List`, `Map` (with any nesting level)
-- **Binary**: `Uint8List`
+- **Binary**: `Uint8List` (stored natively as raw bytes in the main database file)
 - **Firebase types** (via duck-typing, no imports needed):
   - `Timestamp` → `DateTime`
   - `GeoPoint` → `Map<String, double>` with `latitude`/`longitude`
@@ -531,17 +536,17 @@ FastDB
 │   ├── HashIndex    — O(1) exact-match
 │   ├── SortedIndex  — O(log n) range / sortBy
 │   └── BitmaskIndex — bitwise AND for boolean / enum fields
+├── Sequential Operation Log (Sequential Registry)
+│   ├── Operations logged BEFORE applying to main DB
+│   ├── Atomic replay on startup if interruption occurs
+│   └── Optimized for large binary data (no Base64 overhead)
 ├── LRU Page Cache (configurable RAM budget)
-│   └── Default: 256 pages = 1 MB RAM
+│   └── Default: 2048 pages = 8 MB RAM
 ├── WAL (Write-Ahead Log)
 │   ├── CRC32 checksums per entry AND per document
 │   ├── Per-transaction COMMIT markers (uncommitted entries discarded on recovery)
 │   ├── Checkpoint after every commit (WAL never holds more than 1 transaction)
 │   └── Auto crash recovery on open()
-├── IsolateCoordinator (Multi-Isolate)
-│   ├── Owner isolate: ServerSocket on 127.0.0.1:random, port saved to .fdb.port
-│   ├── Proxy isolate: SocketProxy forwards insert/put/delete to Owner
-│   └── Stale port detection: isPortAlive() prevents zombie proxy connections
 ├── BufferedStorageStrategy
 │   └── Write coalescing (~9x faster bulk inserts)
 └── StorageStrategy (platform-specific)
@@ -569,64 +574,15 @@ Benchmarks on a mid-range device (in-memory storage):
 
 ---
 
-## Multi-Isolate Support
+## Sequential Operation Log (Operation Registry)
 
-Flutter apps often run heavy work (image processing, network, background sync) in separate Dart **Isolates**. Since each Isolate has its own memory heap, they cannot share a single `FastDB` object directly. ffastdb handles this transparently using a local TCP socket bus.
+FastDB uses a high-level sequential operation log to guarantee document-level atomicity even during catastrophic failures (app crashes, power loss).
 
-### How it works
+1. **Log First**: Every write operation (`insert`, `put`, `update`, `delete`) is serialized and appended to a `.log` sidecar file *before* the main database index or files are modified.
+2. **Commit**: Once the operation is successfully persisted to the main file (and the WAL is committed), the log is cleared.
+3. **Automatic Recovery**: If the app restarts and finds a non-empty log, it automatically re-applies the pending operations to ensure the database matches the user's intent.
 
-```
-┌─────────────────────────────────────────────────────────┐
-│  Main Isolate (UI)                                      │
-│  ┌───────────────────────────────────────────────────┐  │
-│  │  FastDB (Owner)                                   │  │
-│  │  ├── B-Tree + LRU Cache (authoritative copy)      │  │
-│  │  ├── WAL + file lock                              │  │
-│  │  └── IsolateCoordinator → ServerSocket :PORT      │  │
-│  └───────────────────────────────────────────────────┘  │
-│                        ▲  JSON over loopback TCP         │
-│           ┌────────────┘                                 │
-│  ┌────────┴──────────────────────────────────────────┐  │
-│  │  Background Isolate                               │  │
-│  │  ┌─────────────────────────────────────────────┐  │  │
-│  │  │  FastDB (Proxy)                             │  │  │
-│  │  │  └── SocketProxy → forwards insert/put/     │  │  │
-│  │  │                     delete to Owner         │  │  │
-│  │  └─────────────────────────────────────────────┘  │  │
-│  └───────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────┘
-```
-
-1. The **first** isolate that calls `openDatabase()` becomes the **Owner**. It opens the real database file, acquires the OS file lock, and starts a `ServerSocket` bound to a random loopback port (`127.0.0.1:PORT`).
-2. The port number is written to a sidecar file (`<name>.fdb.port`) next to the database.
-3. Any **subsequent** isolate that calls `openDatabase()` with the same name finds the port file, verifies the socket is alive (`isPortAlive()`), and becomes a **Proxy**. All `insert`, `put`, and `delete` calls are serialized as JSON messages and forwarded to the Owner over the socket. Reads (`findById`, `query`, etc.) are executed locally against the Proxy's own view of the file — they do not round-trip through the socket.
-4. When the Owner isolate closes the database, it deletes the port file and releases the file lock. The next `openDatabase()` call (from any isolate) then becomes the new Owner.
-
-### Usage
-
-No special API — just call `openDatabase()` normally from every isolate:
-
-```dart
-// main.dart (main isolate — becomes Owner automatically)
-final db = await openDatabase('myapp', directory: dir);
-
-// background_worker.dart (spawned with Isolate.spawn or compute())
-Future<void> backgroundTask(String dir) async {
-  // openDatabase detects the port file and creates a Proxy automatically
-  final db = await openDatabase('myapp', directory: dir);
-  await db.insert({'source': 'background', 'data': heavyResult});
-  await db.close();
-}
-```
-
-### Caveats
-
-| Constraint | Reason |
-|---|---|
-| Only `insert`, `put`, `delete` are proxied | Reads are done locally from the shared file; no round-trip needed |
-| Owner isolate must be running | If the Owner closes the DB, Proxy calls fail until a new Owner opens it |
-| Loopback TCP only | Works on all native platforms (Android, iOS, macOS, Linux, Windows); **not available on web** |
-| Stale port file | If the Owner crashes, the next `openDatabase()` call detects the dead socket, deletes the stale port file, and opens normally as the new Owner |
+This "sequential registry" approach ensures that you never lose a document even if the B-Tree indexing is interrupted.
 
 ---
 
@@ -637,8 +593,8 @@ For a database at path `/data/users.db`, FastDB creates:
 ```
 /data/users.db       ← Main database file (FDB2 format)
 /data/users.db.wal   ← Write-Ahead Log (deleted after checkpoint)
+/data/users.db.log   ← Sequential Operation Log (sequential registry)
 /data/users.db.lock  ← Process lock file (deleted on close)
-/data/users.db.port  ← Isolate coordinator port (deleted on close)
 ```
 
 ---
