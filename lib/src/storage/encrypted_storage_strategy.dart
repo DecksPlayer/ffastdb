@@ -1,55 +1,82 @@
 import 'dart:typed_data';
+import '_aes256_ctr.dart';
 import 'storage_strategy.dart';
 
-/// A wrapper [StorageStrategy] that obfuscates data before writing to the
-/// base strategy and de-obfuscates it after reading.
+/// A wrapper [StorageStrategy] that transparently encrypts/decrypts all data
+/// using **AES-256 in CTR mode** (pure Dart, zero external dependencies).
 ///
-/// **⚠️ Security Warning:** This uses a Vigenère-style XOR stream cipher,
-/// which provides **obfuscation only, NOT cryptographic security**. Known
-/// plaintext attacks (e.g. against the fixed 'FDB2' file header) can partially
-/// recover the key. It prevents casual inspection of storage contents (browser
-/// DevTools, file hex dumps) but is not suitable for protecting sensitive data
-/// against a determined attacker.
+/// ### File layout on disk
+/// ```
+/// bytes  0–11 : 12-byte random nonce (plaintext, written on first open)
+/// bytes 12+   : AES-256-CTR encrypted database content
+/// ```
+/// The nonce is generated once with [Random.secure] and persisted in the file
+/// header. All offsets exposed through [StorageStrategy] are logical (nonce
+/// header is invisible to callers).
 ///
-/// **For real encryption** use AES-256-GCM via a package such as `encrypt`
-/// or `pointycastle`, wrapped in a custom [StorageStrategy].
+/// ### Key derivation
+/// When constructed with a [String] password, the key is derived by taking the
+/// UTF-16 code units of the password and cycling them to fill 32 bytes.
+/// **This is NOT a cryptographic KDF.** For maximum security, derive the key
+/// externally (e.g. PBKDF2, Argon2) and use [EncryptedStorageStrategy.withRawKey].
 ///
-/// Primarily used to prevent browser developer-tool inspection of the raw
-/// database bytes in Flutter Web applications.
+/// ### Thread safety
+/// Not thread-safe. Callers must serialise access (FastDB already does this).
 class EncryptedStorageStrategy implements StorageStrategy {
   final StorageStrategy _base;
-  final List<int> _key;
+  final Uint32List _rk;      // 60 AES-256 round-key words (expanded once)
+  late Uint8List _nonce12;   // 12-byte CTR nonce, loaded/written in open()
 
+  /// Number of bytes reserved at the start of the underlying file for the nonce.
+  static const int _headerSize = 12;
+
+  /// Creates an encrypted strategy wrapping [base], deriving the AES key from
+  /// the UTF-16 code units of [encryptionKey] (cyclic padding to 32 bytes).
   EncryptedStorageStrategy(this._base, String encryptionKey)
-      : _key = encryptionKey.codeUnits;
+      : _rk = aes256KeyExpand(aes256KeyFromPassword(encryptionKey));
+
+  /// Creates an encrypted strategy with a pre-derived 32-byte raw AES key.
+  /// Use this when the caller handles key derivation (PBKDF2, Argon2, etc.).
+  EncryptedStorageStrategy.withRawKey(this._base, Uint8List rawKey)
+      : _rk = aes256KeyExpand(rawKey) {
+    assert(rawKey.length == 32, 'AES-256 requires exactly 32 bytes');
+  }
 
   /// Returns the underlying base storage strategy.
   StorageStrategy get storage => _base;
 
-  void _cipher(Uint8List data, int offset) {
-    if (_key.isEmpty) return;
-    for (int i = 0; i < data.length; i++) {
-        // XOR cipher — fast, deterministic, and effectively hides characters
-        // for "obfuscation" requirements.
-        data[i] ^= _key[(offset + i) % _key.length];
+  // ── StorageStrategy ────────────────────────────────────────────────────────
+
+  @override
+  Future<void> open() async {
+    await _base.open();
+    final baseSize = await _base.size;
+    if (baseSize == 0) {
+      // New file: generate a fresh nonce and persist it as the file header.
+      _nonce12 = generateNonce12();
+      await _base.write(0, _nonce12);
+    } else if (baseSize >= _headerSize) {
+      // Existing file: read the stored nonce.
+      _nonce12 = await _base.read(0, _headerSize);
+    } else {
+      throw StateError(
+          'Encrypted storage header is corrupted '
+          '(file size $baseSize < required $_headerSize bytes).');
     }
   }
 
   @override
-  Future<void> open() => _base.open();
-
-  @override
   Future<Uint8List> read(int offset, int size) async {
-    final data = await _base.read(offset, size);
-    _cipher(data, offset);
+    final data = await _base.read(offset + _headerSize, size);
+    aes256CtrXor(_rk, _nonce12, offset, data);
     return data;
   }
 
   @override
   Future<void> write(int offset, Uint8List data) async {
     final encrypted = Uint8List.fromList(data);
-    _cipher(encrypted, offset);
-    return _base.write(offset, encrypted);
+    aes256CtrXor(_rk, _nonce12, offset, encrypted);
+    return _base.write(offset + _headerSize, encrypted);
   }
 
   @override
@@ -59,18 +86,27 @@ class EncryptedStorageStrategy implements StorageStrategy {
   Future<void> close() => _base.close();
 
   @override
-  Future<int> get size => _base.size;
+  Future<int> get size async {
+    final s = await _base.size;
+    final logical = s - _headerSize;
+    return logical < 0 ? 0 : logical;
+  }
 
   @override
-  Future<void> truncate(int size) => _base.truncate(size);
+  Future<void> truncate(int size) => _base.truncate(size + _headerSize);
 
   @override
-  int? get sizeSync => _base.sizeSync;
+  int? get sizeSync {
+    final s = _base.sizeSync;
+    if (s == null) return null;
+    final logical = s - _headerSize;
+    return logical < 0 ? 0 : logical;
+  }
 
   @override
   Uint8List? readSync(int offset, int size) {
-    final data = _base.readSync(offset, size);
-    if (data != null) _cipher(data, offset);
+    final data = _base.readSync(offset + _headerSize, size);
+    if (data != null) aes256CtrXor(_rk, _nonce12, offset, data);
     return data;
   }
 
@@ -80,7 +116,7 @@ class EncryptedStorageStrategy implements StorageStrategy {
   @override
   bool writeSync(int offset, Uint8List data) {
     final encrypted = Uint8List.fromList(data);
-    _cipher(encrypted, offset);
-    return _base.writeSync(offset, encrypted);
+    aes256CtrXor(_rk, _nonce12, offset, encrypted);
+    return _base.writeSync(offset + _headerSize, encrypted);
   }
 }
