@@ -82,7 +82,7 @@ class _WordListPageState extends State<WordListPage> {
     final maps = <Map<String, dynamic>>[];
     for (final id in ids) {
       final doc = await widget.db.findById(id);
-      if (doc is Map<String, dynamic>) {
+      if (doc is Map<String, dynamic> && doc['word'] is String && doc['note'] is String) {
         maps.add({...doc, '__dbId': id});
       }
     }

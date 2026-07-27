@@ -206,13 +206,14 @@ FastDB convierte automáticamente entre tipos cuando es necesario:
 
 1. **Objetos con `toJson()`**: Clases que implementan `toJson()` se serializan automáticamente
 2. **Firebase types**: Detección por duck-typing (sin imports necesarios)
-3. **Uint8List**: Se codifica como Base64 internamente
+3. **Uint8List**: Se almacena de forma nativa como bytes binarios en el archivo principal
 4. **Valores desconocidos**: Se convierten a String con `toString()`
 
 ## ⚡ Rendimiento
 
 - **Serialización binaria eficiente**: Tipos nativos (int, double, bool) se serializan directamente en formato binario
 - **Sin overhead JSON**: Los tipos primitivos no pasan por JSON
+- **Binarios más compactos**: `Uint8List` evita el overhead de Base64 en la serialización principal
 - **Compatible con Web**: Funciona en Flutter Web sin problemas
 
 ## ✅ Resumen
@@ -230,7 +231,7 @@ FastDB convierte automáticamente entre tipos cuando es necesario:
 | null        | ✅        | Valores nulos                            |
 | List        | ✅        | Arrays de cualquier tipo                 |
 | Map         | ✅        | Objetos y mapas anidados                 |
-| Uint8List   | ✅        | Datos binarios                           |
+| Uint8List   | ✅        | Datos binarios almacenados nativamente   |
 | Firebase *  | ✅        | Timestamp, GeoPoint, DocumentRef, Blob   |
 
 **Nota**: FastDB es compatible con Firebase sin necesidad de importar `cloud_firestore`. La detección de tipos se hace mediante duck-typing.
@@ -238,3 +239,9 @@ FastDB convierte automáticamente entre tipos cuando es necesario:
 ## 📝 Ejemplos de Uso
 
 Ver el archivo [test/data_types_test.dart](test/data_types_test.dart) para ejemplos completos de todos los tipos de datos soportados.
+
+## Limitaciones conocidas
+
+- **Enteros > 2^53 en Web**: en dart2js todos los números son IEEE-754 doubles; los `int` con valor absoluto > 9007199254740991 pierden precisión silenciosamente al serializar documentos Map (vía JSON). En VM nativa (Android/iOS/desktop) no aplica. Usa `String` para IDs de 64 bits en Web.
+- **DateTime en TypeAdapters**: se almacena como epoch-ms UTC; al leer se reconstruye con `isUtc: true` (la hora local no se preserva, el instante sí).
+

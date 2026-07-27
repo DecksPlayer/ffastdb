@@ -7,20 +7,6 @@ import '../storage/wal_storage_strategy.dart';
 import '../storage/encrypted_storage_strategy.dart';
 
 /// Opens (or creates) a named database in [directory].
-///
-/// Uses [IoStorageStrategy] + [WalStorageStrategy] for full durability and
-/// crash recovery. A `.fdb`, `.fdb.wal`, and `.fdb.lock` sidecar are created
-/// inside [directory].
-///
-/// [directory] is optional. When omitted (or empty), defaults to the current
-/// working directory. On web/WASM this parameter is ignored automatically
-/// (see `open_database_web.dart`).
-///
-/// [indexes] registers hash (O(1) equality) secondary indexes on the listed
-/// fields before the database file is opened, so they are populated during
-/// startup from persisted or rebuilt state.
-///
-/// [sortedIndexes] registers sorted (O(log n) range/order) secondary indexes.
 Future<FastDB> openDatabase(
   String name, {
   String directory = '',
@@ -33,23 +19,20 @@ Future<FastDB> openDatabase(
   List<String> ftsIndexes = const [],
   List<List<String>> compositeIndexes = const [],
   String? encryptionKey,
+  void Function(double)? onProgress,
 }) async {
-  // Guard: if a live instance already exists, reuse it.
-  // Calling disposeInstance() unconditionally was the root cause of
-  // "Bad state: Cannot perform operations on a closed database" errors
-  // when openDatabase / ffastdb.init was called from multiple code paths
-  // during app startup (e.g., from BLoC + repository simultaneously).
   try {
-    return FfastDb.instance; // throws StateError if null or closed
+    return FfastDb.instance;
   } on StateError {
-    // No live instance — fall through to create one.
+    // No live instance in this isolate.
   }
-
-  // Clean up any stale closed instance before opening a new one.
-  await FfastDb.disposeInstance();
 
   final dir = directory.isEmpty ? Directory.current.path : directory;
   final path = p.join(dir, '$name.fdb');
+
+  // Normal open as the Owner isolate
+  await FfastDb.disposeInstance();
+
   StorageStrategy storage = WalStorageStrategy(
     main: IoStorageStrategy(path),
     wal: IoStorageStrategy('$path.wal'),
@@ -69,6 +52,7 @@ Future<FastDB> openDatabase(
     sortedIndexes: sortedIndexes,
     ftsIndexes: ftsIndexes,
     compositeIndexes: compositeIndexes,
+    onProgress: onProgress,
   );
 
   return db;

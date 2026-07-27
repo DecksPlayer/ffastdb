@@ -56,8 +56,9 @@ void main() async {
   print('\n📊 ACCEDIENDO A CAMPOS INDIVIDUALES:\n');
   
   // String
-  print('ID de Firebase: "${doc['id']}"');
-  print('  → Tipo: ${doc['id'].runtimeType}');
+  print('ID Interno de FastDB (ffdbID): ${doc['ffdbID']}');
+  print('ID de Firebase ("id" original): "${doc['id']}"');
+  print('  → Tipo de ID original: ${doc['id'].runtimeType}');
   
   // String
   print('\nNombre: "${doc['name']}"');

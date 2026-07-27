@@ -1,5 +1,6 @@
 import 'dart:typed_data';
 import 'storage_strategy.dart';
+import '../crc32.dart' as crc;
 
 /// WAL entry types
 const int _kEntryWrite = 1;
@@ -34,6 +35,21 @@ class WalStorageStrategy implements StorageStrategy {
   bool _txOpen = false;
   int _txId = 0;
   final List<_WalEntry> _txEntries = [];
+  int _txBufferedBytes = 0;
+
+  /// Metadata of entries already streamed to the WAL file during the current
+  /// transaction (offset in main file, data length, position in WAL file).
+  /// Streaming bounds RAM usage of huge transactions (e.g. insertAll of 100k
+  /// docs) — the entry DATA is read back from the WAL file at commit time.
+  final List<({int offset, int length, int walPos})> _txStreamed = [];
+
+  /// Above this many buffered bytes, transaction writes are streamed directly
+  /// to the WAL file instead of being buffered in RAM.
+  static const int _txStreamThreshold = 8 * 1024 * 1024; // 8 MB
+
+  /// The WAL is checkpointed (truncated) only when it exceeds this size —
+  /// not after every commit (that was a truncate+fsync storm per operation).
+  static const int _checkpointThreshold = 1024 * 1024; // 1 MB
 
   // Current write position in the WAL
   int _walPos = 0;
@@ -43,6 +59,9 @@ class WalStorageStrategy implements StorageStrategy {
     required StorageStrategy wal,
   })  : _main = main,
         _wal = wal;
+
+  /// Returns the underlying main storage strategy.
+  StorageStrategy get main => _main;
 
   // ─── Open / Recover ──────────────────────────────────────────────────────
 
@@ -54,13 +73,30 @@ class WalStorageStrategy implements StorageStrategy {
   }
 
   /// Reads the WAL file and replays committed transactions to main storage.
+  ///
+  /// Each call to [commit()] writes one or more WRITE entries followed by a
+  /// COMMIT marker to the WAL file.  Between checkpoints the WAL can therefore
+  /// contain several completed transactions followed by a partial (uncommitted)
+  /// transaction that was interrupted by a crash.
+  ///
+  /// The old implementation collected **all** WRITE entries and set `hasCommit`
+  /// if **any** COMMIT was present.  That meant that uncommitted entries from a
+  /// later transaction were replayed whenever an earlier transaction had
+  /// committed — causing silent corruption.
+  ///
+  /// The correct approach tracks "pending" entries per transaction.  A COMMIT
+  /// moves the pending list to the committed list; any entries still pending at
+  /// the end of the file are discarded.
   Future<void> _recover() async {
     final walSize = await _wal.size;
     if (walSize == 0) { _walPos = 0; return; }
 
     final raw = await _wal.read(0, walSize);
-    final entries = <_WalEntry>[];
-    bool hasCommit = false;
+
+    // Committed entries across all fully-committed transactions.
+    final committedEntries = <_WalEntry>[];
+    // Entries belonging to the transaction currently being parsed (not yet committed).
+    final pendingEntries = <_WalEntry>[];
     int offset = 0;
 
     try {
@@ -78,37 +114,59 @@ class WalStorageStrategy implements StorageStrategy {
         offset += 25;
 
         if (type == _kEntryCommit) {
-          // Verify the COMMIT marker's own checksum (4 bytes follow the 25-byte header)
+          // Verify the COMMIT marker's own checksum (4 bytes follow the 25-byte header).
+          // ALWAYS advance past the CRC slot, even if truncated — otherwise offset
+          // never moves and the loop spins forever (mobile infinite-loop bug).
+          bool commitValid = false;
           if (offset + 4 <= raw.length) {
             final storedCrc = _readInt32(raw, offset);
             final computedCrc = _crc32(raw.sublist(offset - 25, offset));
-            if (storedCrc == computedCrc) hasCommit = true;
-            offset += 4;
+            commitValid = (storedCrc == computedCrc);
           }
+          // Advance regardless — clamped to raw.length if truncated.
+          offset += 4;
+
+          if (commitValid) {
+            // Move all pending entries for this transaction to the committed list.
+            committedEntries.addAll(pendingEntries);
+          }
+          // Whether valid or not, clear pending — entries without a valid COMMIT
+          // are discarded (uncommitted transaction, e.g. crash mid-commit).
+          pendingEntries.clear();
           continue;
         }
 
         if (type == _kEntryWrite) {
-          if (offset + length > raw.length) break; // Truncated entry
+          // Need room for data + trailing 4-byte CRC.
+          if (offset + length + 4 > raw.length) break; // Truncated entry
           final data = raw.sublist(offset, offset + length);
-          
+
           // Verify checksum
           final storedCrc = _readInt32(raw, offset + length);
           final computedCrc = _crc32(raw.sublist(offset - 25, offset + length));
           if (storedCrc != computedCrc) break; // Checksum mismatch = corrupt
 
-          entries.add(_WalEntry(txId: txId, offset: writeOffset, data: data));
+          // Suppress unused variable warning — txId is stored in the file for
+          // forensic / debugging purposes but grouping is done via pending list.
+          // ignore: unused_local_variable
+          final _ = txId;
+          pendingEntries.add(_WalEntry(txId: txId, offset: writeOffset, data: data));
           offset += length + 4; // data + checksum
+          continue;
         }
+
+        // Unknown entry type — corrupt WAL, stop parsing.
+        break;
       }
     } catch (_) {
-      // Truncated or corrupt WAL — discard the incomplete transaction
+      // Truncated or corrupt WAL — discard the incomplete transaction.
     }
+    // Any remaining pendingEntries are from an uncommitted transaction — discard them.
 
-    if (hasCommit && entries.isNotEmpty) {
+    if (committedEntries.isNotEmpty) {
       // Replay committed writes to main file — idempotent: skip writes whose
       // data already matches what is on disk (handles double-recovery on crash).
-      for (final entry in entries) {
+      for (final entry in committedEntries) {
         try {
           final existing = await _main.read(entry.offset, entry.data.length);
           bool alreadyApplied = existing.length == entry.data.length;
@@ -150,26 +208,40 @@ class WalStorageStrategy implements StorageStrategy {
   Future<void> commit() async {
     if (!_txOpen) return;
 
-    // 1. Write all entries to WAL file
+    // 1. Write all buffered entries + the COMMIT marker to the WAL file in a
+    //    SINGLE write call (streamed entries are already there). The COMMIT
+    //    marker is the atomic point of no return.
+    final walBytes = BytesBuilder();
     for (final entry in _txEntries) {
-      await _writeWalEntry(_kEntryWrite, entry);
+      _encodeWalEntry(walBytes, _kEntryWrite, entry.txId, entry.offset, entry.data);
     }
-
-    // 2. Write COMMIT marker (this is the atomic point of no return)
-    await _writeCommitMarker();
+    _encodeWalEntry(walBytes, _kEntryCommit, _txId, 0, Uint8List(0));
+    final bytes = walBytes.toBytes();
+    await _wal.write(_walPos, bytes);
+    _walPos += bytes.length;
     await _wal.flush();
 
-    // 3. Apply writes to main file
+    // 2. Apply writes to main file (buffered from RAM, streamed read back
+    //    from the WAL file to keep RAM bounded on huge transactions).
     for (final entry in _txEntries) {
       await _main.write(entry.offset, entry.data);
+    }
+    for (final s in _txStreamed) {
+      final data = await _wal.read(s.walPos + 25, s.length); // +25: entry header
+      await _main.write(s.offset, data);
     }
     await _main.flush();
 
     _txOpen = false;
     _txEntries.clear();
+    _txStreamed.clear();
+    _txBufferedBytes = 0;
 
-    // 4. Checkpoint if WAL is large
-    if (await _wal.size > 1024 * 1024) {
+    // Checkpoint policy: truncate the WAL only when it exceeds the threshold.
+    // The multi-transaction recovery is correct, so keeping several committed
+    // transactions in the WAL between checkpoints is safe and avoids a
+    // truncate+fsync per commit. _walPos keeps advancing until then.
+    if (_walPos >= _checkpointThreshold) {
       await _checkpoint();
     }
   }
@@ -178,6 +250,14 @@ class WalStorageStrategy implements StorageStrategy {
   Future<void> rollback() async {
     _txOpen = false;
     _txEntries.clear();
+    _txStreamed.clear();
+    _txBufferedBytes = 0;
+    // Truncate streamed entries of the aborted transaction so the WAL does
+    // not accumulate dead data (they carry no COMMIT marker, so recovery
+    // would discard them anyway — this just reclaims the space).
+    if (_walPos > 0) {
+      await _checkpoint();
+    }
     // WAL entries are ignored on next recovery since there's no COMMIT marker
   }
 
@@ -196,18 +276,65 @@ class WalStorageStrategy implements StorageStrategy {
   @override
   Future<void> write(int offset, Uint8List data) async {
     if (_txOpen) {
-      // Buffer in current transaction
-      _txEntries.add(_WalEntry(txId: _txId, offset: offset, data: data));
+      if (_txBufferedBytes + data.length <= _txStreamThreshold) {
+        // Small transactions: buffer in RAM (fast path).
+        _txEntries.add(_WalEntry(txId: _txId, offset: offset, data: data));
+        _txBufferedBytes += data.length;
+      } else {
+        // Huge transactions (e.g. insertAll of 100k docs): stream the entry
+        // directly to the WAL file and keep only its metadata — bounds RAM.
+        final entry = _WalEntry(txId: _txId, offset: offset, data: data);
+        final walPos = _walPos;
+        await _writeWalEntry(_kEntryWrite, entry);
+        _txStreamed.add((offset: offset, length: data.length, walPos: walPos));
+      }
     } else {
       // Auto-wrap in a single-op transaction
       await beginTransaction();
       _txEntries.add(_WalEntry(txId: _txId, offset: offset, data: data));
+      _txBufferedBytes += data.length;
       await commit();
     }
   }
 
   @override
-  Future<Uint8List> read(int offset, int size) => _main.read(offset, size);
+  Future<Uint8List> read(int offset, int size) async {
+    if (!_txOpen || (_txEntries.isEmpty && _txStreamed.isEmpty)) {
+      return _main.read(offset, size);
+    }
+    // Read-your-writes: overlay pending transaction writes (last write wins)
+    // on top of the main file content, so a transaction sees its own
+    // uncommitted writes — including regions beyond the main file's current
+    // end (the `size` getter already reports the virtual end of file).
+    final base = await _main.read(offset, size);
+    final result = Uint8List(size);
+    final baseLen = base.length < size ? base.length : size;
+    if (baseLen > 0) result.setRange(0, baseLen, base);
+    final readEnd = offset + size;
+
+    void overlay(int entryOffset, Uint8List entryData) {
+      final entryEnd = entryOffset + entryData.length;
+      if (entryEnd <= offset || entryOffset >= readEnd) return; // no overlap
+      final srcStart = offset > entryOffset ? offset - entryOffset : 0;
+      final dstStart = entryOffset > offset ? entryOffset - offset : 0;
+      var copyLen = entryData.length - srcStart;
+      if (copyLen > size - dstStart) copyLen = size - dstStart;
+      if (copyLen > 0) {
+        result.setRange(dstStart, dstStart + copyLen, entryData, srcStart);
+      }
+    }
+
+    for (final entry in _txEntries) {
+      overlay(entry.offset, entry.data);
+    }
+    // Streamed entries live in the WAL file (RAM-bounded transactions).
+    for (final s in _txStreamed) {
+      if (s.offset + s.length <= offset || s.offset >= readEnd) continue;
+      final data = await _wal.read(s.walPos + 25, s.length); // +25: header
+      overlay(s.offset, data);
+    }
+    return result;
+  }
 
   @override
   Future<void> flush() => _main.flush();
@@ -231,14 +358,18 @@ class WalStorageStrategy implements StorageStrategy {
   @override
   Future<int> get size async {
     final mainSize = await _main.size;
-    if (!_txOpen || _txEntries.isEmpty) return mainSize;
+    if (!_txOpen || (_txEntries.isEmpty && _txStreamed.isEmpty)) return mainSize;
     // During an open transaction, pending (uncommitted) writes are not yet
     // reflected in _main's size. Return the maximum write extent across all
-    // buffered entries so that callers like _dataOffset and allocatePage()
-    // see the correct "virtual end of file" and don't overlap pending data.
+    // buffered/streamed entries so that callers like _dataOffset and
+    // allocatePage() see the correct "virtual end of file".
     var maxExtent = mainSize;
     for (final entry in _txEntries) {
       final extent = entry.offset + entry.data.length;
+      if (extent > maxExtent) maxExtent = extent;
+    }
+    for (final s in _txStreamed) {
+      final extent = s.offset + s.length;
       if (extent > maxExtent) maxExtent = extent;
     }
     return maxExtent;
@@ -246,58 +377,33 @@ class WalStorageStrategy implements StorageStrategy {
 
   // ─── WAL Binary Writers ──────────────────────────────────────────────────
 
-  Future<void> _writeWalEntry(int type, _WalEntry entry) async {
-    final buf = BytesBuilder();
-
-    buf.add(_kMagic);
-    buf.addByte(type);
-    _addInt64(buf, entry.txId);
-    _addInt64(buf, entry.offset);
-    _addInt32(buf, entry.data.length);
-    buf.add(entry.data);
-
-    final payload = buf.toBytes();
-    final crc = _crc32(payload);
-    
-    final full = BytesBuilder();
-    full.add(payload);
-    _addInt32BytesBuilder(full, crc);
-
-    final bytes = full.toBytes();
-    await _wal.write(_walPos, bytes);
-    _walPos += bytes.length;
+  /// Appends one WAL entry (25-byte header + data + 4-byte CRC32) to [buf].
+  void _encodeWalEntry(
+      BytesBuilder buf, int type, int txId, int offset, Uint8List data) {
+    final entryBytes = BytesBuilder();
+    entryBytes.add(_kMagic);
+    entryBytes.addByte(type);
+    _addInt64(entryBytes, txId);
+    _addInt64(entryBytes, offset);
+    _addInt32(entryBytes, data.length);
+    entryBytes.add(data);
+    final payload = entryBytes.toBytes();
+    buf.add(payload);
+    _addInt32(buf, _crc32(payload));
   }
 
-  Future<void> _writeCommitMarker() async {
+  Future<void> _writeWalEntry(int type, _WalEntry entry) async {
     final buf = BytesBuilder();
-    buf.add(_kMagic);
-    buf.addByte(_kEntryCommit);
-    _addInt64(buf, _txId);
-    _addInt64(buf, 0);
-    _addInt32(buf, 0);
-    final payload = buf.toBytes();
-    final crc = _crc32(payload);
-    final full = BytesBuilder();
-    full.add(payload);
-    _addInt32BytesBuilder(full, crc);
-    final bytes = full.toBytes();
+    _encodeWalEntry(buf, type, entry.txId, entry.offset, entry.data);
+    final bytes = buf.toBytes();
     await _wal.write(_walPos, bytes);
     _walPos += bytes.length;
   }
 
   // ─── Checksum ────────────────────────────────────────────────────────────
 
-  /// Simple CRC32 implementation using the standard polynomial.
-  static int _crc32(Uint8List data) {
-    int crc = 0xFFFFFFFF;
-    for (final byte in data) {
-      crc ^= byte;
-      for (int i = 0; i < 8; i++) {
-        crc = (crc & 1) != 0 ? (crc >> 1) ^ 0xEDB88320 : crc >> 1;
-      }
-    }
-    return crc ^ 0xFFFFFFFF;
-  }
+  /// Shared table-driven CRC32 (see lib/src/crc32.dart).
+  static int _crc32(Uint8List data) => crc.crc32(data);
 
   // ─── Binary Helpers ──────────────────────────────────────────────────────
 
@@ -312,8 +418,6 @@ class WalStorageStrategy implements StorageStrategy {
     ByteData.sublistView(data).setUint32(0, v, Endian.little);
     b.add(data);
   }
-
-  void _addInt32BytesBuilder(BytesBuilder b, int v) => _addInt32(b, v);
 
   void _addInt64(BytesBuilder b, int v) {
     final data = Uint8List(8);

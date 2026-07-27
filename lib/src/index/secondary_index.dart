@@ -15,6 +15,13 @@ abstract class SecondaryIndex {
   /// Returns all document IDs matching [value].
   List<int> lookup(dynamic value);
 
+  /// Returns the number of document IDs matching [value].
+  /// Overridden in HashIndex to be O(1) without memory allocations.
+  int lookupCount(dynamic value) => lookup(value).length;
+
+  /// Returns the value indexed for [docId], or null if not indexed.
+  dynamic valueOf(int docId);
+
   /// Returns all document IDs whose value is between [low] and [high].
   List<int> range(dynamic low, dynamic high);
 

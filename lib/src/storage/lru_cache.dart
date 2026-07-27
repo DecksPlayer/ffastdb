@@ -14,7 +14,8 @@ class LruCache {
   int _hits = 0;
   int _misses = 0;
 
-  LruCache({this.capacity = 128}) {
+  LruCache({this.capacity = 128})
+      : assert(capacity > 0, 'LruCache capacity must be > 0') {
     _head.next = _tail;
     _tail.prev = _head;
   }

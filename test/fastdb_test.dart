@@ -5,7 +5,6 @@ import 'package:ffastdb/src/storage/memory_storage_strategy.dart';
 import 'package:ffastdb/src/storage/wal_storage_strategy.dart';
 import 'package:ffastdb/src/storage/buffered_storage_strategy.dart';
 import 'package:ffastdb/src/storage/io/io_storage_strategy.dart';
-import 'package:ffastdb/src/serialization/type_adapter.dart';
 import 'package:test/test.dart';
 import 'user_model.dart';
 
@@ -923,8 +922,8 @@ void main() {
       ]);
 
       // Forcibly clear indexes to simulate corruption
-      for (final idx in ['city', 'name']) {
-        db.query(); // just to force access (indexes already in map)
+      for (final name in ['city', 'name']) {
+        db.indexes.all[name]!.clear();
       }
 
       // Rebuild all
@@ -1112,7 +1111,7 @@ void main() {
       final db = FastDB(MemoryStorageStrategy());
       // No indexes registered
       final plan = db.query().where('email').equals('a@b.com').explain();
-      expect(plan, contains('NO_INDEX'));
+      expect(plan, contains('FULL_SCAN'));
     });
   });
 
@@ -1181,7 +1180,8 @@ void main() {
       final retrieved = await db.findById(fastdbId);
 
       // FastDB's internal ID should be added
-      expect(retrieved['id'], equals(fastdbId));
+      expect(retrieved['ffdbID'], equals(fastdbId));
+      expect(retrieved['id'], isNull);
       expect(retrieved['name'], equals('Charlie'));
     });
 

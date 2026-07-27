@@ -24,6 +24,7 @@ class BTree {
   int? searchSync(int key) {
     if (rootPage == null || rootPage == 0) return null;
     int pageIdx = rootPage!;
+    final visited = <int>{pageIdx};
     while (true) {
       final node = _nodeCache[pageIdx];
       if (node == null) return null; // cache miss — caller falls back to async
@@ -36,6 +37,7 @@ class BTree {
       } else {
         pageIdx = node.values[i];
       }
+      if (pageIdx == 0 || !visited.add(pageIdx)) return null;
     }
   }
   /// Returns the value (offset) for [key], or null if not found.
@@ -43,6 +45,7 @@ class BTree {
   Future<int?> search(int key) async {
     if (rootPage == null || rootPage == 0) return null;
     int pageIdx = rootPage!;
+    final visited = <int>{pageIdx};
     while (true) {
       BTreeNode? node = _readNodeSync(pageIdx);
       node ??= await _readNode(pageIdx); // async only on cold-cache miss
@@ -55,6 +58,10 @@ class BTree {
       } else {
         pageIdx = node.values[i]; // follow left child
       }
+      if (pageIdx == 0 || !visited.add(pageIdx)) {
+        // Corrupt tree: child points to page 0 or forms a cycle.
+        return null; 
+      }
     }
   }
 
@@ -62,7 +69,7 @@ class BTree {
 
   /// Inserts [key] → [value]. Automatically splits nodes when full.
   Future<void> insert(int key, int value) async {
-    if (rootPage == null) {
+    if (rootPage == null || rootPage == 0) {
       // First insert: create the root leaf node.
       final page = await pageManager.allocatePage();
       final root = BTreeNode(
@@ -97,21 +104,17 @@ class BTree {
   }
 
   /// Inserts into a node that is guaranteed NOT full.
-  Future<void> _insertNonFull(BTreeNode node, int key, int value) async {
-    if (node.isLeaf) {
-      // Binary search for the insertion position — O(log n) instead of O(n).
-      final pos = _lowerBound(node.keys, key);
-      if (pos < node.keys.length && node.keys[pos] == key) {
-        // Update existing key in-place; no shift needed.
-        node.values[pos] = value;
-      } else {
-        // Insert preserving order; List.insert is native O(n) memmove.
-        node.keys.insert(pos, key);
-        node.values.insert(pos, value);
-      }
-      await _writeNode(node);
-    } else {
-      // Upper bound: first child whose left separator is > key.
+  ///
+  /// Implemented **iteratively** to avoid stack overflows on deep trees or
+  /// when a corrupt WAL leaves circular page-pointer references in the B-Tree.
+  /// A [visited] set catches any page cycle and throws a clear [StateError]
+  /// instead of recursing until the Dart VM crashes.
+  Future<void> _insertNonFull(BTreeNode startNode, int key, int value) async {
+    BTreeNode node = startNode;
+    final visited = <int>{node.pageIndex};
+
+    while (!node.isLeaf) {
+      // Cycle detection — corrupt tree guard.
       int i = _upperBound(node.keys, key);
 
       BTreeNode? child = _readNodeSync(node.values[i]);
@@ -119,16 +122,45 @@ class BTree {
 
       if (child.isFull) {
         await _splitChild(node, i, child);
-        // After split: node gained a new separator key at keys[i].
-        // Decide which of the two new children to descend into.
+        // After split: node gained a new separator at keys[i].
+        // Choose which half to descend into.
         if (i < node.keys.length && key >= node.keys[i]) i++;
-        // key == separator: update the right child's leaf entry (i already correct).
       }
 
-      BTreeNode? targetChild = _readNodeSync(node.values[i]);
-      targetChild ??= await _readNode(node.values[i]);
-      await _insertNonFull(targetChild, key, value);
+      int childPage = node.values[i];
+      if (childPage == 0) {
+        throw StateError(
+          'FastDB BTree: circular page reference detected at page 0. '
+          'The database file may be corrupt. Delete the .fdb and .fdb.wal files to start fresh.',
+        );
+      }
+
+      BTreeNode? targetChild = _readNodeSync(childPage);
+      targetChild ??= await _readNode(childPage);
+
+      // Cycle detection — stop before infinite descent.
+      if (!visited.add(targetChild.pageIndex)) {
+        throw StateError(
+          'FastDB BTree: circular page reference detected at page '
+          '${targetChild.pageIndex}. The database file may be corrupt. '
+          'Delete the .fdb and .fdb.wal files to start fresh.',
+        );
+      }
+
+      node = targetChild;
     }
+
+    // node is now a leaf — insert here.
+    final pos = _lowerBound(node.keys, key);
+    if (pos < node.keys.length && node.keys[pos] == key) {
+      // Update existing key in-place; no shift needed.
+      node.values[pos] = value;
+    } else {
+      // Insert preserving order; List.insert is native O(n) memmove.
+      node.keys.insert(pos, key);
+      node.values.insert(pos, value);
+    }
+    await _writeNode(node);
   }
 
   /// Bulk-loads the B-Tree from a sorted list of entries (ID -> Offset).
@@ -140,6 +172,10 @@ class BTree {
   /// This avoids both orphaning existing pages and losing median keys during splits.
   Future<void> bulkLoad(List<MapEntry<int, int>> sortedEntries) async {
     if (sortedEntries.isEmpty) return;
+
+    // Defend against unsorted input and duplicate keys (e.g. put() with the
+    // same id twice in one batch): last write wins, strictly ascending keys.
+    sortedEntries = _sanitizeEntries(sortedEntries);
 
     List<MapEntry<int, int>> allEntries;
     if (rootPage != null && rootPage != 0) {
@@ -163,6 +199,18 @@ class BTree {
     }
 
     if (allEntries.isEmpty) return;
+
+    // The rebuild below orphans every page of the replaced tree — return them
+    // to the free list BEFORE building so allocatePage() can reuse them
+    // (previously each bulkLoad leaked the whole old tree, growing the file).
+    final oldRoot = rootPage;
+    if (oldRoot != null && oldRoot != 0) {
+      final oldPages = <int>{};
+      await _collectPages(oldRoot, oldPages);
+      for (final p in oldPages) {
+        _freeTreePage(p);
+      }
+    }
 
     // ── Fast O(N) bulk build ─────────────────────────────────────────────────
     // 1. Build Leaf Layer
@@ -192,23 +240,41 @@ class BTree {
     rootPage = await _buildInternalLayer(leafPages, separatorKeys);
   }
 
+  /// Collects every page index of the subtree rooted at [pageIdx].
+  /// Used to return a replaced tree's pages to the free list.
+  Future<void> _collectPages(int pageIdx, Set<int> out) async {
+    if (pageIdx <= 0 || !out.add(pageIdx)) return;
+    final node = await _readNode(pageIdx);
+    if (!node.isLeaf) {
+      for (final childPage in node.values) {
+        if (childPage > 0) await _collectPages(childPage, out);
+      }
+    }
+  }
+
   /// Counts the total number of entries (key-value pairs) in all leaf nodes.
   /// Used to decide whether to extract+merge or use individual inserts.
-  Future<int> _countLeafEntries(int pageIdx) async {
+  Future<int> _countLeafEntries(int pageIdx, [Set<int>? visited]) async {
+    visited ??= {};
+    if (!visited.add(pageIdx)) return 0;
+    
     final node = await _readNode(pageIdx);
     if (node.isLeaf) {
       return node.keys.length;
     }
     int total = 0;
     for (final childPage in node.values) {
-      if (childPage > 0) total += await _countLeafEntries(childPage);
+      if (childPage > 0) total += await _countLeafEntries(childPage, visited);
     }
     return total;
   }
 
   /// Recursively visits all leaf nodes and collects their (key, value) entries
   /// in ascending key order.
-  Future<void> _extractLeafEntries(int pageIdx, List<MapEntry<int, int>> out) async {
+  Future<void> _extractLeafEntries(int pageIdx, List<MapEntry<int, int>> out, [Set<int>? visited]) async {
+    visited ??= {};
+    if (!visited.add(pageIdx)) return;
+    
     final node = await _readNode(pageIdx);
     if (node.isLeaf) {
       for (int i = 0; i < node.keys.length; i++) {
@@ -216,9 +282,35 @@ class BTree {
       }
     } else {
       for (final childPage in node.values) {
-        if (childPage > 0) await _extractLeafEntries(childPage, out);
+        if (childPage > 0) await _extractLeafEntries(childPage, out, visited);
       }
     }
+  }
+
+  /// Validates bulk-load input: strictly ascending keys, no duplicates.
+  /// Duplicate keys resolve to the LAST occurrence (newest write wins),
+  /// matching [_mergeSorted] semantics. Zero-allocation fast path when the
+  /// input is already valid (the common case).
+  static List<MapEntry<int, int>> _sanitizeEntries(
+      List<MapEntry<int, int>> entries) {
+    bool needsFix = false;
+    for (int i = 1; i < entries.length; i++) {
+      if (entries[i].key <= entries[i - 1].key) {
+        needsFix = true;
+        break;
+      }
+    }
+    if (!needsFix) return entries;
+
+    // Last-write-wins dedupe (LinkedHashMap keeps first position per key but
+    // the LAST value), then sort ascending.
+    final byKey = <int, int>{};
+    for (final e in entries) {
+      byKey[e.key] = e.value;
+    }
+    final list = [for (final me in byKey.entries) MapEntry(me.key, me.value)];
+    list.sort((a, b) => a.key.compareTo(b.key));
+    return list;
   }
 
   /// O(N+M) sorted merge of two sorted entry lists.
@@ -343,8 +435,18 @@ class BTree {
     // Collapse an empty internal root — its only child becomes the new root.
     final root = await _readNode(rootPage!);
     if (root.keys.isEmpty && !root.isLeaf) {
+      final oldRoot = rootPage!;
       rootPage = root.values.first;
+      _freeTreePage(oldRoot); // return the dead root page to the free list
     }
+  }
+
+  /// Returns a dead tree page to the PageManager free list, evicting it from
+  /// the node cache first (stale cache entries for a reused page would be
+  /// read as the NEW node — corruption).
+  void _freeTreePage(int pageIndex) {
+    _nodeCache.remove(pageIndex);
+    pageManager.freePage(pageIndex);
   }
 
   Future<void> _delete(int pageIdx, int key) async {
@@ -520,24 +622,26 @@ class BTree {
 
     await _writeNode(leftChild);
     await _writeNode(parent);
+    // The absorbed right child is now unreachable — return its page to the
+    // free list (was orphaned before, leaking file space on every merge).
+    _freeTreePage(rightChild.pageIndex);
   }
 
   // ─── Range Scan ──────────────────────────────────────────────────────────
 
   /// Returns all values where key is between [low] and [high] (inclusive).
-  Future<List<int>> rangeSearch(int low, int high) async {
+  Future<List<int>> rangeSearch(int low, int high, {bool skipDedupe = false}) async {
     final results = <int>[];
     if (rootPage == null || rootPage == 0) return results;
     // seenIds prevents duplicate IDs in the output if the B-Tree has
     // structural inconsistencies (e.g. after a failed bulkLoad or compaction).
-    final seenIds = <int>{};
+    final seenIds = skipDedupe ? null : <int>{};
     await _rangeNode(rootPage!, low, high, results, null, seenIds);
     return results;
   }
 
   Future<void> _rangeNode(int pageIdx, int low, int high, List<int> out, [Set<int>? visited, Set<int>? seenIds]) async {
     visited ??= {};
-    seenIds ??= {};
     if (visited.contains(pageIdx)) {
       return;
     }
@@ -558,13 +662,17 @@ class BTree {
       // All subsequent keys and right subtrees are also > high.
       if (k > high) return;
 
-      if (k >= low && node.isLeaf && seenIds.add(k)) out.add(k);
+      if (k >= low && node.isLeaf && (seenIds == null || seenIds.add(k))) out.add(k);
     }
 
-    // Rightmost child holds keys > keys.last — only descend if it can overlap.
+    // Rightmost child holds keys >= keys.last — only descend if it can overlap.
+    // NOTE: must be `<= high` (inclusive): the separator is a COPY of the first
+    // key of the right child (B+ style), so when keys.last == high the rightmost
+    // subtree may still contain the key `high`. Using `<` here lost the last
+    // document of bulk-loaded trees (e.g. insertAll of 229 docs).
     if (!node.isLeaf &&
         node.values.length > node.keys.length &&
-        (node.keys.isEmpty || node.keys.last < high)) {
+        (node.keys.isEmpty || node.keys.last <= high)) {
       if (node.values.last > 0) {
         await _rangeNode(node.values.last, low, high, out, visited, seenIds);
       }

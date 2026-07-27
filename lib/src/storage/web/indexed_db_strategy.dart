@@ -60,8 +60,11 @@ class IndexedDbStorageStrategy implements StorageStrategy {
 
     request.onsuccess = (web.Event event) {
       _database = request.result as web.IDBDatabase;
-      _loadData().then((_) => completer.complete()).catchError((_) {
-        completer.complete(); // start fresh on error
+      _loadData().then((_) => completer.complete()).catchError((e) {
+        // FAIL-CLOSED: never "start fresh" on a load error — the next flush
+        // would overwrite the persisted data with the empty/partial buffer.
+        completer.completeError(
+            'IndexedDbStorageStrategy: failed to load existing data: $e');
       });
     }.toJS;
 
@@ -125,7 +128,11 @@ class IndexedDbStorageStrategy implements StorageStrategy {
     }
 
     txn.oncomplete = ((web.Event e) => completer.complete()).toJS;
-    txn.onerror = ((web.Event e) => completer.complete()).toJS;
+    // A load error with an existing _meta key means chunks are missing or
+    // corrupt: propagate so open() fails instead of silently starting with a
+    // partially zeroed buffer that a later flush() would persist.
+    txn.onerror = ((web.Event e) => completer.completeError(
+        StateError('IndexedDbStorageStrategy: failed to load chunks'))).toJS;
 
     return completer.future;
   }
@@ -188,9 +195,15 @@ class IndexedDbStorageStrategy implements StorageStrategy {
     final txn = _database!.transaction(_storeName.toJS, 'readwrite');
     final store = txn.objectStore(_storeName);
 
+    // Snapshot the dirty set for THIS transaction. Writes arriving while the
+    // IDB transaction is in-flight add new markers that must NOT be cleared
+    // by this flush — and if the transaction fails, none of the markers may
+    // be cleared so the next flush() retries them.
+    final flushedChunks = Set<int>.of(_dirtyChunks);
+
     // Write only dirty chunks — each JS copy is at most 64 KB instead of
     // the entire buffer, reducing peak memory from O(DB size) to O(64 KB).
-    for (final ci in _dirtyChunks) {
+    for (final ci in flushedChunks) {
       final start = ci * _chunkSize;
       if (start >= _usedSize) continue;
       final end = (start + _chunkSize > _usedSize) ? _usedSize : start + _chunkSize;
@@ -216,14 +229,15 @@ class IndexedDbStorageStrategy implements StorageStrategy {
       _migrateLegacy = false;
     }
 
-    txn.oncomplete = ((web.Event e) => completer.complete()).toJS;
+    txn.oncomplete = ((web.Event e) {
+      // Clear dirty state only after the transaction actually committed;
+      // markers added while it was in-flight survive for the next flush().
+      _dirtyChunks.removeAll(flushedChunks);
+      _persistedChunkCount = currentChunkCount;
+      completer.complete();
+    }).toJS;
     txn.onerror = ((web.Event e) =>
         completer.completeError('Failed to flush chunks to IndexedDB')).toJS;
-
-    // Clear dirty state immediately so writes that arrive while the IDB
-    // transaction is in-flight are captured in the next flush().
-    _dirtyChunks.clear();
-    _persistedChunkCount = currentChunkCount;
 
     return completer.future;
   }
@@ -249,6 +263,8 @@ class IndexedDbStorageStrategy implements StorageStrategy {
   @override
   Future<void> close() async {
     await flush();
+    _database?.close();
+    _database = null;
   }
 
   @override

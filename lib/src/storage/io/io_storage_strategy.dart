@@ -33,16 +33,10 @@ class IoStorageStrategy implements StorageStrategy {
     // open, so we must read the length first via a stat() call, not via the
     // RandomAccessFile handle.
     final preOpenSize = await dbFile.length();
-    // On Android and iOS, FileMode.append causes corruption because setPosition()
-    // is ignored for writes — all writes are forced to EOF regardless of position.
-    // On Windows, FileMode.write truncates the file (CreateAlways), losing all data.
-    // Solution: use FileMode.append on non-mobile platforms (no truncation, random
-    // writes work via setPosition), and FileMode.write on mobile (no O_APPEND flag,
-    // random writes work, and O_CREAT without O_TRUNC doesn't truncate on POSIX).
-    final mode = (Platform.isAndroid || Platform.isIOS)
-        ? FileMode.write
-        : FileMode.append;
-    _file = await dbFile.open(mode: mode);
+    // Open in append mode to avoid truncation, but then use setPosition() 
+    // for random access. FileMode.write truncates existing files.
+    _file = await dbFile.open(mode: FileMode.append);
+    await _file!.setPosition(0);
     _cachedSize = preOpenSize;
 
     // Acquire an exclusive file lock (blocks other processes)
@@ -101,8 +95,8 @@ class IoStorageStrategy implements StorageStrategy {
 
     await _file!.setPosition(offset);
     final buf = Uint8List(size);
-    final fileSize = await _file!.length();
-    final available = fileSize - offset;
+    // Use the tracked size — _file.length() is an fstat(2) syscall per read.
+    final available = _cachedSize - offset;
     if (available <= 0) return buf;
 
     final toRead = available < size ? available : size;
@@ -121,14 +115,13 @@ class IoStorageStrategy implements StorageStrategy {
 
   @override
   Future<void> flush() async {
-    // flush() on RandomAccessFile only empties the Dart/OS userspace buffer.
-    // We additionally call flushSync() which maps to fdatasync(2) on POSIX and
-    // FlushFileBuffers() on Windows, ensuring data reaches the storage device
-    // before we return.  This is critical for WAL durability guarantees.
+    // RandomAccessFile.flush() already issues fsync(2) on POSIX and
+    // FlushFileBuffers() on Windows (verified in the Dart SDK: File::Flush),
+    // so data reaches the storage device. The old extra flushSync() caused a
+    // SECOND fsync per call AND blocked the isolate — removed.
     final f = _file;
     if (f != null) {
       await f.flush();
-      try { f.flushSync(); } catch (_) {} // best-effort: older SDKs may not have it
     }
   }
 

@@ -1,3 +1,78 @@
+## 0.2.8 
+
+### Bugfix & Performance Release — full audit (see `FIX_PLAN.md`)
+
+**Data correctness (critical):**
+- **FIX - B-Tree `rangeSearch` off-by-one**: the last document was lost when the internal separator equaled the upper bound (e.g. after `insertAll` of 229/458/... docs, `getAll()` returned N-1).
+- **FIX - `BufferedStorageStrategy`**: coalescing discarded recent writes contained within another write (silent corruption).
+- **FIX - `PageManager`**: a stale dirty page could overwrite newer data; batch rollbacks no longer bypass the WAL.
+- **FIX - `EncryptedStorageStrategy(WalStorageStrategy)`**: the WAL was not detected through the encrypted wrapper (no real atomicity and ~2.5× fsyncs).
+- **FIX - Per-instance `QueryCache`**: no more result contamination between FastDB instances.
+- **FIX - Unindexed conditions**: now perform a full scan with in-memory filtering (previously silently dropped, returning incorrect results).
+
+**Durability/consistency (high):** read-your-writes in WAL transactions (and `_findById` consults `_batchEntries`), `delete()` flushes on web, header saved before flush, IndexedDB fail-closed with dirty chunk retries, cache keys free of type collisions, aliasing removed (immutable query results), int64 serialization in `SortedIndex`/`BitmaskIndex`, `_writeValue` fails fast on unsupported types, `CompositeIndex` with collision-free keys (requires automatic rebuild), `count()` consistent with pagination, `upsert` respects manual ids.
+
+**API/indexes (medium):** `watch()` without duplicate emissions and with wildcard for condition-less queries, `not()` propagated to `isNull/isNotNull/alwaysTrue`, `put()` rejects ids < 1, unified numeric comparator (`1 == 1.0`) without crashes on mixed types, idempotent `add()` across all indexes, `bulkLoad` tolerates out-of-order/duplicate input, `transaction()` rollback reverts secondary indexes, page free-list (file no longer grows monotonically on merges/rebuilds).
+
+**Performance:** eliminated the fsync storm (double fsync + checkpoint per commit), streaming WAL (large imports without OOM), `autoCompactThreshold` actually disabled by default (was ~22 ms/delete in benchmarks), amortized operation log checkpoint and cleanup on close, table-driven CRC32 (4-8×), bulk index `deserialize` (startup without O(n²)), dead Bloom filter removed, `_applySort` O(k log k), concurrent `find()`, page free-list.
+
+**Serialization/security:** `DateTime` preserves `isUtc` in TypeAdapters, `\u0000` sentinels escaped, `aes256KeyFromPassword` rejects empty passwords, `typeId` 256 reserved.
+
+**Minor breaking changes:** `findIds()` results are immutable (copy with `.toList()` if you need to mutate them); `put()` throws `ArgumentError` on ids < 1; `HashIndex.mightContainValue` removed along with the Bloom filter; `CompositeIndex` blobs persisted with the old format are discarded and automatically rebuilt on open.
+
+## 0.2.7
+
+## Usage Update
+- **CHANGED — Native Internal ID Migrated to `ffdbID`**: The database now stores its internal numeric ID in the `ffdbID` key instead of `id`. This safely fully segregates FastDB IDs from user IDs (like Firebase `id`), eliminating the need for `_originalId` workarounds. Legacy documents with `id` are migrated automatically on read.
+
+## 0.2.6
+
+### Reliability and Usage Updates
+
+- **NEW — Sequential operation log for write recovery**: Added a `.log` sidecar file that records `insert`, `put`, `update`, and `delete` operations before applying them to the main database. Pending operations are replayed automatically on startup after an interrupted write.
+- **IMPROVED — Native `Uint8List` storage**: Binary payloads are now stored as raw bytes in the main database format instead of being encoded as Base64 strings, reducing storage overhead and improving large-binary performance.
+- **CHANGED — Single-owner native access model**: Removed the transparent multi-isolate socket proxy path. On native platforms, a database file is now documented and treated as having one active owner at a time.
+- **FIX — Safer close/write synchronization**: Close now waits behind the write lock so shutdown cannot race with pending exclusive writes.
+- **FIX — Safer storage opening semantics**: Native file opening now avoids truncation while still resetting the cursor for random-access writes.
+
+## 0.2.5
+
+### Bug Fixes (B-Tree Corruption & Recovery)
+
+- **FIX — Added cycle detection to B-Tree traversal**: B-Tree traversal functions (`searchSync`, `search`, `_countLeafEntries`, `_extractLeafEntries`) now detect circular page references (cycles). If a cycle is detected, the function immediately returns `null` or throws a `StateError` with a helpful message, preventing infinite loops and StackOverflow errors caused by corrupt index pages.
+- **FIX — Improved WAL recovery error messages**: Enhanced `_recover()` to provide more context when encountering corrupted or truncated WAL entries. Errors now include the offset, size, and type of the problematic entry, aiding in diagnosis.
+- **MODERATE — Updated B-Tree rebuilding logic**: Refined `_rebuild()` to use iterative traversals instead of recursive ones for counting and extracting leaf entries. This prevents StackOverflow errors on very deep index trees.
+
+## 0.2.4
+
+### Bug Fixes (WAL Corruption & Multi-Isolate Stability)
+
+- **CRITICAL — Fixed WAL recovery replaying uncommitted transactions**: The `_recover()` method used a single `hasCommit` flag across the entire WAL file. If TX1 was committed and TX2 was interrupted mid-flight (e.g. app killed), recovery would set `hasCommit = true` and replay **all** entries — including the uncommitted ones from TX2 — silently corrupting the B-Tree. Fixed by tracking `pendingEntries` per transaction: a COMMIT marker moves pending → committed; entries still pending at EOF are discarded.
+- **CRITICAL — WAL now checkpoints after every commit**: Previously the WAL only truncated when it exceeded 1 MB, leaving dozens of committed transactions accumulated in a single file. Combined with the multi-tx recovery bug above, this was the primary source of database corruption on mobile. The WAL is now truncated after every `commit()` call, ensuring it never holds more than one transaction at a time and recovery is instantaneous.
+- **FIX — Stale `.fdb.port` file causes SocketException on reopen**: If the Owner isolate crashed or closed the database without calling `coordinator.stop()`, the `.fdb.port` sidecar file was left on disk. The next `openDatabase()` call would find the port, try to connect, and throw a `SocketException`. Fixed by adding `IsolateCoordinator.isPortAlive()` — a 200 ms probe that verifies the socket is accepting connections before entering proxy mode. Stale port files are deleted automatically.
+- **FIX — `.fdb.port` not cleaned up in tests**: `persistence_test.dart` tearDown/setUp did not include `.fdb.port` in the file cleanup list, causing cross-test contamination when running the full suite. Added to the cleanup set.
+
+---
+
+## 0.1.2
+
+### Bug Fixes (WAL & B-Tree Stability on Mobile)
+
+- **CRITICAL — Fixed infinite loop in WAL binary recovery on Android/iOS**: When a COMMIT marker's trailing 4-byte CRC was truncated (i.e. the file ended between the 25-byte header and its checksum), `_recover()` advanced `offset` only inside the `if (offset + 4 <= raw.length)` guard, then `continue`-d back to the `while` — re-matching the same magic bytes forever. Fixed by moving `offset += 4` outside the `if` so the parser always advances past the COMMIT entry, even when truncated.
+- **CRITICAL — Fixed Stack Overflow in `BTree._insertNonFull` on corrupt databases**: The recursive descent could cause a Dart VM stack overflow (~55 000 frames) when B-Tree page pointers formed a cycle due to a previously corrupt WAL recovery. Converted `_insertNonFull` to an **iterative loop** with a `visited` page-index set that detects cycles immediately and throws a clear `StateError` instead of crashing the VM.
+- **FIX — `_WalEntry` truncation check now includes CRC bytes**: The `_kEntryWrite` truncation guard previously checked `offset + length > raw.length`, ignoring the 4 trailing CRC bytes. A write entry whose data fit exactly but left no room for the CRC would throw a `RangeError` inside the `catch (_)` silently. Now checks `offset + length + 4 > raw.length`.
+- **FIX — Unknown WAL entry types now break the parse loop**: Previously an unrecognized `type` byte would leave `offset` unchanged and spin the `while` loop forever. Added an explicit `break` after the `_kEntryWrite` block for unknown types.
+
+---
+
+## 0.1.1
+
+### Bug Fixes
+
+- **FIX — Fixed cumulative sum stream**: Resolved an issue where the reactive stream returned by aggregation watchers was accumulating values across emissions instead of replacing them, causing incorrect cumulative totals on repeated events.
+
+---
+
 ## 0.1.0
 
 ### Stable Public API Release

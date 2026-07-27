@@ -1,5 +1,4 @@
 import 'package:ffastdb/ffastdb.dart';
-import 'dart:async';
 
 void main() async {
   final db = FastDB(MemoryStorageStrategy());
@@ -35,12 +34,12 @@ void main() async {
   
   // First run (cold cache)
   final cold1 = Stopwatch()..start();
-  final result1 = await query1();
+  await query1();
   cold1.stop();
   
   // Second run (hot cache) - should be much faster
   final hot1 = Stopwatch()..start();
-  final result2 = await query1();
+  await query1();
   hot1.stop();
   
   final cacheSpeedup = cold1.elapsedMicroseconds / hot1.elapsedMicroseconds;
@@ -83,7 +82,6 @@ void main() async {
   
   // Sequential fetch (before optimization)
   final sqlCityQuery = db.query().where('city').equals('London');
-  final ids = sqlCityQuery.findIds();
   
   final batchSw = Stopwatch()..start();
   final docs = await db.query().where('city').equals('London').find();

@@ -14,6 +14,8 @@ class _StorageManager {
     _db._writeInt32(header, 8, _db._nextId);
     _db._writeInt32(header, 12, _db._schemaVersion);
     await _db.storage.write(0, header);
+    // Persist the free-page list alongside (bytes 25+; no-op unless changed).
+    await _db._pageManager.persistFreeList();
   }
 
   /// Persists all secondary indexes to storage using typeTag serialization.
@@ -146,6 +148,13 @@ class _StorageManager {
   }
 
   /// Compacts the database by removing deleted entries and rewriting all data.
+  ///
+  /// ⚠️ CRASH SAFETY: compaction rewrites data in place (single-file mode
+  /// truncates to the header page first; dual-file mode rewrites the data
+  /// file from offset 0). A crash MID-compact can lose data. Run compact()
+  /// only at controlled points (app startup, maintenance windows), ideally
+  /// after a successful close+reopen cycle. Full copy-compaction
+  /// (new file + atomic rename) is tracked as future work — see FIX_PLAN.md.
   Future<void> compactImpl() async {
     final allIds = await _db._primaryIndex.rangeSearch(1, _db._nextId - 1);
     if (allIds.isEmpty) return;
@@ -193,6 +202,7 @@ class _StorageManager {
 
       await _db.storage.truncate(PageManager.pageSize); // keep only the header page
       _db._pageManager.clearCache();                    // discard all cached/dirty B-Tree pages
+      _db._pageManager.clearFreeList();                 // free pages no longer exist post-truncate
       _db._primaryIndex.clearNodeCache();
       _db._primaryIndex.rootPage = null;                // force a fresh root on first insert
       for (final idx in _db._secondaryIndexes.values) idx.clear();

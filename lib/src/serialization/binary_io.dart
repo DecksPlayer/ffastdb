@@ -10,6 +10,7 @@ const int _typeList = 4;
 const int _typeMap = 5;
 const int _typeDouble = 6;
 const int _typeDateTime = 7;
+const int _typeByteList = 8;
 
 class FastBinaryWriter implements BinaryWriter {
   final BytesBuilder _builder = BytesBuilder();
@@ -88,7 +89,9 @@ class FastBinaryWriter implements BinaryWriter {
     } else if (value is DateTime) {
       writeUint8(_typeDateTime);
       final bd = ByteData(8);
-      final ms = value.millisecondsSinceEpoch;
+      // Stored as UTC epoch ms so the read side can rebuild with isUtc:true
+      // (round trip preserves both the instant and the isUtc flag).
+      final ms = value.toUtc().millisecondsSinceEpoch;
       final lo = ms & 0xFFFFFFFF;
       final loUnsigned = lo < 0 ? lo + 0x100000000 : lo;
       final hi = (ms - loUnsigned) ~/ 0x100000000;
@@ -96,9 +99,8 @@ class FastBinaryWriter implements BinaryWriter {
       bd.setInt32(4, hi, Endian.little);
       _builder.add(bd.buffer.asUint8List());
     } else if (value is Uint8List) {
-      writeUint8(_typeString);
-      // Encode as Base64 string so it round-trips cleanly
-      writeString('\u0000bl:${base64Encode(value)}');
+      writeUint8(_typeByteList);
+      writeByteList(value);
     } else {
       // Try Firebase duck-typing before giving up.
       // 1) Timestamp → DateTime
@@ -234,7 +236,10 @@ class FastBinaryReader implements BinaryReader {
         final dtLoUnsigned = dtLo < 0 ? dtLo + 0x100000000 : dtLo;
         final dtHi = bdDt.getInt32(4, Endian.little);
         return DateTime.fromMillisecondsSinceEpoch(
-            dtHi * 0x100000000 + dtLoUnsigned);
+            dtHi * 0x100000000 + dtLoUnsigned,
+            isUtc: true);
+      case _typeByteList:
+        return readByteList();
       default:
         throw UnsupportedError('Unsupported type ID: $type');
     }

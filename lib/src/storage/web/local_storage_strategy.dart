@@ -56,15 +56,18 @@ class LocalStorageStrategy extends WebStorageStrategy {
   @override
   Future<void> flush() async {
     if (!_dirty) return;
-    _dirty = false;
     final sz = await size;
     if (sz == 0) {
       web.window.localStorage.removeItem(_lsKey);
+      _dirty = false;
       return;
     }
     final snapshot = await read(0, sz);
     try {
       web.window.localStorage.setItem(_lsKey, base64Encode(snapshot));
+      // Clear the flag ONLY after a successful persist — otherwise a
+      // QuotaExceededError would lose the dirty state and never retry.
+      _dirty = false;
     } catch (_) {
       // localStorage throws QuotaExceededError (~5 MB limit per origin).
       // Surface a clear message instead of a silent data-loss failure.

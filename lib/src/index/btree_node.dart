@@ -62,20 +62,32 @@ class BTreeNode {
     final isLeaf = bd.getUint8(0) == 1;
     final count = bd.getUint32(1, Endian.little);
 
+    // Corruption guards: a page can never hold more than kMaxKeys keys, and
+    // the buffer must contain all declared keys/values. A corrupt count
+    // previously caused a massive allocation (OOM) or silently zero-filled
+    // keys/values, masking the corruption.
+    if (count > kMaxKeys) {
+      throw StateError(
+          'BTreeNode: corrupt page $pageIndex (numKeys=$count > $kMaxKeys)');
+    }
+    final valCount = isLeaf ? count : count + 1;
+    final needed = 5 + count * 4 + valCount * 8;
+    if (data.length < needed) {
+      throw StateError(
+          'BTreeNode: truncated page $pageIndex (needs $needed bytes, got ${data.length})');
+    }
+
     // Pre-allocate with the known count to avoid repeated List growths.
     final keys = List<int>.filled(count, 0, growable: true);
-    final valCount = isLeaf ? count : count + 1;
     final values = List<int>.filled(valCount, 0, growable: true);
 
     int off = 5;
     for (int i = 0; i < count; i++) {
-      if (off + 4 > data.length) break;
       keys[i] = bd.getUint32(off, Endian.little);
       off += 4;
     }
 
     for (int i = 0; i < valCount; i++) {
-      if (off + 8 > data.length) break;
       final lo = bd.getUint32(off, Endian.little);
       final hi = bd.getUint32(off + 4, Endian.little);
       values[i] = lo | (hi << 32);

@@ -52,6 +52,13 @@ class BitmaskIndex implements SecondaryIndex {
   void add(int docId, dynamic fieldValue) {
     if (fieldValue == null || docId < 0) return;
 
+    // Idempotency: re-adding a docId under a different value first clears
+    // the stale bit — add() is safe without a prior remove().
+    final existing = _reverse[docId];
+    if (existing != null && existing != fieldValue) {
+      remove(docId, existing);
+    }
+
     if (docId >= _maxDocId) _grow(docId + 1);
 
     _bitsets.putIfAbsent(fieldValue, () => Uint32List(_wordCount));
@@ -131,9 +138,36 @@ class BitmaskIndex implements SecondaryIndex {
   List<int> lookup(dynamic value) {
     final bitset = _bitsets[value];
     if (bitset == null) return const [];
-    // Return cached list when available — avoids rebuilding on every repeated query.
-    return _lookupCache[value] ??= _bitsToList(bitset, _highestDocId);
+    // Return a COPY of the cached list — callers mutating the result would
+    // otherwise corrupt the shared cache (and lookupCount with it).
+    final cached = _lookupCache[value] ??= _bitsToList(bitset, _highestDocId);
+    return List<int>.of(cached);
   }
+
+  @override
+  int lookupCount(dynamic value) {
+    final cached = _lookupCache[value];
+    if (cached != null) return cached.length;
+    final bitset = _bitsets[value];
+    if (bitset == null) return 0;
+
+    if (_highestDocId < 0) return 0;
+    final wordLimit = (_highestDocId >> 5) + 1;
+    final limit = wordLimit < bitset.length ? wordLimit : bitset.length;
+
+    int count = 0;
+    for (int i = 0; i < limit; i++) {
+      int word = bitset[i];
+      while (word != 0) {
+        word &= word - 1;
+        count++;
+      }
+    }
+    return count;
+  }
+
+  @override
+  dynamic valueOf(int docId) => _reverse[docId];
 
   @override
   List<int> range(dynamic low, dynamic high) {
@@ -306,6 +340,11 @@ class BitmaskIndex implements SecondaryIndex {
           return s;
         case 4:
           return bytes[off++] == 1;
+        case 5:
+          // 64-bit int (new writes); legacy tag 1 (int32) still read above.
+          final lo = readInt32();
+          final hi = readInt32();
+          return lo | (hi << 32);
         default:
           return null;
       }
@@ -330,8 +369,14 @@ class BitmaskIndex implements SecondaryIndex {
 
   void _writeValue(BytesBuilder buf, dynamic v) {
     if (v is int) {
-      buf.addByte(1);
-      _writeInt32(buf, v);
+      if (v >= -2147483648 && v <= 2147483647) {
+        buf.addByte(1); // legacy int32 tag — compact & backward compatible
+        _writeInt32(buf, v);
+      } else {
+        buf.addByte(5); // int64 tag (same as HashIndex) — >2^31 values were
+        // silently truncated before.
+        _writeInt64(buf, v);
+      }
     } else if (v is double) {
       buf.addByte(2);
       final bd = ByteData(8);
@@ -345,7 +390,23 @@ class BitmaskIndex implements SecondaryIndex {
     } else if (v is bool) {
       buf.addByte(4);
       buf.addByte(v ? 1 : 0);
+    } else {
+      // Fail fast: writing nothing (not even the tag) desynchronizes the
+      // reader and corrupts the whole index blob silently.
+      throw ArgumentError(
+          'BitmaskIndex: unsupported value type for serialization: ${v.runtimeType}');
     }
+  }
+
+  void _writeInt64(BytesBuilder buf, int v) {
+    buf.addByte(v & 0xFF);
+    buf.addByte((v >> 8) & 0xFF);
+    buf.addByte((v >> 16) & 0xFF);
+    buf.addByte((v >> 24) & 0xFF);
+    buf.addByte((v >> 32) & 0xFF);
+    buf.addByte((v >> 40) & 0xFF);
+    buf.addByte((v >> 48) & 0xFF);
+    buf.addByte((v >> 56) & 0xFF);
   }
 
   void _writeInt32(BytesBuilder buf, int v) {

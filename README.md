@@ -1,4 +1,4 @@
-# FastDB 🚀 `v0.1.0`
+# FFastDB 🚀 `v0.2.6`
 
 A high-performance, pure-Dart NoSQL database for Flutter & server-side Dart.
 
@@ -11,6 +11,7 @@ A high-performance, pure-Dart NoSQL database for Flutter & server-side Dart.
 
 | Feature | FastDB | Hive | Isar |
 |---|---|---|---|
+| Sequential operation log | ✅ | ❌ | ❌ |
 | Pure Dart | ✅ | ✅ | ❌ (native) |
 | No code generation | ✅ | ❌ | ❌ |
 | B-Tree primary index | ✅ | ❌ | ✅ |
@@ -18,7 +19,7 @@ A high-performance, pure-Dart NoSQL database for Flutter & server-side Dart.
 | Write-Ahead Log (WAL) | ✅ | ❌ | ✅ |
 | Crash recovery | ✅ | ❌ | ✅ |
 | File locking | ✅ | ❌ | ✅ |
-| Fluent QueryBuilder | ✅ | ❌ | ✅ |
+| Fluent QueryBuilder | ✅ | ✅ | ✅ |
 | Reactive watchers | ✅ | ✅ | ✅ |
 | Transactions | ✅ | ❌ | ✅ |
 | `DateTime` support | ✅ | ✅ | ✅ |
@@ -31,8 +32,12 @@ A high-performance, pure-Dart NoSQL database for Flutter & server-side Dart.
 
 ```yaml
 dependencies:
-  ffastdb: ^0.1.0
+  ffastdb: ^0.2.6
 ```
+
+> **Native isolate note:** Transparent write proxying between isolates was removed.
+> On Android, iOS, macOS, Linux, and Windows, treat a database file as having a
+> single active owner at a time.
 
 ### Open a database
 
@@ -229,7 +234,7 @@ FastDB supports all common Dart and Firebase data types with automatic serializa
 - **Primitives**: `int`, `double`, `String`, `bool`, `null`
 - **Date/Time**: `DateTime` (stored as milliseconds since epoch)
 - **Collections**: `List`, `Map` (with any nesting level)
-- **Binary**: `Uint8List`
+- **Binary**: `Uint8List` (stored natively as raw bytes in the main database file)
 - **Firebase types** (via duck-typing, no imports needed):
   - `Timestamp` → `DateTime`
   - `GeoPoint` → `Map<String, double>` with `latitude`/`longitude`
@@ -531,11 +536,16 @@ FastDB
 │   ├── HashIndex    — O(1) exact-match
 │   ├── SortedIndex  — O(log n) range / sortBy
 │   └── BitmaskIndex — bitwise AND for boolean / enum fields
+├── Sequential Operation Log (Sequential Registry)
+│   ├── Operations logged BEFORE applying to main DB
+│   ├── Atomic replay on startup if interruption occurs
+│   └── Optimized for large binary data (no Base64 overhead)
 ├── LRU Page Cache (configurable RAM budget)
-│   └── Default: 256 pages = 1 MB RAM
+│   └── Default: 2048 pages = 8 MB RAM
 ├── WAL (Write-Ahead Log)
 │   ├── CRC32 checksums per entry AND per document
-│   ├── Atomic COMMIT markers
+│   ├── Per-transaction COMMIT markers (uncommitted entries discarded on recovery)
+│   ├── Checkpoint after every commit (WAL never holds more than 1 transaction)
 │   └── Auto crash recovery on open()
 ├── BufferedStorageStrategy
 │   └── Write coalescing (~9x faster bulk inserts)
@@ -564,14 +574,27 @@ Benchmarks on a mid-range device (in-memory storage):
 
 ---
 
+## Sequential Operation Log (Operation Registry)
+
+FastDB uses a high-level sequential operation log to guarantee document-level atomicity even during catastrophic failures (app crashes, power loss).
+
+1. **Log First**: Every write operation (`insert`, `put`, `update`, `delete`) is serialized and appended to a `.log` sidecar file *before* the main database index or files are modified.
+2. **Commit**: Once the operation is successfully persisted to the main file (and the WAL is committed), the log is cleared.
+3. **Automatic Recovery**: If the app restarts and finds a non-empty log, it automatically re-applies the pending operations to ensure the database matches the user's intent.
+
+This "sequential registry" approach ensures that you never lose a document even if the B-Tree indexing is interrupted.
+
+---
+
 ## File Structure
 
 For a database at path `/data/users.db`, FastDB creates:
 
 ```
-/data/users.db      ← Main database file (FDB2 format)
-/data/users.db.wal  ← Write-Ahead Log (deleted after checkpoint)
-/data/users.db.lock ← Process lock file (deleted on close)
+/data/users.db       ← Main database file (FDB2 format)
+/data/users.db.wal   ← Write-Ahead Log (deleted after checkpoint)
+/data/users.db.log   ← Sequential Operation Log (sequential registry)
+/data/users.db.lock  ← Process lock file (deleted on close)
 ```
 
 ---

@@ -43,10 +43,23 @@ class SortedIndex implements SecondaryIndex {
     }
   }
 
+  /// Unified total order, consistent with HashIndex equality:
+  ///  - nums compare numerically (1 == 1.0, never throws on int/double mix)
+  ///  - strings compare lexicographically, booleans false < true
+  ///  - mixed types order by type rank (num < String < bool < other) and
+  ///    NEVER throw — a schemaless DB must not crash on mixed-type fields.
   static int _compare(dynamic a, dynamic b) {
-    if (a is Comparable && b is Comparable) return a.compareTo(b);
+    if (a is num && b is num) return a.compareTo(b);
+    if (a is String && b is String) return a.compareTo(b);
+    if (a is bool && b is bool) return a == b ? 0 : (a ? 1 : -1);
+    final ra = _typeRank(a);
+    final rb = _typeRank(b);
+    if (ra != rb) return ra.compareTo(rb);
     return a.toString().compareTo(b.toString());
   }
+
+  static int _typeRank(dynamic v) =>
+      v is num ? 0 : v is String ? 1 : v is bool ? 2 : 3;
 
   /// Binary search for the first occurrence of `key` (lower bound).
   int _lowerBound(dynamic key) {
@@ -86,6 +99,13 @@ class SortedIndex implements SecondaryIndex {
   @override
   void add(int docId, dynamic fieldValue) {
     if (fieldValue == null) return;
+
+    // Idempotency: re-adding a docId under a different value first removes
+    // the stale entry — add() is safe without a prior remove().
+    final existing = _reverse[docId];
+    if (existing != null && _compare(existing, fieldValue) != 0) {
+      remove(docId, existing);
+    }
 
     // Check if docId is already indexed for this value to avoid duplicates
     int start = _lowerBound(fieldValue);
@@ -152,8 +172,21 @@ class SortedIndex implements SecondaryIndex {
   List<int> lookup(dynamic value) {
     int start = _lowerBound(value);
     int end = _upperBound(value);
-    return Uint32List.sublistView(_docIds, start, end);
+    // MUST return a copy (like range()/greaterThan()/lessThan() do): a
+    // sublistView aliases the internal buffer — callers mutating the result
+    // (e.g. .sort()) or later index writes would corrupt shared state.
+    return Uint32List.fromList(Uint32List.sublistView(_docIds, start, end));
   }
+
+  @override
+  int lookupCount(dynamic value) {
+    int start = _lowerBound(value);
+    int end = _upperBound(value);
+    return end - start;
+  }
+
+  @override
+  dynamic valueOf(int docId) => _reverse[docId];
 
   @override
   Iterable<int> search(String operator, dynamic value) {
@@ -187,14 +220,20 @@ class SortedIndex implements SecondaryIndex {
       if (value is! String || value.isEmpty) return all();
       // O(log n) binary prefix scan.
       // All strings starting with `prefix` lie in the sorted range
-      // [prefix, nextPrefix), where nextPrefix increments the last code unit.
+      // [prefix, nextPrefix), where nextPrefix increments the last code unit
+      // that is NOT 0xFFFF (trailing 0xFFFFs are trimmed first). If the whole
+      // prefix is 0xFFFFs there is no upper bound — scan to the end.
       final start = _lowerBound(value);
-      final lastCode = value.codeUnitAt(value.length - 1);
-      // Compute exclusive upper bound; guard against overflow at max code unit.
-      final upperBound = lastCode < 0xFFFF
-          ? value.substring(0, value.length - 1) + String.fromCharCode(lastCode + 1)
-          : value.substring(0, value.length - 1);
-      final end = upperBound.isEmpty ? _length : _lowerBound(upperBound);
+      int cut = value.length;
+      while (cut > 0 && value.codeUnitAt(cut - 1) == 0xFFFF) cut--;
+      final int end;
+      if (cut == 0) {
+        end = _length;
+      } else {
+        final upperBound = value.substring(0, cut - 1) +
+            String.fromCharCode(value.codeUnitAt(cut - 1) + 1);
+        end = _lowerBound(upperBound);
+      }
       if (start >= end) return [];
       return List<int>.from(Uint32List.sublistView(_docIds, start, end));
     }
@@ -324,8 +363,14 @@ class SortedIndex implements SecondaryIndex {
 
   void _writeValue(BytesBuilder buf, dynamic v) {
     if (v is int) {
-      buf.addByte(1);
-      _writeInt32(buf, v);
+      if (v >= -2147483648 && v <= 2147483647) {
+        buf.addByte(1); // legacy int32 tag — compact & backward compatible
+        _writeInt32(buf, v);
+      } else {
+        buf.addByte(5); // int64 tag (same as HashIndex) — timestamps in
+        // micros/nanos and other >2^31 values were silently truncated before.
+        _writeInt64(buf, v);
+      }
     } else if (v is double) {
       buf.addByte(2);
       final bd = ByteData(8);
@@ -339,7 +384,23 @@ class SortedIndex implements SecondaryIndex {
     } else if (v is bool) {
       buf.addByte(4);
       buf.addByte(v ? 1 : 0);
+    } else {
+      // Fail fast: writing nothing (not even the tag) desynchronizes the
+      // reader and corrupts the whole index blob silently.
+      throw ArgumentError(
+          'SortedIndex: unsupported value type for serialization: ${v.runtimeType}');
     }
+  }
+
+  void _writeInt64(BytesBuilder buf, int v) {
+    buf.addByte(v & 0xFF);
+    buf.addByte((v >> 8) & 0xFF);
+    buf.addByte((v >> 16) & 0xFF);
+    buf.addByte((v >> 24) & 0xFF);
+    buf.addByte((v >> 32) & 0xFF);
+    buf.addByte((v >> 40) & 0xFF);
+    buf.addByte((v >> 48) & 0xFF);
+    buf.addByte((v >> 56) & 0xFF);
   }
 
   void _writeInt32(BytesBuilder buf, int v) {
@@ -374,6 +435,11 @@ class SortedIndex implements SecondaryIndex {
           off += sLen;
           return s;
         case 4: return bytes[off++] == 1;
+        case 5:
+          // 64-bit int (new writes); legacy tag 1 (int32) still read above.
+          final lo = readInt32();
+          final hi = readInt32();
+          return lo | (hi << 32);
         default: return null;
       }
     }
@@ -384,12 +450,44 @@ class SortedIndex implements SecondaryIndex {
 
     final index = SortedIndex(fieldName);
     final entryCount = readInt32();
+
+    // Pass 1: walk the blob only counting ids, to pre-size the flat arrays.
+    // Pass 2 fills the arrays directly (entries are already in ascending key
+    // order — serialize() writes them sorted). The old add()-per-document
+    // restore was O(n²) on low-cardinality indexes (each add range-scans the
+    // run of equal keys).
+    int totalIds = 0;
+    final dataStart = off;
+    for (int i = 0; i < entryCount; i++) {
+      final tag = bytes[off++];
+      switch (tag) {
+        case 1: off += 4;
+        case 2: case 5: off += 8;
+        case 3: off += readInt32();
+        case 4: off += 1;
+      }
+      final idCount = readInt32();
+      totalIds += idCount;
+      off += idCount * 4;
+    }
+    off = dataStart;
+
+    if (totalIds > index._capacity) {
+      index._capacity = totalIds;
+      index._docIds = Uint32List(index._capacity);
+      index._keys = List<dynamic>.filled(index._capacity, null);
+    }
+
     for (int i = 0; i < entryCount; i++) {
       final value = readValue();
       final idCount = readInt32();
       for (int j = 0; j < idCount; j++) {
         final docId = readInt32();
-        if (value != null) index.add(docId, value);
+        if (value == null) continue;
+        index._docIds[index._length] = docId;
+        index._keys[index._length] = value;
+        index._length++;
+        index._reverse[docId] = value;
       }
     }
     return index;
