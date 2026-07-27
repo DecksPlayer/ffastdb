@@ -485,7 +485,10 @@ class FastDB {
               await _putImpl(op.id!, op.data);
               break;
             case 'update':
-              await _crudOps.updateImpl(op.id!, op.data as Map<String, dynamic>);
+              await _crudOps.updateImpl(
+                op.id!,
+                op.data as Map<String, dynamic>,
+              );
               break;
             case 'delete':
               await _crudOps.deleteImpl(op.id!);
@@ -564,8 +567,7 @@ class FastDB {
     String uniqueField,
     dynamic value,
     Map<String, dynamic> fields,
-  ) =>
-      _exclusive(() => _crudOps.upsertWhereImpl(uniqueField, value, fields));
+  ) => _exclusive(() => _crudOps.upsertWhereImpl(uniqueField, value, fields));
 
   /// Hive-style put with manual key.
   Future<void> put(int id, dynamic value) {
@@ -760,8 +762,13 @@ class FastDB {
   /// The returned builder has access to [QueryBuilder.find] and
   /// [QueryBuilder.findFirst] which resolve full documents without
   /// requiring a manual `findById` loop.
-  QueryBuilder query() =>
-      QueryBuilder(_secondaryIndexes, _findById, _rangeSearch, watch, _queryCache);
+  QueryBuilder query() => QueryBuilder(
+    _secondaryIndexes,
+    _findById,
+    _rangeSearch,
+    watch,
+    _queryCache,
+  );
 
   Future<List<dynamic>> findWhere(
     Future<List<int>> Function(QueryBuilder q) fn,
@@ -800,7 +807,13 @@ class FastDB {
     FutureOr<List<int>> Function(QueryBuilder q) queryFn,
   ) => _exclusive(
     () async => (await queryFn(
-      QueryBuilder(_secondaryIndexes, _findById, _rangeSearch, null, _queryCache),
+      QueryBuilder(
+        _secondaryIndexes,
+        _findById,
+        _rangeSearch,
+        null,
+        _queryCache,
+      ),
     )).length,
   );
 
@@ -809,7 +822,13 @@ class FastDB {
     String field,
   ) => _exclusive(() async {
     final ids = await queryFn(
-      QueryBuilder(_secondaryIndexes, _findById, _rangeSearch, null, _queryCache),
+      QueryBuilder(
+        _secondaryIndexes,
+        _findById,
+        _rangeSearch,
+        null,
+        _queryCache,
+      ),
     );
     num total = 0;
     final idx = _secondaryIndexes[field];
@@ -835,7 +854,13 @@ class FastDB {
     String field,
   ) => _exclusive(() async {
     final ids = await queryFn(
-      QueryBuilder(_secondaryIndexes, _findById, _rangeSearch, null, _queryCache),
+      QueryBuilder(
+        _secondaryIndexes,
+        _findById,
+        _rangeSearch,
+        null,
+        _queryCache,
+      ),
     );
     if (ids.isEmpty) return null;
     num total = 0;
@@ -869,14 +894,21 @@ class FastDB {
     String field,
   ) => _exclusive(() async {
     final ids = await queryFn(
-      QueryBuilder(_secondaryIndexes, _findById, _rangeSearch, null, _queryCache),
+      QueryBuilder(
+        _secondaryIndexes,
+        _findById,
+        _rangeSearch,
+        null,
+        _queryCache,
+      ),
     );
     dynamic min;
     final idx = _secondaryIndexes[field];
     if (idx != null) {
       for (final id in ids) {
         final v = idx.valueOf(id);
-        if (v != null && (min == null || (v as Comparable).compareTo(min) < 0)) {
+        if (v != null &&
+            (min == null || (v as Comparable).compareTo(min) < 0)) {
           min = v;
         }
       }
@@ -898,14 +930,21 @@ class FastDB {
     String field,
   ) => _exclusive(() async {
     final ids = await queryFn(
-      QueryBuilder(_secondaryIndexes, _findById, _rangeSearch, null, _queryCache),
+      QueryBuilder(
+        _secondaryIndexes,
+        _findById,
+        _rangeSearch,
+        null,
+        _queryCache,
+      ),
     );
     dynamic max;
     final idx = _secondaryIndexes[field];
     if (idx != null) {
       for (final id in ids) {
         final v = idx.valueOf(id);
-        if (v != null && (max == null || (v as Comparable).compareTo(max) > 0)) {
+        if (v != null &&
+            (max == null || (v as Comparable).compareTo(max) > 0)) {
           max = v;
         }
       }
@@ -929,7 +968,13 @@ class FastDB {
     if (_isClosed)
       throw StateError('Cannot perform operations on a closed database.');
     final ids = await queryFn(
-      QueryBuilder(_secondaryIndexes, _findById, _rangeSearch, null, _queryCache),
+      QueryBuilder(
+        _secondaryIndexes,
+        _findById,
+        _rangeSearch,
+        null,
+        _queryCache,
+      ),
     );
     for (final id in ids) {
       final doc = await _findById(id);
@@ -998,7 +1043,9 @@ class FastDB {
           if (stream != null && idx != null) {
             stream.add(idx.all());
           } else if (stream != null) {
-            _primaryIndex.rangeSearch(1, _nextId - 1, skipDedupe: true).then((ids) {
+            _primaryIndex.rangeSearch(1, _nextId - 1, skipDedupe: true).then((
+              ids,
+            ) {
               if (!stream.isClosed) stream.add(ids);
             });
           }
@@ -1176,7 +1223,15 @@ class FastDB {
     FutureOr<List<int>> Function(QueryBuilder q) queryFn,
   ) => _exclusive(() async {
     final ids = List<int>.from(
-      await queryFn(QueryBuilder(_secondaryIndexes, _findById, _rangeSearch, null, _queryCache)),
+      await queryFn(
+        QueryBuilder(
+          _secondaryIndexes,
+          _findById,
+          _rangeSearch,
+          null,
+          _queryCache,
+        ),
+      ),
     );
     if (ids.isEmpty) return 0;
     final wal = _wal;

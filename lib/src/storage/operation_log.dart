@@ -11,12 +11,7 @@ class LoggedOp {
   final dynamic data;
   final int timestamp;
 
-  LoggedOp({
-    required this.type,
-    this.id,
-    this.data,
-    required this.timestamp,
-  });
+  LoggedOp({required this.type, this.id, this.data, required this.timestamp});
 
   Map<String, dynamic> toJson() => {
     't': type,
@@ -59,9 +54,7 @@ class OperationLog {
 
   OperationLog(this.path) : _enabled = true;
 
-  OperationLog.disabled()
-      : path = '',
-        _enabled = false;
+  OperationLog.disabled() : path = '', _enabled = false;
 
   Future<void> open() async {
     if (!_enabled) return;
@@ -84,7 +77,8 @@ class OperationLog {
     if (data is Map) {
       encodedData = {
         '\u0000fs': base64Encode(
-            FastSerializer.serialize(Map<String, dynamic>.from(data)))
+          FastSerializer.serialize(Map<String, dynamic>.from(data)),
+        ),
       };
     }
 
@@ -95,12 +89,15 @@ class OperationLog {
       timestamp: DateTime.now().millisecondsSinceEpoch,
     );
 
-    final jsonStr = jsonEncode(op.toJson(), toEncodable: (val) {
-      if (val is Uint8List) {
-        return '\u0000bl:${base64Encode(val)}';
-      }
-      return val.toString();
-    });
+    final jsonStr = jsonEncode(
+      op.toJson(),
+      toEncodable: (val) {
+        if (val is Uint8List) {
+          return '\u0000bl:${base64Encode(val)}';
+        }
+        return val.toString();
+      },
+    );
 
     final bytes = utf8.encode(jsonStr);
     final lenHeader = Uint8List(4);
@@ -128,10 +125,11 @@ class OperationLog {
       final bytes = await _file!.readAsBytes();
       int offset = 0;
       while (offset + 4 <= bytes.length) {
-        final len = bytes[offset] |
-                    (bytes[offset + 1] << 8) |
-                    (bytes[offset + 2] << 16) |
-                    (bytes[offset + 3] << 24);
+        final len =
+            bytes[offset] |
+            (bytes[offset + 1] << 8) |
+            (bytes[offset + 2] << 16) |
+            (bytes[offset + 3] << 24);
         offset += 4;
         if (offset + len > bytes.length) break;
 
@@ -145,7 +143,8 @@ class OperationLog {
         final d = raw['d'];
         if (d is Map && d.length == 1 && d['\u0000fs'] is String) {
           raw['d'] = FastSerializer.deserialize(
-              base64Decode(d['\u0000fs'] as String));
+            base64Decode(d['\u0000fs'] as String),
+          );
         }
         ops.add(LoggedOp.fromJson(raw));
       }
