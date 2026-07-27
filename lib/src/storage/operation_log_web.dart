@@ -7,5 +7,6 @@ class OperationLog {
   Future<void> log(String type, {int? id, dynamic data}) async {}
   Future<dynamic> readAll() async => [];
   Future<void> clear() async {}
+  Future<void> maybeCheckpoint() async {}
   Future<void> close() async {}
 }

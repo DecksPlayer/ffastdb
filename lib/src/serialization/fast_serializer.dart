@@ -18,6 +18,14 @@ class FastSerializer {
   static const _blPrefix = '\u0000bl:'; // Blob / Uint8List  → base64
 
   static Object? _toEncodable(Object? value) {
+    if (value == null) return null;
+
+    // Escape user strings that begin with \u0000 so they can never be
+    // misread as sentinel-typed values (dt:/gp:/dr:/bl:) on the read side.
+    if (value is String && value.startsWith('\u0000')) {
+      return '\u0000$value';
+    }
+
     // ── Dart native ──────────────────────────────────────────────────────────
     if (value is DateTime) {
       return '$_dtPrefix${value.toUtc().toIso8601String()}';
@@ -26,30 +34,30 @@ class FastSerializer {
       return '$_blPrefix${base64Encode(value)}';
     }
 
-    // ── Firebase: Timestamp (has .toDate() → DateTime) ───────────────────────
-    try {
-      final dt = (value as dynamic).toDate() as DateTime;
-      return '$_dtPrefix${dt.toUtc().toIso8601String()}';
-    } catch (_) {}
-
-    // ── Firebase: GeoPoint (has .latitude & .longitude) ──────────────────────
-    try {
-      final lat = ((value as dynamic).latitude as num).toDouble();
-      final lng = ((value as dynamic).longitude as num).toDouble();
-      return '$_gpPrefix$lat,$lng';
-    } catch (_) {}
-
-    // ── Firebase: DocumentReference (has .path → String) ─────────────────────
-    try {
-      final path = (value as dynamic).path as String;
-      return '$_drPrefix$path';
-    } catch (_) {}
-
-    // ── Firebase: Blob (has .bytes → Uint8List) ───────────────────────────────
-    try {
-      final bytes = (value as dynamic).bytes as Uint8List;
-      return '$_blPrefix${base64Encode(bytes)}';
-    } catch (_) {}
+    // Check type names to avoid slow try-catch exceptions for non-Firebase custom objects
+    final typeStr = value.runtimeType.toString();
+    if (typeStr == 'Timestamp' || typeStr.endsWith('Timestamp')) {
+      try {
+        final dt = (value as dynamic).toDate() as DateTime;
+        return '$_dtPrefix${dt.toUtc().toIso8601String()}';
+      } catch (_) {}
+    } else if (typeStr == 'GeoPoint' || typeStr.endsWith('GeoPoint')) {
+      try {
+        final lat = ((value as dynamic).latitude as num).toDouble();
+        final lng = ((value as dynamic).longitude as num).toDouble();
+        return '$_gpPrefix$lat,$lng';
+      } catch (_) {}
+    } else if (typeStr == 'DocumentReference' || typeStr.endsWith('DocumentReference')) {
+      try {
+        final path = (value as dynamic).path as String;
+        return '$_drPrefix$path';
+      } catch (_) {}
+    } else if (typeStr == 'Blob' || typeStr.endsWith('Blob')) {
+      try {
+        final bytes = (value as dynamic).bytes as Uint8List;
+        return '$_blPrefix${base64Encode(bytes)}';
+      } catch (_) {}
+    }
 
     // ── Last resort: stringify so the document never crashes ──────────────────
     return value.toString();
@@ -62,6 +70,10 @@ class FastSerializer {
   /// Walks a decoded JSON value and restores all sentinel-encoded types.
   static dynamic revive(dynamic v) {
     if (v is String) {
+      // Unescape user strings that started with \u0000 (escaped at write).
+      if (v.startsWith('\u0000\u0000')) {
+        return v.substring(1);
+      }
       if (v.startsWith(_dtPrefix)) {
         return DateTime.parse(v.substring(_dtPrefix.length));
       }

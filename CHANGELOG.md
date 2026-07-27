@@ -1,3 +1,25 @@
+## 0.2.8 
+
+### Bugfix & Performance Release — full audit (see `FIX_PLAN.md`)
+
+**Data correctness (critical):**
+- **FIX - B-Tree `rangeSearch` off-by-one**: the last document was lost when the internal separator equaled the upper bound (e.g. after `insertAll` of 229/458/... docs, `getAll()` returned N-1).
+- **FIX - `BufferedStorageStrategy`**: coalescing discarded recent writes contained within another write (silent corruption).
+- **FIX - `PageManager`**: a stale dirty page could overwrite newer data; batch rollbacks no longer bypass the WAL.
+- **FIX - `EncryptedStorageStrategy(WalStorageStrategy)`**: the WAL was not detected through the encrypted wrapper (no real atomicity and ~2.5× fsyncs).
+- **FIX - Per-instance `QueryCache`**: no more result contamination between FastDB instances.
+- **FIX - Unindexed conditions**: now perform a full scan with in-memory filtering (previously silently dropped, returning incorrect results).
+
+**Durability/consistency (high):** read-your-writes in WAL transactions (and `_findById` consults `_batchEntries`), `delete()` flushes on web, header saved before flush, IndexedDB fail-closed with dirty chunk retries, cache keys free of type collisions, aliasing removed (immutable query results), int64 serialization in `SortedIndex`/`BitmaskIndex`, `_writeValue` fails fast on unsupported types, `CompositeIndex` with collision-free keys (requires automatic rebuild), `count()` consistent with pagination, `upsert` respects manual ids.
+
+**API/indexes (medium):** `watch()` without duplicate emissions and with wildcard for condition-less queries, `not()` propagated to `isNull/isNotNull/alwaysTrue`, `put()` rejects ids < 1, unified numeric comparator (`1 == 1.0`) without crashes on mixed types, idempotent `add()` across all indexes, `bulkLoad` tolerates out-of-order/duplicate input, `transaction()` rollback reverts secondary indexes, page free-list (file no longer grows monotonically on merges/rebuilds).
+
+**Performance:** eliminated the fsync storm (double fsync + checkpoint per commit), streaming WAL (large imports without OOM), `autoCompactThreshold` actually disabled by default (was ~22 ms/delete in benchmarks), amortized operation log checkpoint and cleanup on close, table-driven CRC32 (4-8×), bulk index `deserialize` (startup without O(n²)), dead Bloom filter removed, `_applySort` O(k log k), concurrent `find()`, page free-list.
+
+**Serialization/security:** `DateTime` preserves `isUtc` in TypeAdapters, `\u0000` sentinels escaped, `aes256KeyFromPassword` rejects empty passwords, `typeId` 256 reserved.
+
+**Minor breaking changes:** `findIds()` results are immutable (copy with `.toList()` if you need to mutate them); `put()` throws `ArgumentError` on ids < 1; `HashIndex.mightContainValue` removed along with the Bloom filter; `CompositeIndex` blobs persisted with the old format are discarded and automatically rebuilt on open.
+
 ## 0.2.7
 
 ## Usage Update

@@ -9,16 +9,16 @@ class _QueryOperations {
   /// Executes a query using the QueryBuilder DSL.
   /// Optimized with batch document loading for better performance.
   Future<List<dynamic>> findImpl(FutureOr<List<int>> Function(QueryBuilder q) queryFn) async {
-    final builder = QueryBuilder(_db._secondaryIndexes, _db._findById, _db._rangeSearch);
+    final builder = QueryBuilder(_db._secondaryIndexes, _db._findById, _db._rangeSearch, _db.watch, _db._queryCache);
     final ids = await queryFn(builder);
-    return _prefetchDocuments(ids);
+    return findByIdsImpl(ids);
   }
 
   /// Batch-loads documents by ID more efficiently than loading one-by-one.
   /// Uses Future.wait for parallel/concurrent loading when possible.
   /// 
   /// Performance: ~5-10x faster than sequential await for large result sets.
-  Future<List<dynamic>> _prefetchDocuments(List<int> ids) async {
+  Future<List<dynamic>> findByIdsImpl(List<int> ids) async {
     if (ids.isEmpty) return [];
     
     // For small result sets (<50), sequential loading is fine
@@ -60,11 +60,11 @@ class _QueryOperations {
 
   /// Retrieves all documents in the database.
   Future<List<dynamic>> getAllImpl() async {
-    final rawIds = await _db._primaryIndex.rangeSearch(1, _db._nextId - 1);
+    final rawIds = await _db._primaryIndex.rangeSearch(1, _db._nextId - 1, skipDedupe: true);
     // Deduplicate IDs preserving order — guards against B-Tree structural
     // inconsistencies that could cause rangeSearch to return the same ID twice.
     final ids = LinkedHashSet<int>.from(rawIds).toList();
-    return _prefetchDocuments(ids);
+    return findByIdsImpl(ids);
   }
 
   /// Returns the number of live documents.

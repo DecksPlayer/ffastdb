@@ -31,8 +31,12 @@ class CompositeIndex extends SecondaryIndex {
   final List<String> fieldNames;
 
   /// Maps composite keys to document IDs.
-  /// Key format: "field1_value|field2_value|..."
+  /// Key format: type-tagged, length-prefixed (see [_compositeKey]).
   final Map<String, List<int>> _entries = {};
+
+  /// Reverse map: docId → composite key. Enables O(1) removeById and makes
+  /// [add] idempotent (a docId lives under at most ONE composite key).
+  final Map<int, String> _reverse = {};
 
   CompositeIndex(this.fieldNames) : super();
 
@@ -40,10 +44,29 @@ class CompositeIndex extends SecondaryIndex {
   String get fieldName => fieldNames.join('+');
 
   /// Creates a composite key from field values.
+  ///
+  /// Type-tagged, length-prefixed encoding — the previous `join('|')` of
+  /// `toString()` collided on:
+  ///  - delimiter injection: `['a|b','c']` ≡ `['a','b|c']`
+  ///  - type erasure: `1` (int) ≡ `'1'` (String), `1.0` ≡ `'1.0'`
+  ///  - null ≡ the string `'null'`
   static String _compositeKey(List<dynamic> values) {
-    return values
-        .map((v) => v == null ? 'null' : v.toString())
-        .join('|');
+    final sb = StringBuffer();
+    for (final v in values) {
+      if (v == null) {
+        sb.write('N;');
+      } else if (v is int) {
+        sb.write('I$v;');
+      } else if (v is double) {
+        sb.write('D$v;');
+      } else if (v is bool) {
+        sb.write(v ? 'T;' : 'F;');
+      } else {
+        final s = v.toString();
+        sb.write('S${s.length}:$s;');
+      }
+    }
+    return sb.toString();
   }
 
   @override
@@ -53,7 +76,15 @@ class CompositeIndex extends SecondaryIndex {
     if (value.length != fieldNames.length) return;
 
     final key = _compositeKey(value);
+    // Idempotency: re-adding a docId under a different key first removes the
+    // stale entry — add() is safe without a prior remove().
+    final existing = _reverse[docId];
+    if (existing != null) {
+      if (existing == key) return; // already indexed under this key
+      _removeFromKey(docId, existing);
+    }
     _entries.putIfAbsent(key, () => []).add(docId);
+    _reverse[docId] = key;
   }
 
   @override
@@ -73,26 +104,18 @@ class CompositeIndex extends SecondaryIndex {
   }
 
   @override
-  List<int> all() {
-    final results = <int>{};
-    for (final ids in _entries.values) {
-      results.addAll(ids);
-    }
-    return results.toList();
-  }
+  dynamic valueOf(int docId) => null;
 
   @override
-  int get size {
-    final results = <int>{};
-    for (final ids in _entries.values) {
-      results.addAll(ids);
-    }
-    return results.length;
-  }
+  List<int> all() => _reverse.keys.toList();
+
+  @override
+  int get size => _reverse.length; // O(1) — was O(N) over all entries
 
   @override
   void clear() {
     _entries.clear();
+    _reverse.clear();
   }
 
   @override
@@ -122,6 +145,10 @@ class CompositeIndex extends SecondaryIndex {
     if (value.length != fieldNames.length) return;
 
     final key = _compositeKey(value);
+    _removeFromKey(docId, key);
+  }
+
+  void _removeFromKey(int docId, String key) {
     final ids = _entries[key];
     if (ids != null) {
       ids.remove(docId);
@@ -129,22 +156,26 @@ class CompositeIndex extends SecondaryIndex {
         _entries.remove(key);
       }
     }
+    if (_reverse[docId] == key) _reverse.remove(docId);
   }
 
   @override
   void removeById(int docId) {
-    // Remove from all entries
-    for (final ids in _entries.values) {
-      ids.remove(docId);
-    }
-    // Clean up empty entries
-    _entries.removeWhere((key, ids) => ids.isEmpty);
+    // O(1) via reverse map — was O(total entries) scanning every key list.
+    final key = _reverse[docId];
+    if (key != null) _removeFromKey(docId, key);
   }
 
   // ─── Persistence ──────────────────────────────────────────────────────────
 
+  /// Format magic: [0xC1, major]. Blobs without this magic (pre-v2 format,
+  /// which serialized ambiguous `join('|')` keys) are rejected so that
+  /// `_loadIndexes` discards them and they get rebuilt with collision-free keys.
+  static const List<int> _kMagic = [0xC1, 0x02];
+
   Uint8List serialize() {
     final buf = BytesBuilder();
+    buf.add(_kMagic); // format version
     _writeInt32(buf, fieldNames.length);
     for (final f in fieldNames) {
       final fBytes = Uint8List.fromList(utf8.encode(f));
@@ -175,6 +206,14 @@ class CompositeIndex extends SecondaryIndex {
       return v;
     }
 
+    // Reject pre-v2 blobs (ambiguous key format): the caller (_loadIndexes)
+    // catches this and rebuilds the index from live documents.
+    if (bytes.length < 2 || bytes[0] != _kMagic[0] || bytes[1] != _kMagic[1]) {
+      throw const FormatException(
+          'CompositeIndex: stale pre-v2 index format — rebuild required');
+    }
+    off = 2;
+
     final fieldCount = readInt32();
     final fieldNames = <String>[];
     for (int i = 0; i < fieldCount; i++) {
@@ -196,6 +235,10 @@ class CompositeIndex extends SecondaryIndex {
         ids.add(readInt32());
       }
       index._entries[key] = ids;
+      // Rebuild the reverse map (docId → composite key).
+      for (final id in ids) {
+        index._reverse[id] = key;
+      }
     }
     return index;
   }

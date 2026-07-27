@@ -37,15 +37,15 @@ void main() async {
 
   // ── Query with secondary indexes ──────────────────────────────────────────
   // All people in Paris (hash index equality)
-  final parisIds = db.query().where('city').equals('Paris').findIds();
+  final parisIds = await db.query().where('city').equals('Paris').findIds();
   print('People in Paris (IDs): $parisIds');
 
   // People aged 25–30 (sorted index range)
-  final ageIds = db.query().where('age').between(25, 30).findIds();
+  final ageIds = await db.query().where('age').between(25, 30).findIds();
   print('People aged 25–30 (IDs): $ageIds');
 
   // Sorted by age descending, limit 2
-  final topTwo = db.query()
+  final topTwo = await db.query()
       .where('age').greaterThan(0)
       .sortBy('age', descending: true)
       .limit(2)

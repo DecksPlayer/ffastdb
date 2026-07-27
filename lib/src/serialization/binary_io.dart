@@ -89,7 +89,9 @@ class FastBinaryWriter implements BinaryWriter {
     } else if (value is DateTime) {
       writeUint8(_typeDateTime);
       final bd = ByteData(8);
-      final ms = value.millisecondsSinceEpoch;
+      // Stored as UTC epoch ms so the read side can rebuild with isUtc:true
+      // (round trip preserves both the instant and the isUtc flag).
+      final ms = value.toUtc().millisecondsSinceEpoch;
       final lo = ms & 0xFFFFFFFF;
       final loUnsigned = lo < 0 ? lo + 0x100000000 : lo;
       final hi = (ms - loUnsigned) ~/ 0x100000000;
@@ -234,7 +236,8 @@ class FastBinaryReader implements BinaryReader {
         final dtLoUnsigned = dtLo < 0 ? dtLo + 0x100000000 : dtLo;
         final dtHi = bdDt.getInt32(4, Endian.little);
         return DateTime.fromMillisecondsSinceEpoch(
-            dtHi * 0x100000000 + dtLoUnsigned);
+            dtHi * 0x100000000 + dtLoUnsigned,
+            isUtc: true);
       case _typeByteList:
         return readByteList();
       default:

@@ -14,10 +14,18 @@ class _BatchOperations {
     const chunkSize = 5000;
     
     _db._enableWriteBehind();
+    // Checkpoint pre-existing dirty pages BEFORE the batch (and its WAL tx):
+    // the failure path discards dirty pages, which must contain ONLY batch
+    // writes, never earlier committed state.
+    await _db._pageManager.flushDirty();
     _db._batchMode = true;
     _db._batchEntries.clear();
 
     final ids = List<int>.generate(docs.length, (i) => _db._nextId++);
+
+    // Save B-Tree state so a failed batch can be rolled back in memory too
+    // (the WAL rollback only discards the on-disk writes).
+    final savedRoot = _db._primaryIndex.rootPage;
 
     try {
       if (!_db._inTransaction && _db._wal != null) await _db._wal!.beginTransaction();
@@ -71,7 +79,7 @@ class _BatchOperations {
       await _db.dataStorage?.flush();
       await _db.storage.flush();
       await _db._saveHeader();
-      QueryBuilder.clearCache();
+      _db._queryCache.clear();
       _db._disableWriteBehind();
       
       if (!_db._inTransaction && wal != null) await wal.commit();
@@ -84,6 +92,16 @@ class _BatchOperations {
       _db._batchMode = false;
       _db._batchEntries.clear();
       _db._disableWriteBehind();
+      // Roll back in-memory state: discard dirty pages from the failed batch
+      // (they would bypass the WAL rollback on the next flushDirty) and
+      // restore the B-Tree root so stale nodes are not reachable.
+      _db._pageManager.clearDirtyPages();
+      _db._pageManager.clearLruCache();
+      _db._primaryIndex.rootPage = savedRoot;
+      _db._primaryIndex.clearNodeCache();
+      // Revert _nextId so failed batch IDs are not burned... unless the batch
+      // ran inside a transaction, which manages its own rollback.
+      if (!_db._inTransaction) _db._nextId = ids.first;
       if (!_db._inTransaction && _db._wal != null) await _db._wal!.rollback();
       rethrow;
     }

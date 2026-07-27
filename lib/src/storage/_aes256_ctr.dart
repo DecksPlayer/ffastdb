@@ -221,7 +221,10 @@ void aes256CtrXor(Uint32List rk, Uint8List nonce12, int offset, Uint8List data) 
 Uint8List aes256KeyFromPassword(String password) {
   final units = password.codeUnits;
   final key   = Uint8List(32);
-  if (units.isEmpty) return key; // all-zero key — caller should avoid this
+  if (units.isEmpty) {
+    // An empty password previously produced an all-zero key SILENTLY.
+    throw ArgumentError('encryptionKey must not be empty');
+  }
   for (int i = 0; i < 32; i++) {
     key[i] = units[i % units.length] & 0xff;
   }

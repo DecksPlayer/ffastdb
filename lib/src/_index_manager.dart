@@ -106,17 +106,17 @@ class IndexManager {
         final doc = await _db.findById(allIds[i]);
         if (doc is Map) {
           final castedDoc = Map<String, dynamic>.from(doc);
-          final val = castedDoc[field];
+          final val = _extractField(castedDoc, field);
           if (val != null) idx.add(allIds[i], val);
         }
         if (i > 0 && i % 250 == 0) await Future.delayed(Duration.zero);
       }
       // Invalidate query cache since the index was rebuilt
-      QueryBuilder.clearCache();
+      _db._queryCache.clear();
     } else {
       await rebuildSecondaryIndexes();
       // Invalidate query cache since all indexes were rebuilt
-      QueryBuilder.clearCache();
+      _db._queryCache.clear();
     }
   }
 
@@ -124,13 +124,13 @@ class IndexManager {
   void indexDocument(int id, Map<String, dynamic> doc) {
     for (final idx in _db._secondaryIndexes.values) {
       if (idx is CompositeIndex) {
-        final values = idx.fieldNames.map((f) => doc[f]).toList();
+        final values = idx.fieldNames.map((f) => _extractField(doc, f)).toList();
         // Only index if at least one field is present (to allow partial composites)
         if (values.any((v) => v != null)) {
           idx.add(id, values);
         }
       } else {
-        final val = doc[idx.fieldName];
+        final val = _extractField(doc, idx.fieldName);
         if (val != null) idx.add(id, val);
       }
     }
@@ -140,15 +140,27 @@ class IndexManager {
   void removeDocument(int id, Map<String, dynamic> doc) {
     for (final idx in _db._secondaryIndexes.values) {
       if (idx is CompositeIndex) {
-        final values = idx.fieldNames.map((f) => doc[f]).toList();
+        final values = idx.fieldNames.map((f) => _extractField(doc, f)).toList();
         if (values.any((v) => v != null)) {
           idx.remove(id, values);
         }
       } else {
-        final val = doc[idx.fieldName];
+        final val = _extractField(doc, idx.fieldName);
         if (val != null) idx.remove(id, val);
       }
     }
+  }
+
+  dynamic _extractField(Map<String, dynamic> doc, String fieldPath) {
+    if (!fieldPath.contains('.')) return doc[fieldPath];
+    
+    final parts = fieldPath.split('.');
+    dynamic current = doc;
+    for (final part in parts) {
+      if (current is! Map) return null;
+      current = current[part];
+    }
+    return current;
   }
 
   /// Rebuilds all secondary indexes from live documents.

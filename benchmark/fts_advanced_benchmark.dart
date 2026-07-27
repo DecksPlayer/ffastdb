@@ -20,7 +20,6 @@ void main() async {
   ];
 
   print('Seeding $docCount documents with varied content...');
-  final random = DateTime.now().millisecondsSinceEpoch;
   
   for (int i = 0; i < docCount; i++) {
     final wordSet = wordLists[i % wordLists.length];
@@ -59,7 +58,7 @@ void main() async {
     final containsTimes = <int>[];
     for (int i = 0; i < 5; i++) {
       final sw = Stopwatch()..start();
-      final results = await db.query().where('description').contains(query).find();
+      await db.query().where('description').contains(query).find();
       sw.stop();
       containsTimes.add(sw.elapsedMicroseconds);
     }
@@ -68,7 +67,7 @@ void main() async {
     final ftsTimes = <int>[];
     for (int i = 0; i < 5; i++) {
       final sw = Stopwatch()..start();
-      final results = await db.query().where('description').fts(query).find();
+      await db.query().where('description').fts(query).find();
       sw.stop();
       ftsTimes.add(sw.elapsedMicroseconds);
     }
@@ -92,7 +91,7 @@ void main() async {
   for (int i = 0; i < 10; i++) {
     final sw = Stopwatch()..start();
     // FTS with prefix (if implemented)
-    final results = await db.query()
+    await db.query()
       .where('description')
       .contains('londonist') // Simulating prefix search
       .find();

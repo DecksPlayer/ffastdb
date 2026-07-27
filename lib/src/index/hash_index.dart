@@ -1,7 +1,6 @@
 import 'dart:convert';
 import 'dart:typed_data';
 import 'secondary_index.dart';
-import 'bloom_filter.dart';
 
 // Value type tags for binary serialization
 const int _tInt = 1;    // legacy: 32-bit int — kept for reading old index blobs
@@ -21,20 +20,14 @@ class HashIndex implements SecondaryIndex {
   static const int _initialBuckets = 256; // Power of 2 for fast modulo
   late List<List<_HashEntry>> _buckets;
   int _bucketCount = _initialBuckets;
-  
+
   /// Reverse map: docId → fieldValue for O(1) removeById.
   final Map<int, dynamic> _reverse = {};
   int _size = 0;
-
-  /// Bloom Filter for fast "definitely not contains" checks on negative queries.
-  /// Dramatically speeds up queries like: .where('status').not().equals('inactive')
-  late BloomFilter<String> _bloomFilter;
+  List<int>? _allCache;
 
   HashIndex(this.fieldName) {
     _buckets = List.generate(_bucketCount, (_) => <_HashEntry>[]);
-    // Create Bloom Filter with ~1% false positive rate
-    // Assumes up to 100k unique values per field
-    _bloomFilter = BloomFilter<String>(expectedSize: 100000, falsePositiveRate: 0.01);
   }
 
   // ─── FNV-1a Hash Function ─────────────────────────────────────────────────
@@ -42,20 +35,22 @@ class HashIndex implements SecondaryIndex {
   /// Fast FNV-1a hash with better distribution than Dart's default hashCode
   int _hash(dynamic value) {
     if (value == null) return 0;
-    
+
     // FNV-1a constants
     const int fnvPrime = 16777619;
     int hash = 2166136261;
-    
-    if (value is int) {
-      hash ^= value & 0xFF;
-      hash *= fnvPrime;
-      hash ^= (value >> 8) & 0xFF;
-      hash *= fnvPrime;
-      hash ^= (value >> 16) & 0xFF;
-      hash *= fnvPrime;
-      hash ^= (value >> 24) & 0xFF;
-      hash *= fnvPrime;
+
+    if (value is num) {
+      // Numeric values hash by mathematical value: in Dart, equal nums have
+      // equal hashCodes (1.hashCode == (1.0).hashCode), and int.hashCode is
+      // the int itself. Mixing all 8 bytes also fixes the old 32-bit-only
+      // mixing that collided every 64-bit timestamp into the same buckets.
+      int h = value.hashCode;
+      for (int i = 0; i < 8; i++) {
+        hash ^= h & 0xFF;
+        hash *= fnvPrime;
+        h >>= 8;
+      }
     } else if (value is String) {
       for (int i = 0; i < value.length; i++) {
         hash ^= value.codeUnitAt(i);
@@ -69,7 +64,7 @@ class HashIndex implements SecondaryIndex {
       hash ^= (code >> 8) & 0xFF;
       hash *= fnvPrime;
     }
-    
+
     return hash & 0x7FFFFFFF; // Keep positive
   }
 
@@ -82,14 +77,18 @@ class HashIndex implements SecondaryIndex {
   @override
   void add(int docId, dynamic fieldValue) {
     if (fieldValue == null) return;
-    
+
+    // Idempotency: if this docId is already indexed under a DIFFERENT value,
+    // remove the stale entry first — add() is safe without a prior remove().
+    final existing = _reverse[docId];
+    if (existing != null && !_equals(existing, fieldValue)) {
+      remove(docId, existing);
+    }
+
     final hashCode = _hash(fieldValue);
     final bucketIdx = hashCode & (_bucketCount - 1); // Fast modulo for power of 2
     final bucket = _buckets[bucketIdx];
-    
-    // Add to Bloom Filter for fast negative query optimization
-    _bloomFilter.add(fieldValue.toString());
-    
+
     // Check if value already exists in bucket
     for (final entry in bucket) {
       if (_equals(entry.value, fieldValue)) {
@@ -97,6 +96,7 @@ class HashIndex implements SecondaryIndex {
           entry.docIds.add(docId);
           _reverse[docId] = fieldValue;
           _size++;
+          _allCache = null;
         }
         return;
       }
@@ -106,6 +106,7 @@ class HashIndex implements SecondaryIndex {
     bucket.add(_HashEntry(fieldValue, [docId]));
     _reverse[docId] = fieldValue;
     _size++;
+    _allCache = null;
     
     // Auto-resize if load factor > 0.75
     if (_size > _bucketCount * 0.75) {
@@ -127,6 +128,7 @@ class HashIndex implements SecondaryIndex {
         if (entry.docIds.remove(docId)) {
           _size--;
           _reverse.remove(docId);
+          _allCache = null;
           if (entry.docIds.isEmpty) {
             bucket.removeAt(i);
           }
@@ -146,19 +148,8 @@ class HashIndex implements SecondaryIndex {
   void clear() {
     _buckets = List.generate(_bucketCount, (_) => <_HashEntry>[]);
     _reverse.clear();
-    _bloomFilter.clear();
     _size = 0;
-  }
-
-  /// Checks if a value might be in the index using Bloom Filter.
-  /// Returns false if value is definitely NOT in index.
-  /// Returns true if value might be in index (or false positive).
-  /// 
-  /// Used to optimize negated queries: .where('status').not().equals('inactive')
-  /// If mightContainValue returns false, we can skip the negation logic.
-  bool mightContainValue(dynamic value) {
-    if (value == null) return false;
-    return _bloomFilter.mightContain(value.toString());
+    _allCache = null;
   }
 
   @override
@@ -210,6 +201,25 @@ class HashIndex implements SecondaryIndex {
     return [];
   }
 
+  @override
+  int lookupCount(dynamic value) {
+    if (value == null) return 0;
+    
+    final hashCode = _hash(value);
+    final bucketIdx = hashCode & (_bucketCount - 1);
+    final bucket = _buckets[bucketIdx];
+    
+    for (final entry in bucket) {
+      if (_equals(entry.value, value)) {
+        return entry.docIds.length;
+      }
+    }
+    return 0;
+  }
+
+  @override
+  dynamic valueOf(int docId) => _reverse[docId];
+
   /// Resize hash table when load factor is too high
   void _resize() {
     final oldBuckets = _buckets;
@@ -225,9 +235,12 @@ class HashIndex implements SecondaryIndex {
     }
   }
 
-  /// Fast equality check
+  /// Fast equality check.
+  /// Unified numeric equality: 1 and 1.0 match (mirrors Dart `==` and the
+  /// SortedIndex comparator) — other types require the same runtime type.
   bool _equals(dynamic a, dynamic b) {
     if (identical(a, b)) return true;
+    if (a is num && b is num) return a == b;
     if (a.runtimeType != b.runtimeType) return false;
     return a == b;
   }
@@ -279,8 +292,7 @@ class HashIndex implements SecondaryIndex {
     return result;
   }
 
-  @override
-  List<int> all() {
+  List<int> _buildAll() {
     final result = <int>[];
     for (final bucket in _buckets) {
       for (final entry in bucket) {
@@ -288,6 +300,12 @@ class HashIndex implements SecondaryIndex {
       }
     }
     return result;
+  }
+
+  @override
+  List<int> all() {
+    _allCache ??= _buildAll();
+    return List<int>.from(_allCache!);
   }
 
   @override
@@ -353,6 +371,15 @@ class HashIndex implements SecondaryIndex {
     final index = HashIndex(fieldName);
     final entryCount = readInt32();
 
+    // Pre-size the table for the known entry count — avoids repeated
+    // rehashing via _resize() during the restore.
+    while (entryCount > index._bucketCount * 0.75) {
+      index._bucketCount *= 2;
+    }
+    if (index._bucketCount != index._buckets.length) {
+      index._buckets = List.generate(index._bucketCount, (_) => <_HashEntry>[]);
+    }
+
     for (int i = 0; i < entryCount; i++) {
       final tag = bytes[off++];
       dynamic value;
@@ -386,9 +413,19 @@ class HashIndex implements SecondaryIndex {
       }
 
       final idCount = readInt32();
-      for (int j = 0; j < idCount; j++) {
-        final docId = readInt32();
-        if (value != null) index.add(docId, value);
+      // Bulk restore: each value appears once in the blob and ids are
+      // duplicate-free by construction — insert the bucket entry directly
+      // (the old add()-per-document restore paid O(k) contains() per doc,
+      // O(n·k) total on hot buckets).
+      final ids = <int>[for (int j = 0; j < idCount; j++) readInt32()];
+      if (value != null) {
+        final hashCode = index._hash(value);
+        final bucketIdx = hashCode & (index._bucketCount - 1);
+        index._buckets[bucketIdx].add(_HashEntry(value, ids));
+        for (final id in ids) {
+          index._reverse[id] = value;
+        }
+        index._size += idCount;
       }
     }
     return index;
@@ -413,6 +450,11 @@ class HashIndex implements SecondaryIndex {
     } else if (v is bool) {
       buf.addByte(_tBool);
       buf.addByte(v ? 1 : 0);
+    } else {
+      // Fail fast: writing nothing (not even the tag) desynchronizes the
+      // reader and corrupts the whole index blob silently.
+      throw ArgumentError(
+          'HashIndex: unsupported value type for serialization: ${v.runtimeType}');
     }
   }
 

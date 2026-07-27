@@ -1,5 +1,5 @@
 import 'dart:typed_data';
-import 'package:fastdb/fastdb.dart';
+import 'package:ffastdb/ffastdb.dart';
 import 'dart:io';
 
 void main() async {
@@ -9,7 +9,7 @@ void main() async {
   if (File(dbPath).existsSync()) File(dbPath).deleteSync();
   if (File(walPath).existsSync()) File(walPath).deleteSync();
 
-  final db = await FfastDb.init(
+  final db = await FastDB.init(
     WalStorageStrategy(
       main: IoStorageStrategy(dbPath),
       wal: IoStorageStrategy(walPath),

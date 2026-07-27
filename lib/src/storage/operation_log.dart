@@ -2,6 +2,8 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import '../serialization/fast_serializer.dart';
+
 /// Represents a single database operation in the sequential log.
 class LoggedOp {
   final String type; // 'insert', 'put', 'update', 'delete'
@@ -32,14 +34,28 @@ class LoggedOp {
 }
 
 /// A high-level sequential log for database operations.
-/// 
+///
 /// This ensures that even if the main DB file or index is corrupted,
 /// the last set of operations can be replayed from this log.
+///
+/// Replays are IDEMPOTENT (put/update/delete by id), so entries do not need
+/// to be cleared after every operation — the log is checkpointed
+/// (truncated) only every [_checkpointEvery] durable ops, and flushed every
+/// [_flushEvery] ops. That removes ~4 syscalls per CRUD operation.
 class OperationLog {
   final String path;
   final bool _enabled;
   File? _file;
   IOSink? _sink;
+
+  /// Clear (truncate) the log after this many durable operations.
+  static const int _checkpointEvery = 1000;
+
+  /// Flush the sink every this many logged operations.
+  static const int _flushEvery = 32;
+
+  int _opsSinceClear = 0;
+  int _opsSinceFlush = 0;
 
   OperationLog(this.path) : _enabled = true;
 
@@ -61,16 +77,24 @@ class OperationLog {
     if (!_enabled) return;
     if (_sink == null) return;
 
+    // Map data is serialized with FastSerializer (type-safe: DateTime,
+    // Uint8List, etc. survive the round trip — the old toEncodable fallback
+    // degraded unknown objects to toString()).
+    dynamic encodedData = data;
+    if (data is Map) {
+      encodedData = {
+        '\u0000fs': base64Encode(
+            FastSerializer.serialize(Map<String, dynamic>.from(data)))
+      };
+    }
+
     final op = LoggedOp(
       type: type,
       id: id,
-      data: data,
+      data: encodedData,
       timestamp: DateTime.now().millisecondsSinceEpoch,
     );
 
-    // Use FastSerializer-like encoding if available, but for the log, 
-    // standard JSON is fine as long as we handle Uint8List in toJson.
-    // Actually, we'll use a simple encoding that handles Uint8List.
     final jsonStr = jsonEncode(op.toJson(), toEncodable: (val) {
       if (val is Uint8List) {
         return '\u0000bl:${base64Encode(val)}';
@@ -87,7 +111,12 @@ class OperationLog {
 
     _sink!.add(lenHeader);
     _sink!.add(bytes);
-    await _sink!.flush();
+    // Amortized flush — the WAL already provides crash recovery; this log is
+    // a secondary safety net, so per-op flushing is not required.
+    if (++_opsSinceFlush >= _flushEvery) {
+      await _sink!.flush();
+      _opsSinceFlush = 0;
+    }
   }
 
   /// Reads all pending operations from the log.
@@ -99,9 +128,9 @@ class OperationLog {
       final bytes = await _file!.readAsBytes();
       int offset = 0;
       while (offset + 4 <= bytes.length) {
-        final len = bytes[offset] | 
-                    (bytes[offset + 1] << 8) | 
-                    (bytes[offset + 2] << 16) | 
+        final len = bytes[offset] |
+                    (bytes[offset + 1] << 8) |
+                    (bytes[offset + 2] << 16) |
                     (bytes[offset + 3] << 24);
         offset += 4;
         if (offset + len > bytes.length) break;
@@ -110,8 +139,14 @@ class OperationLog {
         offset += len;
 
         final Map<String, dynamic> raw = jsonDecode(jsonStr);
-        // Revive Uint8List if needed
+        // Revive Uint8List / FastSerializer payloads if needed
         _revive(raw);
+        // FastSerializer-encoded document (type-safe round trip)
+        final d = raw['d'];
+        if (d is Map && d.length == 1 && d['\u0000fs'] is String) {
+          raw['d'] = FastSerializer.deserialize(
+              base64Decode(d['\u0000fs'] as String));
+        }
         ops.add(LoggedOp.fromJson(raw));
       }
     } catch (_) {}
@@ -143,6 +178,7 @@ class OperationLog {
   /// Clears the log (checkpoint).
   Future<void> clear() async {
     if (!_enabled) return;
+    _opsSinceClear = 0;
     await _sink?.close();
     if (_file != null && await _file!.exists()) {
       await _file!.writeAsBytes([]);
@@ -150,8 +186,24 @@ class OperationLog {
     _sink = _file?.openWrite(mode: FileMode.append);
   }
 
+  /// Amortized checkpoint: clears the log only once it has accumulated
+  /// [_checkpointEvery] durable operations — previously every CRUD op paid a
+  /// truncate+reopen (3 syscalls).
+  ///
+  /// Safe because replays are idempotent and entries are only dropped after
+  /// their operation is already durable in the main DB.
+  Future<void> maybeCheckpoint() async {
+    if (!_enabled) return;
+    if (++_opsSinceClear < _checkpointEvery) return;
+    await clear();
+  }
+
   Future<void> close() async {
     if (!_enabled) return;
+    if (_opsSinceFlush > 0) {
+      await _sink?.flush();
+      _opsSinceFlush = 0;
+    }
     await _sink?.close();
     _sink = null;
   }

@@ -93,6 +93,10 @@ class PageManager {
       return _doneFuture;
     } else {
       final offset = pageIndex * pageSize;
+      // Discard any stale dirty copy of this page: without this, a page marked
+      // dirty in write-behind mode and later written through would be flushed
+      // AGAIN by the next flushDirty(), overwriting the newer data on disk.
+      _dirtyPages.remove(pageIndex);
       return storage.write(offset, data);
     }
     // In write-behind mode: disk write is deferred until flushDirty()
@@ -101,9 +105,92 @@ class PageManager {
   /// Pre-allocated completed Future used by write-behind [writePage].
   static final Future<void> _doneFuture = Future.value();
 
+  // ─── Free page list ───────────────────────────────────────────────────────
+
+  /// Pages freed by B-Tree merges/collapses/rebuilds. [allocatePage] reuses
+  /// them before growing the file — without this, the file grew monotonically
+  /// until the next compact().
+  ///
+  /// Persisted in the header page (bytes 25+) on clean shutdowns. After a
+  /// crash the persisted list is IGNORED (the dirty-flag guards it): a stale
+  /// list could hand out pages that are live again — leaking pages is safe,
+  /// reusing live pages is not.
+  final List<int> _freePages = [];
+  bool _freeListDirty = false;
+
+  /// Maximum free-page indexes that fit in the header page at offset 25.
+  static const int maxPersistedFreePages = (pageSize - 25 - 4) ~/ 4; // 1017
+
+  /// Number of pages currently in the free list.
+  int get freePageCount => _freePages.length;
+
+  /// Returns [pageIndex] to the free list for reuse by [allocatePage].
+  void freePage(int pageIndex) {
+    if (pageIndex <= 0) return; // never free the header page
+    _cache.invalidate(pageIndex);
+    _dirtyPages.remove(pageIndex);
+    _freePages.add(pageIndex);
+    _freeListDirty = true;
+  }
+
+  /// Clears the free list (used by compact(), which rebuilds the file).
+  void clearFreeList() {
+    if (_freePages.isEmpty) return;
+    _freePages.clear();
+    _freeListDirty = true;
+  }
+
+  /// Persists the free-page list into the header page at byte offset 25
+  /// (byte 24 is the clean-shutdown flag). No-op unless the list changed.
+  Future<void> persistFreeList() async {
+    if (!_freeListDirty) return;
+    final count = _freePages.length > maxPersistedFreePages
+        ? maxPersistedFreePages
+        : _freePages.length;
+    final bytes = Uint8List(4 + count * 4);
+    final bd = ByteData.view(bytes.buffer);
+    bd.setUint32(0, count, Endian.little);
+    for (int i = 0; i < count; i++) {
+      bd.setUint32(4 + i * 4, _freePages[i], Endian.little);
+    }
+    await storage.write(25, bytes);
+    _freeListDirty = false;
+  }
+
+  /// Loads the persisted free-page list. Must be called ONLY when the file
+  /// was closed cleanly (clean flag set) — see the note on [_freePages].
+  Future<void> loadFreeList() async {
+    _freePages.clear();
+    final head = await storage.read(25, 4);
+    if (head.length < 4) return;
+    final count = ByteData.view(head.buffer).getUint32(0, Endian.little);
+    if (count == 0 || count > maxPersistedFreePages) return;
+    final bytes = await storage.read(29, count * 4);
+    if (bytes.length < count * 4) return;
+    final bd = ByteData.view(bytes.buffer);
+    for (int i = 0; i < count; i++) {
+      _freePages.add(bd.getUint32(i * 4, Endian.little));
+    }
+    _freeListDirty = false;
+  }
+
   // ─── Allocate ─────────────────────────────────────────────────────────────
 
   Future<int> allocatePage() async {
+    // Reuse a freed page before growing the file.
+    if (_freePages.isNotEmpty) {
+      final pageIndex = _freePages.removeLast();
+      _freeListDirty = true;
+      final emptyPage = Uint8List(pageSize);
+      _cache.put(pageIndex, emptyPage);
+      // NOT marked dirty: the subsequent node write marks it. One write less
+      // per page (the zero-fill below only reserves the file space).
+      if (!storage.writeSync(pageIndex * pageSize, emptyPage)) {
+        await storage.write(pageIndex * pageSize, emptyPage);
+      }
+      return pageIndex;
+    }
+
     // Use sync size when available (e.g. MemoryStorageStrategy) to avoid a
     // microtask bounce.  Fall back to async for disk-backed strategies.
     final currentSize = storage.sizeSync ?? await storage.size;
@@ -115,13 +202,10 @@ class PageManager {
     final emptyPage = Uint8List(pageSize);
 
     _cache.put(pageIndex, emptyPage);
-    if (writeBehind) {
-      // In write-behind mode, mark dirty — flushDirty() will write it.
-      // Still write to storage ONLY to reserve the space (bump file size).
-      _dirtyPages[pageIndex] = emptyPage;
-    }
     // Write to storage to reserve the space and increment the tracked file size.
-    // In write-behind mode flushDirty() will overwrite this with the real data.
+    // NOT marked dirty in write-behind mode: the subsequent B-Tree node write
+    // marks the page dirty anyway — the old code also flushed these zeros,
+    // i.e. TWO writes (and two WAL entries) per new page.
     // Use synchronous write when available (e.g. MemoryStorageStrategy) to
     // eliminate one microtask bounce per page allocation.
     if (!storage.writeSync(pageIndex * pageSize, emptyPage)) {
@@ -134,10 +218,28 @@ class PageManager {
   // ─── Cache Management ─────────────────────────────────────────────────────
 
   /// Flushes all dirty pages to disk and clears the dirty set.
+  /// Groups contiguous pages to perform larger, fewer write operations.
   Future<void> flushDirty() async {
-    for (final entry in _dirtyPages.entries) {
-      await storage.write(entry.key * pageSize, entry.value);
+    if (_dirtyPages.isEmpty) return;
+    
+    // Sort pages and group contiguous for a single write per range
+    final sorted = _dirtyPages.entries.toList()
+      ..sort((a, b) => a.key.compareTo(b.key));
+    
+    int rangeStart = sorted.first.key;
+    final rangeData = BytesBuilder();
+    rangeData.add(sorted.first.value);
+    
+    for (int i = 1; i < sorted.length; i++) {
+      if (sorted[i].key == sorted[i - 1].key + 1) {
+        rangeData.add(sorted[i].value); // page is contiguous → merge
+      } else {
+        await storage.write(rangeStart * pageSize, rangeData.takeBytes());
+        rangeStart = sorted[i].key;
+        rangeData.add(sorted[i].value);
+      }
     }
+    await storage.write(rangeStart * pageSize, rangeData.takeBytes());
     _dirtyPages.clear();
   }
 

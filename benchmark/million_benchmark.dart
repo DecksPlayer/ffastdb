@@ -155,7 +155,7 @@ class HashIndex1MBench extends AsyncBenchmarkBase {
   @override
   Future<void> run() async {
     for (int i = 0; i < QUERIES; i++) {
-      db.query().where('city').equals(cities[i % 5]).findIds();
+      await db.query().where('city').equals(cities[i % 5]).findIds();
     }
   }
 }
@@ -185,7 +185,7 @@ class SortedIndexRange1MBench extends AsyncBenchmarkBase {
   @override
   Future<void> run() async {
     for (int i = 0; i < QUERIES; i++) {
-      db.query().where('age').between(25, 35).findIds();
+      await db.query().where('age').between(25, 35).findIds();
     }
   }
 }

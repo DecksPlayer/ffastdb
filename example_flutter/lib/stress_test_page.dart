@@ -3,7 +3,6 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:ffastdb/ffastdb.dart';
 // Internal imports for diagnostics
-import 'package:ffastdb/src/index/secondary_index.dart';
 import 'package:ffastdb/src/index/hash_index.dart';
 import 'package:ffastdb/src/index/sorted_index.dart';
 import 'package:ffastdb/src/index/fts_index.dart';
@@ -104,9 +103,9 @@ class _StressTestPageState extends State<StressTestPage> {
       // 1. Indexes are now globally registered in main.dart
 
       // 2. Create Users
-      _log('👤 Creating 50 users...');
+      _log('👤 Creating 1000 users...');
       final usersToInsert = <Map<String, dynamic>>[];
-      for (int i = 0; i < 50; i++) {
+      for (int i = 0; i < 1000; i++) {
         usersToInsert.add({
           'type': 'user',
           'name': 'User $i',
@@ -279,29 +278,38 @@ class _StressTestPageState extends State<StressTestPage> {
         return '${subjects[random.nextInt(subjects.length)]} ${verbs[random.nextInt(verbs.length)]} ${objects[random.nextInt(objects.length)]}.';
       });
 
-      _log('📝 Creating 2400 posts with 400 possible phrases...');
-      final postsToInsert = <Map<String, dynamic>>[];
-      for (int i = 0; i < 2400; i++) {
-        final uId = userIds[random.nextInt(userIds.length)];
-        final phrase = phrases[random.nextInt(phrases.length)];
-        postsToInsert.add({
-          'type': 'post',
-          'userId': uId,
-          'content': phrase,
-          'likes': random.nextInt(500),
-          'timestamp': DateTime.now()
-              .subtract(Duration(hours: random.nextInt(100)))
-              .millisecondsSinceEpoch,
-        });
-        if (i % 500 == 0) setState(() => _progress = i / 2400 * 0.4);
+      _log('📝 Creating 98000 posts with 400 possible phrases...');
+      final postIds = <int>[];
+      const totalPosts = 98000;
+      const batchSize = 10000;
+      
+      for (int start = 0; start < totalPosts; start += batchSize) {
+        final end = min(start + batchSize, totalPosts);
+        final batchPosts = <Map<String, dynamic>>[];
+        for (int i = start; i < end; i++) {
+          final uId = userIds[random.nextInt(userIds.length)];
+          final phrase = phrases[random.nextInt(phrases.length)];
+          batchPosts.add({
+            'type': 'post',
+            'userId': uId,
+            'content': phrase,
+            'likes': random.nextInt(500),
+            'timestamp': DateTime.now()
+                .subtract(Duration(hours: random.nextInt(100)))
+                .millisecondsSinceEpoch,
+          });
+        }
+        _log('   Inserting posts ${start + 1} to $end...');
+        final ids = await widget.db.insertAll(batchPosts);
+        postIds.addAll(ids);
+        setState(() => _progress = 0.1 + (end / totalPosts) * 0.7); // Progress from 0.1 to 0.8
+        await Future.delayed(Duration.zero);
       }
-      final postIds = await widget.db.insertAll(postsToInsert);
-      setState(() => _progress = 0.5);
 
       // 4. Create Comments
-      _log('💬 Creating 50 comments...');
+      _log('💬 Creating 1000 comments...');
       final commentsToInsert = <Map<String, dynamic>>[];
-      for (int i = 0; i < 50; i++) {
+      for (int i = 0; i < 1000; i++) {
         final pId = postIds[random.nextInt(postIds.length)];
         final uId = userIds[random.nextInt(userIds.length)];
         commentsToInsert.add({
@@ -311,10 +319,10 @@ class _StressTestPageState extends State<StressTestPage> {
           'text': 'Comment #$i on post $pId',
           'timestamp': DateTime.now().millisecondsSinceEpoch,
         });
-        if (i % 25 == 0) setState(() => _progress = 0.5 + (i / 50 * 0.2));
+        if (i % 250 == 0) setState(() => _progress = 0.8 + (i / 1000 * 0.15));
       }
       await widget.db.insertAll(commentsToInsert);
-      setState(() => _progress = 0.8);
+      setState(() => _progress = 0.95);
 
       _log('✨ Complex DB Loaded Successfully!');
       _log('📊 Post-Load Diagnostics:');
@@ -435,49 +443,6 @@ class _StressTestPageState extends State<StressTestPage> {
     return val;
   }
 
-  Future<void> _runComplexSearch() async {
-    _log('🕵️ Running Complex Search...');
-    setState(() => _running = true);
-    try {
-      final results = await widget.db.find((q) {
-        QueryBuilder builder;
-
-        // 1. Start with Type
-        if (_selectedType != 'all') {
-          builder = q.where('type').equals(_selectedType);
-        } else {
-          builder = q.where('type').isNotNull();
-        }
-
-        // 2. Filter by FTS (if text provided)
-        if (_searchController.text.isNotEmpty) {
-          builder = builder.and('content').contains(_searchController.text);
-        }
-
-        // 3. Filter by Popularity (SortedIndex)
-        if (_minLikes > 0) {
-          builder = builder.and('likes').greaterThan(_minLikes.toInt());
-        }
-
-        // 4. Filter by Featured (Bitmask)
-        if (_onlyFeatured) {
-          builder = builder.and('isFeatured').equals(true);
-        }
-
-        return builder.findIds();
-      });
-
-      _log('   Found ${results.length} matches.');
-      setState(() {
-        _searchResults = results;
-        _isStreamingAll = false;
-      });
-    } catch (e) {
-      _log('❌ Search Error: $e');
-    } finally {
-      setState(() => _running = false);
-    }
-  }
 
   void _showStats() {
     _log('📊 DATABASE STATUS:');
@@ -525,7 +490,6 @@ class _StressTestPageState extends State<StressTestPage> {
       }
 
       // Show them in the search results
-      final duplicateIds = <int>[];
       if (duplicates.isNotEmpty) {
         final mostRepeated = duplicates.first.key;
         final matchingIds = await widget.db.find(

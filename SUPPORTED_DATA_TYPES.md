@@ -239,3 +239,9 @@ FastDB convierte automáticamente entre tipos cuando es necesario:
 ## 📝 Ejemplos de Uso
 
 Ver el archivo [test/data_types_test.dart](test/data_types_test.dart) para ejemplos completos de todos los tipos de datos soportados.
+
+## Limitaciones conocidas
+
+- **Enteros > 2^53 en Web**: en dart2js todos los números son IEEE-754 doubles; los `int` con valor absoluto > 9007199254740991 pierden precisión silenciosamente al serializar documentos Map (vía JSON). En VM nativa (Android/iOS/desktop) no aplica. Usa `String` para IDs de 64 bits en Web.
+- **DateTime en TypeAdapters**: se almacena como epoch-ms UTC; al leer se reconstruye con `isUtc: true` (la hora local no se preserva, el instante sí).
+

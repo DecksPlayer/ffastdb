@@ -95,8 +95,8 @@ class IoStorageStrategy implements StorageStrategy {
 
     await _file!.setPosition(offset);
     final buf = Uint8List(size);
-    final fileSize = await _file!.length();
-    final available = fileSize - offset;
+    // Use the tracked size — _file.length() is an fstat(2) syscall per read.
+    final available = _cachedSize - offset;
     if (available <= 0) return buf;
 
     final toRead = available < size ? available : size;
@@ -115,14 +115,13 @@ class IoStorageStrategy implements StorageStrategy {
 
   @override
   Future<void> flush() async {
-    // flush() on RandomAccessFile only empties the Dart/OS userspace buffer.
-    // We additionally call flushSync() which maps to fdatasync(2) on POSIX and
-    // FlushFileBuffers() on Windows, ensuring data reaches the storage device
-    // before we return.  This is critical for WAL durability guarantees.
+    // RandomAccessFile.flush() already issues fsync(2) on POSIX and
+    // FlushFileBuffers() on Windows (verified in the Dart SDK: File::Flush),
+    // so data reaches the storage device. The old extra flushSync() caused a
+    // SECOND fsync per call AND blocked the isolate — removed.
     final f = _file;
     if (f != null) {
       await f.flush();
-      try { f.flushSync(); } catch (_) {} // best-effort: older SDKs may not have it
     }
   }
 

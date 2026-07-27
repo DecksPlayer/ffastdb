@@ -14,11 +14,13 @@ import 'index/bitmask_index.dart';
 import 'index/composite_index.dart';
 import 'index/fts_index.dart';
 import 'query/fast_query.dart';
+import 'query/query_cache.dart';
 import 'serialization/fast_serializer.dart';
 import 'serialization/type_adapter.dart';
 import 'serialization/type_registry.dart';
 import 'index/secondary_index.dart';
 import 'serialization/binary_io.dart';
+import 'crc32.dart' as crc;
 import 'storage/operation_log.dart'
     if (dart.library.js_interop) 'storage/operation_log_web.dart';
 import 'storage/io/io_storage_strategy.dart';
@@ -55,10 +57,18 @@ const bool _runningOnWeb = identical(0, 0.0);
 class FastDB {
   final StorageStrategy storage;
   final StorageStrategy? dataStorage;
+  final String? name;
+  static bool debugQueryPlan = false;
   late PageManager _pageManager;
   late final BTree _primaryIndex;
   final TypeRegistry _registry = TypeRegistry();
   final Map<String, SecondaryIndex> _secondaryIndexes = {};
+
+  /// Per-instance query cache. Injected into every [QueryBuilder] this
+  /// database creates, and cleared on every write. Being per-instance (not
+  /// static) prevents cached results from leaking between FastDB instances
+  /// that run textually identical queries.
+  final QueryCache _queryCache = QueryCache(maxSize: 256);
 
   // Reactive watchers: field → StreamController
   final Map<String, StreamController<List<int>>> _watchers = {};
@@ -68,6 +78,10 @@ class FastDB {
   bool _batchMode = false;
   bool _inTransaction = false;
   int _nextId = 1;
+
+  /// True while replaying the operation log at open() — replayed operations
+  /// must not be logged again (nor checkpoint the log they are reading).
+  bool _isReplayingOpLog = false;
 
   /// Whether this database instance has been closed.
   /// Used to prevent operations on a closed database, especially important
@@ -85,14 +99,16 @@ class FastDB {
   Future<T> _exclusive<T>(Future<T> Function() fn) {
     if (_isClosed) {
       throw StateError(
-        'Bad state: Cannot perform operations on a closed database.',
+        'Bad state: Cannot perform operations on a closed database'
+        '${name != null ? " \"$name\"" : ""}.',
       );
     }
     if (_inTransaction) return fn();
     final next = _writeLock.then((_) async {
       if (_isClosed) {
         throw StateError(
-          'Bad state: Cannot perform operations on a closed database.',
+          'Bad state: Cannot perform operations on a closed database'
+          '${name != null ? " \"$name\"" : ""}.',
         );
       }
       // Synchronize data offset before every exclusive operation to ensure
@@ -119,8 +135,24 @@ class FastDB {
   late final IndexManager _indexMgr;
   late final _StorageManager _storageMgr;
 
-  WalStorageStrategy? get _wal =>
-      storage is WalStorageStrategy ? storage as WalStorageStrategy : null;
+  /// Returns the [WalStorageStrategy] in the storage stack, if any.
+  ///
+  /// The stack may be wrapped (e.g. `EncryptedStorageStrategy(WalStorageStrategy(...))`),
+  /// so we unwrap layers — same traversal as the `_opLog` path resolution in the
+  /// constructor. Without this, an encrypted WAL was silently not detected:
+  /// every internal write opened its own auto-transaction (no atomicity, ~2.5x fsyncs).
+  WalStorageStrategy? get _wal {
+    StorageStrategy? current = storage;
+    while (current != null) {
+      if (current is WalStorageStrategy) return current;
+      if (current is EncryptedStorageStrategy) {
+        current = current.storage;
+      } else {
+        break;
+      }
+    }
+    return null;
+  }
 
   /// Access to index management and statistics.
   IndexManager get indexes => _indexMgr;
@@ -130,7 +162,8 @@ class FastDB {
     this.storage, {
     this.dataStorage,
     int cacheCapacity = 2048,
-    double autoCompactThreshold = double.minPositive,
+    double autoCompactThreshold = 0,
+    this.name,
   }) {
     _autoCompactThreshold = autoCompactThreshold;
     _pageManager = PageManager(storage, cacheCapacity: cacheCapacity);
@@ -176,13 +209,15 @@ class FastDB {
     StorageStrategy storage, {
     StorageStrategy? dataStorage,
     int cacheCapacity = 2048,
-    double autoCompactThreshold = double.minPositive,
+    double autoCompactThreshold = 0,
+    String? name,
   }) {
     return FastDB._internal(
       storage,
       dataStorage: dataStorage,
       cacheCapacity: cacheCapacity,
       autoCompactThreshold: autoCompactThreshold,
+      name: name,
     );
   }
 
@@ -193,13 +228,15 @@ class FastDB {
     StorageStrategy storage, {
     StorageStrategy? dataStorage,
     int cacheCapacity = 2048,
-    double autoCompactThreshold = double.minPositive,
+    double autoCompactThreshold = 0,
+    String? name,
   }) {
     return FastDB._internal(
       storage,
       dataStorage: dataStorage,
       cacheCapacity: cacheCapacity,
       autoCompactThreshold: autoCompactThreshold,
+      name: name,
     );
   }
 
@@ -239,7 +276,7 @@ class FastDB {
     StorageStrategy storage, {
     StorageStrategy? dataStorage,
     int cacheCapacity = 256,
-    double autoCompactThreshold = double.minPositive,
+    double autoCompactThreshold = 0,
     int version = 1,
     Map<int, dynamic Function(dynamic)>? migrations,
     List<String> indexes = const [],
@@ -247,12 +284,14 @@ class FastDB {
     List<String> ftsIndexes = const [],
     List<List<String>> compositeIndexes = const [],
     void Function(double)? onProgress,
+    String? name,
   }) async {
     final db = FastDB._internal(
       storage,
       dataStorage: dataStorage,
       cacheCapacity: cacheCapacity,
       autoCompactThreshold: autoCompactThreshold,
+      name: name,
     );
     // Register indexes BEFORE open() so that _loadIndexes() can match blobs
     // to their correct type, and the singleton is never exposed without indexes.
@@ -347,9 +386,8 @@ class FastDB {
     Map<int, dynamic Function(dynamic)>? migrations,
     void Function(double)? onProgress,
   }) async {
-    // Clear the global query cache when opening a new database.
-    // This prevents query results from one database/test from contaminating another.
-    QueryBuilder.clearCache();
+    // Clear this instance's query cache when (re)opening.
+    _queryCache.clear();
 
     _schemaVersion = version;
     await storage.open();
@@ -390,6 +428,9 @@ class FastDB {
 
       final isClean = header.length >= 25 && header[24] == 0x43;
       if (isClean) {
+        // Restore the free-page list (only trustworthy after a CLEAN shutdown;
+        // a stale list after a crash could hand out live pages).
+        await _pageManager.loadFreeList();
         final loadedKeys = await _loadIndexes();
         final missingKeys = _secondaryIndexes.keys
             .where((k) => !loadedKeys.contains(k))
@@ -427,30 +468,35 @@ class FastDB {
     final ops = await _opLog.readAll();
     if (ops.isEmpty) return;
 
-    for (final op in ops) {
-      try {
-        switch (op.type) {
-          case 'insert':
-            // Use put to ensure the same ID is reused if possible, or just insert
-            if (op.id != null) {
+    _isReplayingOpLog = true;
+    try {
+      for (final op in ops) {
+        try {
+          switch (op.type) {
+            case 'insert':
+              // Use put to ensure the same ID is reused if possible, or just insert
+              if (op.id != null) {
+                await _putImpl(op.id!, op.data);
+              } else {
+                await _crudOps.insertImpl(op.data);
+              }
+              break;
+            case 'put':
               await _putImpl(op.id!, op.data);
-            } else {
-              await _crudOps.insertImpl(op.data);
-            }
-            break;
-          case 'put':
-            await _putImpl(op.id!, op.data);
-            break;
-          case 'update':
-            await _crudOps.updateImpl(op.id!, op.data as Map<String, dynamic>);
-            break;
-          case 'delete':
-            await _crudOps.deleteImpl(op.id!);
-            break;
+              break;
+            case 'update':
+              await _crudOps.updateImpl(op.id!, op.data as Map<String, dynamic>);
+              break;
+            case 'delete':
+              await _crudOps.deleteImpl(op.id!);
+              break;
+          }
+        } catch (_) {
+          // Skip failed replays
         }
-      } catch (_) {
-        // Skip failed replays
       }
+    } finally {
+      _isReplayingOpLog = false;
     }
     await _opLog.clear();
   }
@@ -475,6 +521,10 @@ class FastDB {
       await storage.close();
       await dataStorage?.flush();
       await dataStorage?.close();
+      // Clean shutdown: everything is durable — clear the operation log so
+      // the next open() has nothing to replay (replays after a CLEAN close
+      // would redo already-applied operations, clobbering e.g. migrations).
+      await _opLog.clear();
       await _opLog.close();
       final watchersCopy = _watchers.values.toList();
       _watchers.clear();
@@ -504,6 +554,19 @@ class FastDB {
     return _exclusive(() => _crudOps.insertImpl(doc));
   }
 
+  /// Inserts if it does not exist, updates if it does. Atómico.
+  /// Retorna el ID del documento (existente o nuevo).
+  Future<int> upsert(int id, Map<String, dynamic> fields) =>
+      _exclusive(() => _crudOps.upsertImpl(id, fields));
+
+  /// Upsert basado en campo único (sin conocer el ID interno).
+  Future<int> upsertWhere(
+    String uniqueField,
+    dynamic value,
+    Map<String, dynamic> fields,
+  ) =>
+      _exclusive(() => _crudOps.upsertWhereImpl(uniqueField, value, fields));
+
   /// Hive-style put with manual key.
   Future<void> put(int id, dynamic value) {
     return _exclusive(() => _putImpl(id, value));
@@ -518,6 +581,11 @@ class FastDB {
       _exclusive(() => _batchOps.insertAllImpl(docs));
 
   Future<void> beginBatch() async {
+    // Checkpoint pre-existing dirty pages FIRST. Rollback paths
+    // (transaction/updateWhere/insertAll) discard the dirty pages of the
+    // failed batch — they must contain ONLY batch writes, never earlier
+    // committed state.
+    await _pageManager.flushDirty();
     _batchMode = true;
     _enableWriteBehind(); // Enable write-behind mode for faster B-Tree operations
   }
@@ -560,7 +628,7 @@ class FastDB {
     Map<String, dynamic> fields,
   ) => _exclusive(() async {
     final ids = await queryFn(
-      QueryBuilder(_secondaryIndexes, findById, rangeSearch),
+      QueryBuilder(_secondaryIndexes, findById, rangeSearch, null, _queryCache),
     );
     if (ids.isEmpty) return 0;
 
@@ -598,6 +666,12 @@ class FastDB {
         _batchMode = false;
         _batchEntries.clear();
         _pageManager.writeBehind = false;
+        // Discard dirty pages from the failed batch: otherwise the next
+        // flushDirty() would write stale B-Tree pages on top of the state
+        // restored by the WAL rollback.
+        _pageManager.clearDirtyPages();
+        _pageManager.clearLruCache();
+        _primaryIndex.clearNodeCache();
         // Rollback WAL if necessary (handled by transaction if in transaction)
       }
       rethrow;
@@ -613,7 +687,8 @@ class FastDB {
   /// Executes [fn] as an atomic transaction.
   Future<T> transaction<T>(Future<T> Function() fn) {
     if (_inTransaction) {
-      throw StateError('FastDB: Nested transactions are not supported.');
+      // Join the outer transaction
+      return fn();
     }
     return _exclusive(() async {
       _inTransaction = true;
@@ -621,6 +696,10 @@ class FastDB {
       final savedRoot = _primaryIndex.rootPage;
       final wal = _wal;
 
+      // Checkpoint pre-transaction dirty pages BEFORE opening the WAL tx:
+      // they are committed state and must not join (and be lost with) a
+      // possible rollback.
+      await _pageManager.flushDirty();
       if (wal != null) await wal.beginTransaction();
 
       try {
@@ -633,12 +712,20 @@ class FastDB {
         _nextId = savedNextId;
         _primaryIndex.rootPage = savedRoot;
         if (wal != null) await wal.rollback();
-        // Clear batch entries and CACHE on rollback to prevent them from leaking into next operations
+        // Clear batch entries and CACHE on rollback to prevent them from leaking into next operations.
+        // Dirty pages at this point are transaction-only (pre-tx state was
+        // flushed before opening the tx) — safe to discard. LRU-cached pages
+        // may hold post-tx reads — must be invalidated.
         _batchEntries.clear();
         _batchMode = false;
-        _pageManager.clearCache();
+        _pageManager.clearDirtyPages();
+        _pageManager.clearLruCache();
         _primaryIndex.clearNodeCache();
-        QueryBuilder.clearCache();
+        _queryCache.clear();
+        // Roll back SECONDARY indexes too: aborted operations already mutated
+        // them eagerly. Rebuild from the restored primary index (rollback is
+        // rare — correctness over speed here).
+        await _indexMgr.rebuildSecondaryIndexes();
         rethrow;
       } finally {
         _inTransaction = false;
@@ -652,8 +739,15 @@ class FastDB {
 
   Future<dynamic> _findById(int id) async {
     final offset = await _primaryIndex.search(id);
-    if (offset == null) return null;
-    return _readAt(offset);
+    if (offset != null) return _readAt(offset);
+    // Read-your-writes in batch/transaction mode: pending inserts live in
+    // _batchEntries until bulkLoad() at commit — they are not in the B-Tree yet.
+    if (_batchEntries.isNotEmpty) {
+      for (final e in _batchEntries) {
+        if (e.key == id) return _readAt(e.value);
+      }
+    }
+    return null;
   }
 
   /// Find all documents matching a query.
@@ -667,7 +761,7 @@ class FastDB {
   /// [QueryBuilder.findFirst] which resolve full documents without
   /// requiring a manual `findById` loop.
   QueryBuilder query() =>
-      QueryBuilder(_secondaryIndexes, _findById, _rangeSearch);
+      QueryBuilder(_secondaryIndexes, _findById, _rangeSearch, watch, _queryCache);
 
   Future<List<dynamic>> findWhere(
     Future<List<int>> Function(QueryBuilder q) fn,
@@ -675,6 +769,17 @@ class FastDB {
 
   /// Returns all documents in the database.
   Future<List<dynamic>> getAll() => _exclusive(() => _queryOps.getAllImpl());
+
+  /// Carga múltiples documentos en paralelo. Preserva el orden de [ids].
+  /// Los IDs no encontrados son omitidos del resultado.
+  Future<List<dynamic>> findByIds(List<int> ids) =>
+      _exclusive(() => _queryOps.findByIdsImpl(ids));
+
+  /// Versión tipada de [findByIds].
+  Future<List<T>> findByIdsCast<T>(List<int> ids) async {
+    final docs = await findByIds(ids);
+    return docs.cast<T>();
+  }
 
   /// Returns the number of live documents.
   Future<int> count() => _exclusive(() => _queryOps.countImpl());
@@ -695,7 +800,7 @@ class FastDB {
     FutureOr<List<int>> Function(QueryBuilder q) queryFn,
   ) => _exclusive(
     () async => (await queryFn(
-      QueryBuilder(_secondaryIndexes, _findById, _rangeSearch),
+      QueryBuilder(_secondaryIndexes, _findById, _rangeSearch, null, _queryCache),
     )).length,
   );
 
@@ -704,9 +809,17 @@ class FastDB {
     String field,
   ) => _exclusive(() async {
     final ids = await queryFn(
-      QueryBuilder(_secondaryIndexes, _findById, _rangeSearch),
+      QueryBuilder(_secondaryIndexes, _findById, _rangeSearch, null, _queryCache),
     );
     num total = 0;
+    final idx = _secondaryIndexes[field];
+    if (idx != null) {
+      for (final id in ids) {
+        final v = idx.valueOf(id);
+        if (v is num) total += v;
+      }
+      return total;
+    }
     for (final id in ids) {
       final doc = await _findById(id);
       if (doc is Map<String, dynamic>) {
@@ -722,11 +835,22 @@ class FastDB {
     String field,
   ) => _exclusive(() async {
     final ids = await queryFn(
-      QueryBuilder(_secondaryIndexes, _findById, _rangeSearch),
+      QueryBuilder(_secondaryIndexes, _findById, _rangeSearch, null, _queryCache),
     );
     if (ids.isEmpty) return null;
     num total = 0;
     int count = 0;
+    final idx = _secondaryIndexes[field];
+    if (idx != null) {
+      for (final id in ids) {
+        final v = idx.valueOf(id);
+        if (v is num) {
+          total += v;
+          count++;
+        }
+      }
+      return count == 0 ? null : total / count;
+    }
     for (final id in ids) {
       final doc = await _findById(id);
       if (doc is Map<String, dynamic>) {
@@ -745,9 +869,19 @@ class FastDB {
     String field,
   ) => _exclusive(() async {
     final ids = await queryFn(
-      QueryBuilder(_secondaryIndexes, _findById, _rangeSearch),
+      QueryBuilder(_secondaryIndexes, _findById, _rangeSearch, null, _queryCache),
     );
     dynamic min;
+    final idx = _secondaryIndexes[field];
+    if (idx != null) {
+      for (final id in ids) {
+        final v = idx.valueOf(id);
+        if (v != null && (min == null || (v as Comparable).compareTo(min) < 0)) {
+          min = v;
+        }
+      }
+      return min;
+    }
     for (final id in ids) {
       final doc = await _findById(id);
       if (doc is Map<String, dynamic>) {
@@ -764,9 +898,19 @@ class FastDB {
     String field,
   ) => _exclusive(() async {
     final ids = await queryFn(
-      QueryBuilder(_secondaryIndexes, _findById, _rangeSearch),
+      QueryBuilder(_secondaryIndexes, _findById, _rangeSearch, null, _queryCache),
     );
     dynamic max;
+    final idx = _secondaryIndexes[field];
+    if (idx != null) {
+      for (final id in ids) {
+        final v = idx.valueOf(id);
+        if (v != null && (max == null || (v as Comparable).compareTo(max) > 0)) {
+          max = v;
+        }
+      }
+      return max;
+    }
     for (final id in ids) {
       final doc = await _findById(id);
       if (doc is Map<String, dynamic>) {
@@ -785,7 +929,7 @@ class FastDB {
     if (_isClosed)
       throw StateError('Cannot perform operations on a closed database.');
     final ids = await queryFn(
-      QueryBuilder(_secondaryIndexes, _findById, _rangeSearch),
+      QueryBuilder(_secondaryIndexes, _findById, _rangeSearch, null, _queryCache),
     );
     for (final id in ids) {
       final doc = await _findById(id);
@@ -823,9 +967,46 @@ class FastDB {
     yield* _watchers[field]!.stream;
   }
 
+  /// Stream de documentos completos cuando el campo indexado cambia.
+  Stream<List<dynamic>> watchDocs(String field) =>
+      watch(field).asyncMap((ids) => findByIds(ids));
+
+  /// Versión tipada de [watchDocs].
+  Stream<List<T>> watchDocsCast<T>(String field) =>
+      watchDocs(field).map((docs) => docs.cast<T>());
+
   void _notifyWatchers(dynamic doc) {
     if (_batchMode) return;
-    _notifyWatchersBatch();
+    if (doc is Map<String, dynamic>) {
+      // Notify only watchers whose field was modified in doc,
+      // or if it has a nested/dot field whose prefix field was modified
+      for (final field in _watchers.keys) {
+        bool shouldNotify = false;
+        // '' is the wildcard used by QueryBuilder.watch() with no conditions:
+        // it must be notified on EVERY write.
+        if (field.isEmpty || doc.containsKey(field)) {
+          shouldNotify = true;
+        } else if (field.contains('.')) {
+          final rootField = field.split('.').first;
+          if (doc.containsKey(rootField)) {
+            shouldNotify = true;
+          }
+        }
+        if (shouldNotify) {
+          final stream = _watchers[field];
+          final idx = _secondaryIndexes[field];
+          if (stream != null && idx != null) {
+            stream.add(idx.all());
+          } else if (stream != null) {
+            _primaryIndex.rangeSearch(1, _nextId - 1, skipDedupe: true).then((ids) {
+              if (!stream.isClosed) stream.add(ids);
+            });
+          }
+        }
+      }
+    } else {
+      _notifyWatchersBatch();
+    }
   }
 
   void _notifyWatchersBatch() {
@@ -836,7 +1017,7 @@ class FastDB {
       if (idx != null) {
         stream.add(idx.all());
       } else {
-        _primaryIndex.rangeSearch(1, _nextId - 1).then((ids) {
+        _primaryIndex.rangeSearch(1, _nextId - 1, skipDedupe: true).then((ids) {
           if (!stream.isClosed) stream.add(ids);
         });
       }
@@ -900,7 +1081,7 @@ class FastDB {
     // 1. New format: magic prefix [0x00, 0x01]
     if (body.length >= 2 && body[0] == 0x00 && body[1] == 0x01) {
       final doc = FastSerializer.deserialize(body);
-      if (doc is Map) migrateLegacyDoc(doc);
+      migrateLegacyDoc(doc);
       return doc;
     }
 
@@ -926,15 +1107,15 @@ class FastDB {
   Uint8List _serialize(dynamic doc, {int? id}) {
     final Uint8List payload;
     if (doc is Map) {
-      final docMap = Map<String, dynamic>.from(doc);
-      Map<String, dynamic> map;
-
-      // OPTIMIZATION: Avoid Map.from() copy if we don't need to modify
-      if (id != null && docMap['ffdbID'] != id) {
-        map = Map<String, dynamic>.from(docMap);
-        map['ffdbID'] = id;
+      // Copy ONLY when we must inject ffdbID (the old code copied
+      // unconditionally AND then again conditionally — the "optimization"
+      // was broken). When no injection is needed, pass the map straight to
+      // the serializer (it only reads).
+      final Map<String, dynamic> map;
+      if (id != null && doc['ffdbID'] != id) {
+        map = Map<String, dynamic>.from(doc)..['ffdbID'] = id;
       } else {
-        map = docMap;
+        map = doc.cast<String, dynamic>();
       }
 
       payload = FastSerializer.serialize(map);
@@ -995,12 +1176,15 @@ class FastDB {
     FutureOr<List<int>> Function(QueryBuilder q) queryFn,
   ) => _exclusive(() async {
     final ids = List<int>.from(
-      await queryFn(QueryBuilder(_secondaryIndexes, _findById, _rangeSearch)),
+      await queryFn(QueryBuilder(_secondaryIndexes, _findById, _rangeSearch, null, _queryCache)),
     );
     if (ids.isEmpty) return 0;
     final wal = _wal;
     _inTransaction = true;
     _batchMode = true; // Use batch mode to avoid redundant disk writes per item
+    // Checkpoint pre-existing dirty pages BEFORE opening the WAL tx
+    // (same reasoning as in transaction()).
+    await _pageManager.flushDirty();
     if (wal != null) await wal.beginTransaction();
     try {
       int count = 0;
@@ -1016,7 +1200,7 @@ class FastDB {
       await _pageManager.flushDirty();
       await storage.flush();
       await _saveHeader();
-      QueryBuilder.clearCache();
+      _queryCache.clear();
       if (_autoCompactThreshold > 0) {
         await _maybeAutoCompact();
       }
@@ -1059,16 +1243,7 @@ class FastDB {
     b[off + 3] = (v >> 24) & 0xFF;
   }
 
-  static int _crc32(Uint8List data) {
-    int crc = 0xFFFFFFFF;
-    for (final byte in data) {
-      crc ^= byte;
-      for (int i = 0; i < 8; i++) {
-        crc = (crc & 1) != 0 ? (crc >> 1) ^ 0xEDB88320 : crc >> 1;
-      }
-    }
-    return crc ^ 0xFFFFFFFF;
-  }
+  static int _crc32(Uint8List data) => crc.crc32(data);
 
   /// Synchronizes the document write pointer with the actual storage size.
   /// Crucial for single-file mode where docs and pages share the same file.

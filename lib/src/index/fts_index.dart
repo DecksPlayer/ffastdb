@@ -24,9 +24,11 @@ import 'secondary_index.dart';
 ///   .find();
 /// ```
 class FtsIndex extends SecondaryIndex {
-  /// Maps tokens to document IDs.
-  /// Example: 'london' -> [1, 5, 23, 45]
-  final Map<String, List<int>> _tokenIndex = {};
+  /// Maps tokens to document IDs (posting sets).
+  /// Example: 'london' -> {1, 5, 23, 45}
+  /// Sets make add/remove O(1) (the old List had an O(k) contains() per add,
+  /// quadratic on hot tokens).
+  final Map<String, Set<int>> _tokenIndex = {};
 
   /// Maps document ID to all tokens in that document.
   /// Used for removing documents during index maintenance.
@@ -58,6 +60,11 @@ class FtsIndex extends SecondaryIndex {
   void add(int docId, dynamic value) {
     if (value is! String) return;
 
+    // Idempotency: re-adding the same docId first removes its previous
+    // tokens — otherwise stale tokens stay in the inverted index forever
+    // (ghost matches) because remove() only knows the NEW token set.
+    if (_docTokens.containsKey(docId)) remove(docId, null);
+
     final tokens = tokenize(value);
     if (tokens.isEmpty) return;
 
@@ -70,8 +77,7 @@ class FtsIndex extends SecondaryIndex {
 
     // Add to inverted index (exact tokens only)
     for (final token in uniqueTokens) {
-      final ids = _tokenIndex.putIfAbsent(token, () => []);
-      if (!ids.contains(docId)) ids.add(docId);
+      _tokenIndex.putIfAbsent(token, () => <int>{}).add(docId);
     }
   }
 
@@ -90,14 +96,14 @@ class FtsIndex extends SecondaryIndex {
       case 'startsWith':
         final tokens = tokenize(value);
         if (tokens.isEmpty) return [];
-        
+
         Set<int>? resultSet;
         for (final t in tokens) {
-          final matches = searchPrefix(t);
+          final matches = searchPrefix(t).toSet();
           if (resultSet == null) {
-            resultSet = matches.toSet();
+            resultSet = matches;
           } else {
-            resultSet = resultSet.intersection(matches.toSet());
+            resultSet = resultSet.intersection(matches);
           }
           if (resultSet.isEmpty) break;
         }
@@ -141,7 +147,7 @@ class FtsIndex extends SecondaryIndex {
     bool first = true;
 
     for (final token in tokens) {
-      final matches = _tokenIndex[token] ?? [];
+      final matches = _tokenIndex[token] ?? const <int>{};
       if (first) {
         results.addAll(matches);
         first = false;
@@ -180,6 +186,9 @@ class FtsIndex extends SecondaryIndex {
     if (value is! String) return [];
     return _runSearch(value);
   }
+
+  @override
+  dynamic valueOf(int docId) => null;
 
   @override
   List<int> range(dynamic min, dynamic max) {
@@ -242,7 +251,7 @@ class FtsIndex extends SecondaryIndex {
 
     return [
       for (final token in sortedTokens)
-        MapEntry(token, _tokenIndex[token]!),
+        MapEntry(token, _tokenIndex[token]!.toList()),
     ];
   }
 
@@ -292,9 +301,9 @@ class FtsIndex extends SecondaryIndex {
         final t = utf8.decode(bytes.sublist(off, off + tLen));
         off += tLen;
         tokens.add(t);
-        
+
         // Rebuild inverted index on the fly
-        index._tokenIndex.putIfAbsent(t, () => []).add(docId);
+        index._tokenIndex.putIfAbsent(t, () => <int>{}).add(docId);
       }
       index._docTokens[docId] = tokens;
     }

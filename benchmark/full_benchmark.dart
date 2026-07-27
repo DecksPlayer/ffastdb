@@ -175,7 +175,7 @@ class HashIndexBench extends AsyncBenchmarkBase {
   @override
   Future<void> run() async {
     for (int i = 0; i < QUERIES; i++) {
-      db.query().where('city').equals(cities[i % 5]).findIds();
+      await db.query().where('city').equals(cities[i % 5]).findIds();
     }
   }
 }
@@ -207,7 +207,7 @@ class SortedIndexRangeBench extends AsyncBenchmarkBase {
   @override
   Future<void> run() async {
     for (int i = 0; i < QUERIES; i++) {
-      db.query().where('age').between(25, 35).findIds();
+      await db.query().where('age').between(25, 35).findIds();
     }
   }
 }
@@ -239,7 +239,7 @@ class SortedIndexGreaterThanBench extends AsyncBenchmarkBase {
   @override
   Future<void> run() async {
     for (int i = 0; i < QUERIES; i++) {
-      db.query().where('score').greaterThan(5000.0).findIds();
+      await db.query().where('score').greaterThan(5000.0).findIds();
     }
   }
 }
@@ -271,7 +271,7 @@ class BitmaskIndexBench extends AsyncBenchmarkBase {
   @override
   Future<void> run() async {
     for (int i = 0; i < QUERIES; i++) {
-      db.query().where('active').equals(true).findIds();
+      await db.query().where('active').equals(true).findIds();
     }
   }
 }
@@ -306,7 +306,7 @@ class OrQueryBench extends AsyncBenchmarkBase {
   @override
   Future<void> run() async {
     for (int i = 0; i < QUERIES; i++) {
-      db.query()
+      await db.query()
           .where('city').equals('London')
           .or()
           .where('city').equals('Paris')
@@ -347,7 +347,7 @@ class AndQueryBench extends AsyncBenchmarkBase {
   @override
   Future<void> run() async {
     for (int i = 0; i < QUERIES; i++) {
-      db.query()
+      await db.query()
           .where('age').between(25, 35)
           .and('city').equals('London')
           .findIds();
@@ -385,7 +385,7 @@ class InQueryBench extends AsyncBenchmarkBase {
   @override
   Future<void> run() async {
     for (int i = 0; i < QUERIES; i++) {
-      db.query().where('city').isIn(['London', 'Paris', 'Tokyo']).findIds();
+      await db.query().where('city').isIn(['London', 'Paris', 'Tokyo']).findIds();
     }
   }
 }
@@ -492,7 +492,7 @@ class SortByBench extends AsyncBenchmarkBase {
   @override
   Future<void> run() async {
     for (int i = 0; i < QUERIES; i++) {
-      db.query().where('age').alwaysTrue().sortBy('age').findIds();
+      await db.query().where('age').alwaysTrue().sortBy('age').findIds();
     }
   }
 }

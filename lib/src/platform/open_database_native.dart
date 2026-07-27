@@ -30,7 +30,6 @@ Future<FastDB> openDatabase(
   final dir = directory.isEmpty ? Directory.current.path : directory;
   final path = p.join(dir, '$name.fdb');
 
-
   // Normal open as the Owner isolate
   await FfastDb.disposeInstance();
 
