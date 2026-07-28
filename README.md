@@ -1,4 +1,4 @@
-# FFastDB 🚀 `v0.2.6`
+# FFastDB 🚀 `v0.3.1`
 
 A high-performance, pure-Dart NoSQL database for Flutter & server-side Dart.
 
@@ -32,7 +32,7 @@ A high-performance, pure-Dart NoSQL database for Flutter & server-side Dart.
 
 ```yaml
 dependencies:
-  ffastdb: ^0.2.6
+  ffastdb: ^0.3.1
 ```
 
 > **Native isolate note:** Transparent write proxying between isolates was removed.

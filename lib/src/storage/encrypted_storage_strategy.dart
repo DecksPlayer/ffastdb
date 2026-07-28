@@ -45,6 +45,9 @@ class EncryptedStorageStrategy implements StorageStrategy {
   /// Returns the underlying base storage strategy.
   StorageStrategy get storage => _base;
 
+  @override
+  StorageStrategy get innerStorage => _base;
+
   // ── StorageStrategy ────────────────────────────────────────────────────────
 
   @override

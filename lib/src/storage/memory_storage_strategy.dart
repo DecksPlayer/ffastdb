@@ -82,6 +82,9 @@ class MemoryStorageStrategy implements StorageStrategy {
   // ── Synchronous fast paths ────────────────────────────────────────────────
 
   @override
+  StorageStrategy? get innerStorage => null; // not a wrapper
+
+  @override
   int? get sizeSync => _usedSize;
 
   @override

@@ -11,7 +11,7 @@ A **pure-Dart, high-performance, cross-platform embedded NoSQL database** for Fl
 
 - **Platforms:** Web, Android, iOS, Windows, Linux, macOS
 - **Package:** `ffastdb` on pub.dev
-- **Version:** 0.2.7+
+- **Version:** 0.3.0+
 - **Main entry:** `lib/ffastdb.dart`
 
 ---

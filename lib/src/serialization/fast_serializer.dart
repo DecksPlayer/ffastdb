@@ -17,21 +17,41 @@ class FastSerializer {
   static const _drPrefix = '\u0000dr:'; // DocumentReference → path
   static const _blPrefix = '\u0000bl:'; // Blob / Uint8List  → base64
 
+  /// Recursive pre-pass run BEFORE jsonEncode.
+  ///
+  /// `JsonEncoder` only calls `toEncodable` for values it cannot encode
+  /// directly — and `Uint8List` IS directly encodable (it implements
+  /// `List<int>`, so it silently became a JSON array of numbers and was
+  /// revived as `List<dynamic>`) and plain Strings are encodable too (so
+  /// sentinel-escaping never happened there either). Both cases are handled
+  /// here instead:
+  ///   - `Uint8List` → `_blPrefix` + base64 (revived as `Uint8List`)
+  ///   - Strings starting with `\u0000` → doubled (escape, see [revive])
+  static dynamic _preEncode(dynamic v) {
+    if (v is Uint8List) {
+      return '$_blPrefix${base64Encode(v)}';
+    }
+    if (v is String && v.startsWith('\u0000')) {
+      return '\u0000$v';
+    }
+    if (v is Map) {
+      return v.map((k, val) => MapEntry(k, _preEncode(val)));
+    }
+    if (v is List) {
+      return v.map(_preEncode).toList();
+    }
+    return v;
+  }
+
   static Object? _toEncodable(Object? value) {
     if (value == null) return null;
 
-    // Escape user strings that begin with \u0000 so they can never be
-    // misread as sentinel-typed values (dt:/gp:/dr:/bl:) on the read side.
-    if (value is String && value.startsWith('\u0000')) {
-      return '\u0000$value';
-    }
-
     // ── Dart native ──────────────────────────────────────────────────────────
+    // NOTE: Uint8List and \u0000-prefixed strings are handled in [_preEncode]
+    // — JsonEncoder never calls this function for directly-encodable types
+    // (String, List — and Uint8List implements List<int>).
     if (value is DateTime) {
       return '$_dtPrefix${value.toUtc().toIso8601String()}';
-    }
-    if (value is Uint8List) {
-      return '$_blPrefix${base64Encode(value)}';
     }
 
     // Check type names to avoid slow try-catch exceptions for non-Firebase custom objects
@@ -102,7 +122,7 @@ class FastSerializer {
   /// Serializes a Map to a JSON-UTF8 binary byte array.
   /// Includes a 2-byte magic prefix [0x00, 0x01] and a 4-byte length header.
   static Uint8List serialize(Map<String, dynamic> doc) {
-    final utf8Data = _encoder.convert(doc);
+    final utf8Data = _encoder.convert(_preEncode(doc));
     final data = Uint8List(2 + 4 + utf8Data.length);
 
     // Magic prefix
@@ -141,4 +161,3 @@ class FastSerializer {
     return revive(raw) as Map<String, dynamic>;
   }
 }
-

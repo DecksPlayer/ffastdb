@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 import '../storage_strategy.dart';
@@ -17,6 +18,22 @@ class IoStorageStrategy implements StorageStrategy {
   RandomAccessFile? _file;
   RandomAccessFile? _lockFile;
   int _cachedSize = 0;
+
+  /// Serializes all operations on [_file].
+  ///
+  /// A [RandomAccessFile] handle does not allow concurrent async operations
+  /// ("An async operation is currently pending"), and `setPosition` + read/
+  /// write is not atomic across interleaved calls — concurrent readers would
+  /// corrupt each other's offsets. Every handle operation goes through this
+  /// chain so they execute one at a time, in issue order.
+  Future<void> _opQueue = Future.value();
+
+  Future<T> _locked<T>(Future<T> Function() op) {
+    final prev = _opQueue;
+    final completer = Completer<void>();
+    _opQueue = completer.future;
+    return prev.then((_) => op()).whenComplete(completer.complete);
+  }
 
   IoStorageStrategy(this.path);
 
@@ -49,32 +66,70 @@ class IoStorageStrategy implements StorageStrategy {
     final lockPath = '$path.lock';
     final lockFile = File(lockPath);
 
-    try {
-      // Open with write-exclusive mode and try to lock
-      _lockFile = await lockFile.open(mode: FileMode.write);
-      await _lockFile!.lock(FileLock.blockingExclusive);
+    // NON-blocking exclusive lock, with a short retry loop. Two requirements
+    // meet here:
+    //  1. A live owner must make us FAIL (never wait forever on
+    //     FileLock.blockingExclusive — that froze apps on startup).
+    //  2. After an owner is SIGKILLed, the OS may take a few milliseconds to
+    //     release the byte-range lock (observed on Windows in the soak test:
+    //     open() right after kill+exitCode intermittently hit errno 33).
+    //     Retrying briefly bridges that release latency; a genuinely live
+    //     owner holds the lock continuously and we still fail — just after
+    //     ~2 s instead of instantly.
+    const maxAttempts = 20;
+    Object? lastError;
+    for (var attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        _lockFile = await lockFile.open(mode: FileMode.write);
+        await _lockFile!.lock(FileLock.exclusive);
 
-      // Write our PID so the lock is inspectable
-      final pid = pid_;
-      final pidBytes = Uint8List(4);
-      pidBytes[0] = pid & 0xFF;
-      pidBytes[1] = (pid >> 8) & 0xFF;
-      pidBytes[2] = (pid >> 16) & 0xFF;
-      pidBytes[3] = (pid >> 24) & 0xFF;
-      await _lockFile!.setPosition(0);
-      await _lockFile!.writeFrom(pidBytes);
-    } catch (e) {
-      throw StateError(
-          'FastDB: Cannot open "$path" — another process has it locked. '
-          'Close all other instances first. (Original error: $e)');
+        // Write our PID so the lock is inspectable
+        final pid = pid_;
+        final pidBytes = Uint8List(4);
+        pidBytes[0] = pid & 0xFF;
+        pidBytes[1] = (pid >> 8) & 0xFF;
+        pidBytes[2] = (pid >> 16) & 0xFF;
+        pidBytes[3] = (pid >> 24) & 0xFF;
+        await _lockFile!.setPosition(0);
+        await _lockFile!.writeFrom(pidBytes);
+        return;
+      } catch (e) {
+        lastError = e;
+        try {
+          await _lockFile?.close();
+        } catch (_) {}
+        _lockFile = null;
+        if (attempt < maxAttempts) {
+          await Future.delayed(const Duration(milliseconds: 100));
+        }
+      }
     }
+    throw StateError(
+        'FastDB: Cannot open "$path" — another process has it locked. '
+        'Close all other instances first. (Original error: $lastError)');
   }
 
   @override
   Future<void> close() async {
-    await flush();
-    await _file?.close();
-    _file = null;
+    // Flush/close errors must be reported, but the lock must ALWAYS be
+    // released — otherwise a single failed flush (e.g. ENOSPC) keeps the
+    // database file locked until the process exits, and even THIS process
+    // cannot reopen it.
+    Object? flushError;
+    await _locked(() async {
+      final f = _file;
+      if (f != null) {
+        try {
+          await f.flush();
+        } catch (e) {
+          flushError = e;
+        }
+        try {
+          await f.close();
+        } catch (_) {}
+        _file = null;
+      }
+    });
 
     // Release and delete lock file
     try {
@@ -84,56 +139,70 @@ class IoStorageStrategy implements StorageStrategy {
       final lockFile = File('$path.lock');
       if (await lockFile.exists()) await lockFile.delete();
     } catch (_) {}
+
+    final err = flushError;
+    if (err != null) throw err;
   }
 
   // ─── Read / Write ─────────────────────────────────────────────────────────
 
   @override
-  Future<Uint8List> read(int offset, int size) async {
+  Future<Uint8List> read(int offset, int size) {
     if (_file == null) throw StateError('Storage not open');
-    if (size <= 0) return Uint8List(0);
+    if (size <= 0) return Future.value(Uint8List(0));
 
-    await _file!.setPosition(offset);
-    final buf = Uint8List(size);
-    // Use the tracked size — _file.length() is an fstat(2) syscall per read.
-    final available = _cachedSize - offset;
-    if (available <= 0) return buf;
+    return _locked(() async {
+      await _file!.setPosition(offset);
+      final buf = Uint8List(size);
+      // Use the tracked size — _file.length() is an fstat(2) syscall per read.
+      final available = _cachedSize - offset;
+      if (available <= 0) return buf;
 
-    final toRead = available < size ? available : size;
-    await _file!.readInto(buf, 0, toRead);
-    return buf;
+      final toRead = available < size ? available : size;
+      await _file!.readInto(buf, 0, toRead);
+      return buf;
+    });
   }
 
   @override
-  Future<void> write(int offset, Uint8List data) async {
+  Future<void> write(int offset, Uint8List data) {
     if (_file == null) throw StateError('Storage not open');
-    await _file!.setPosition(offset);
-    await _file!.writeFrom(data);
-    final end = offset + data.length;
-    if (end > _cachedSize) _cachedSize = end;
+    return _locked(() async {
+      await _file!.setPosition(offset);
+      await _file!.writeFrom(data);
+      final end = offset + data.length;
+      if (end > _cachedSize) _cachedSize = end;
+    });
   }
 
   @override
-  Future<void> flush() async {
+  Future<void> flush() {
     // RandomAccessFile.flush() already issues fsync(2) on POSIX and
     // FlushFileBuffers() on Windows (verified in the Dart SDK: File::Flush),
     // so data reaches the storage device. The old extra flushSync() caused a
     // SECOND fsync per call AND blocked the isolate — removed.
-    final f = _file;
-    if (f != null) {
-      await f.flush();
-    }
+    return _locked(() async {
+      final f = _file;
+      if (f != null) {
+        await f.flush();
+      }
+    });
   }
 
   @override
   Future<int> get size async => _cachedSize;
 
   @override
-  Future<void> truncate(int size) async {
+  Future<void> truncate(int size) {
     if (_file == null) throw StateError('Storage not open');
-    await _file!.truncate(size);
-    if (size < _cachedSize) _cachedSize = size;
+    return _locked(() async {
+      await _file!.truncate(size);
+      if (size < _cachedSize) _cachedSize = size;
+    });
   }
+
+  @override
+  StorageStrategy? get innerStorage => null; // not a wrapper
 
   // Disk-backed: no synchronous fast paths.
   @override int? get sizeSync => null;

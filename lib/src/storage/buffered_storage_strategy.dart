@@ -19,6 +19,9 @@ class _WalEntry {
 /// This is the primary reason FastDB should be 10x faster on bulk inserts.
 class BufferedStorageStrategy implements StorageStrategy {
   final StorageStrategy _inner;
+
+  @override
+  StorageStrategy get innerStorage => _inner;
   final int maxPendingBytes;
 
   final List<_WalEntry> _pendingWrites = [];
