@@ -6,7 +6,6 @@ import 'package:meta/meta.dart';
 import 'storage/storage_strategy.dart';
 import 'storage/page_manager.dart';
 import 'storage/wal_storage_strategy.dart';
-import 'storage/encrypted_storage_strategy.dart';
 import 'index/btree.dart';
 import 'index/hash_index.dart';
 import 'index/sorted_index.dart';
@@ -138,18 +137,15 @@ class FastDB {
   /// Returns the [WalStorageStrategy] in the storage stack, if any.
   ///
   /// The stack may be wrapped (e.g. `EncryptedStorageStrategy(WalStorageStrategy(...))`),
-  /// so we unwrap layers — same traversal as the `_opLog` path resolution in the
-  /// constructor. Without this, an encrypted WAL was silently not detected:
-  /// every internal write opened its own auto-transaction (no atomicity, ~2.5x fsyncs).
+  /// so we unwrap layers via [StorageStrategy.innerStorage] — same traversal as
+  /// the `_opLog` path resolution in the constructor. Without this, a wrapped
+  /// WAL is silently not detected: every internal write opens its own
+  /// auto-transaction (no atomicity, ~2.5x fsyncs, non-atomic compact()).
   WalStorageStrategy? get _wal {
     StorageStrategy? current = storage;
     while (current != null) {
       if (current is WalStorageStrategy) return current;
-      if (current is EncryptedStorageStrategy) {
-        current = current.storage;
-      } else {
-        break;
-      }
+      current = current.innerStorage;
     }
     return null;
   }
@@ -177,13 +173,8 @@ class FastDB {
       if (current is IoStorageStrategy) {
         logPath = '${current.path}.log';
         break;
-      } else if (current is WalStorageStrategy) {
-        current = current.main;
-      } else if (current is EncryptedStorageStrategy) {
-        current = current.storage;
-      } else {
-        break;
       }
+      current = current.innerStorage;
     }
     _opLog = logPath == null ? OperationLog.disabled() : OperationLog(logPath);
 
@@ -456,8 +447,18 @@ class FastDB {
     }
 
     if (currentVersion < _schemaVersion) {
-      await _runMigrations(currentVersion, _schemaVersion, migrations);
-      await _saveHeader();
+      // Migrations + version bump must be ATOMIC. Previously the header was
+      // saved only after runMigrations() completed, so a crash mid-migration
+      // re-ran the ENTIRE migration on the next open — applying
+      // non-idempotent migrations (counters, increments) twice to the docs
+      // that had already been migrated. Wrapping in a transaction makes it
+      // all-or-nothing: the WAL either commits every migrated doc plus the
+      // new version header, or rolls back to the pre-migration state and the
+      // next open retries cleanly from scratch.
+      await transaction(() async {
+        await _runMigrations(currentVersion, _schemaVersion, migrations);
+        await _saveHeader();
+      });
     }
 
     // RECOVERY: Replay any pending operations from the sequential log.
@@ -514,30 +515,52 @@ class FastDB {
       if (_isClosed) return;
       _isClosed = true;
 
-      await _saveIndexes();
-      if (storage.needsExplicitFlush) {
-        await storage.write(24, Uint8List(1)..[0] = 0x43);
-      }
-      await _saveHeader();
-      await _pageManager.flushDirty();
-      await storage.flush();
-      await storage.close();
-      await dataStorage?.flush();
-      await dataStorage?.close();
-      // Clean shutdown: everything is durable — clear the operation log so
-      // the next open() has nothing to replay (replays after a CLEAN close
-      // would redo already-applied operations, clobbering e.g. migrations).
-      await _opLog.clear();
-      await _opLog.close();
-      final watchersCopy = _watchers.values.toList();
-      _watchers.clear();
-      for (final c in watchersCopy) {
-        await c.close();
-      }
+      // Best-effort close: if any durability step fails (e.g. ENOSPC), we
+      // still MUST release the storage locks/handles below — otherwise the
+      // file stays locked until process exit and even this process cannot
+      // reopen the database. The original error is rethrown afterwards so
+      // callers know the last writes may not be durable.
+      Object? closeError;
+      try {
+        await _saveIndexes();
+        if (storage.needsExplicitFlush) {
+          await storage.write(24, Uint8List(1)..[0] = 0x43);
+        }
+        await _saveHeader();
+        await _pageManager.flushDirty();
+        await storage.flush();
+      } catch (e) {
+        closeError = e;
+      } finally {
+        try {
+          await storage.close();
+        } catch (_) {}
+        try {
+          await dataStorage?.flush();
+          await dataStorage?.close();
+        } catch (_) {}
+        // Clean shutdown: everything is durable — clear the operation log so
+        // the next open() has nothing to replay (replays after a CLEAN close
+        // would redo already-applied operations, clobbering e.g. migrations).
+        // On a failed close the log is left in place so it can be replayed.
+        try {
+          if (closeError == null) await _opLog.clear();
+          await _opLog.close();
+        } catch (_) {}
+        final watchersCopy = _watchers.values.toList();
+        _watchers.clear();
+        for (final c in watchersCopy) {
+          try {
+            await c.close();
+          } catch (_) {}
+        }
 
-      if (identical(_instance, this)) {
-        _instance = null;
+        if (identical(_instance, this)) {
+          _instance = null;
+        }
       }
+      final err = closeError;
+      if (err != null) throw err;
     });
     _writeLock = next.then((_) {}, onError: (_) {});
     return next;
@@ -696,6 +719,9 @@ class FastDB {
       _inTransaction = true;
       final savedNextId = _nextId;
       final savedRoot = _primaryIndex.rootPage;
+      // compact() and migrations move _dataOffset — restore it on rollback
+      // or subsequent writes would land at stale offsets.
+      final savedDataOffset = _dataOffset;
       final wal = _wal;
 
       // Checkpoint pre-transaction dirty pages BEFORE opening the WAL tx:
@@ -713,6 +739,7 @@ class FastDB {
       } catch (e) {
         _nextId = savedNextId;
         _primaryIndex.rootPage = savedRoot;
+        _dataOffset = savedDataOffset;
         if (wal != null) await wal.rollback();
         // Clear batch entries and CACHE on rollback to prevent them from leaking into next operations.
         // Dirty pages at this point are transaction-only (pre-tx state was
@@ -1273,7 +1300,12 @@ class FastDB {
 
   // ─── Compact (Vacuum) ──────────────────────────────────────────────────────
 
-  Future<void> compact() => _exclusive(() => _storageMgr.compactImpl());
+  /// Compacts the database inside a WAL transaction. The single-file path
+  /// truncates and rewrites the whole file; before this was transactional, a
+  /// crash or write failure (ENOSPC) after the truncate permanently destroyed
+  /// every document not yet rewritten. Now the truncate is recorded in the
+  /// WAL and applied only at commit — all-or-nothing.
+  Future<void> compact() => transaction(() => _storageMgr.compactImpl());
 
   // ─── Migrations ────────────────────────────────────────────────────────────
 

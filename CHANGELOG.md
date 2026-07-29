@@ -1,4 +1,31 @@
-## 0.2.8 
+## 0.3.1
+
+### Bugfix and Documentation release
+
+**Fixes:**
+- fix documentation.
+
+## 0.3.0
+
+Durability release. Breaking for custom `StorageStrategy` implementations only.
+
+**Critical — crash atomicity:**
+- **`compact()` destroyed docs on crash/ENOSPC** — truncated the file first, rewrote from RAM after. The truncate is now a WAL transaction entry; compact is all-or-nothing.
+- **Rollback after a failed commit-apply deleted a committed transaction** — it checkpointed the WAL past the atomic point. Rollback now preserves the WAL and the strategy refuses further operations until reopened.
+- **Schema migrations applied twice after a crash** — version header was saved last, so a kill re-ran everything. Migrations now run inside a WAL transaction.
+- **`Uint8List` in documents came back as `List<dynamic>`** — `JsonEncoder` never calls `toEncodable` for `List` subclasses, so the blob path was dead code (as was the 0.2.8 `\u0000` escaping). Now pre-encoded recursively; round-trips correctly.
+- **Concurrent `find()` threw `FileSystemException` on native storage** — concurrent `setPosition`/`read` on one `RandomAccessFile`. Handle operations are now serialized in `IoStorageStrategy`.
+
+**High:**
+- Opening a locked DB hung forever (`FileLock.blockingExclusive`) — now fails fast; also retries ~2 s after an owner dies (Windows lock-release lag, errno 33).
+- `close()` always releases the file lock, even when a flush fails; op log kept for replay on unclean close.
+- `StorageStrategy.innerStorage` lets capability detection (WAL) see through any wrapper.
+
+**Breaking:** custom `StorageStrategy` implementations must add `innerStorage` (one line, return `null`); opening a DB held by another process now throws instead of waiting forever.
+
+**Tests:** physical durability suite — SIGKILL mid-write (insert/batch/update/compact/reindex/blob/encrypted), SIGKILL mid-migration, fault injection on the commit-apply path, cross-version migration test (old package code → new code), concurrent writes/transactions, multi-process lock, ENOSPC, LRU eviction, watcher stress, query fuzzing vs linear oracle, index edge cases, opt-in soak test (`FFASTDB_SOAK=1`), manual on-device checklist (`test/manual/`).
+
+## 0.2.8
 
 ### Bugfix & Performance Release — full audit (see `FIX_PLAN.md`)
 

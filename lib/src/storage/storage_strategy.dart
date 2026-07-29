@@ -25,6 +25,15 @@ abstract class StorageStrategy {
 
   // ── Optional synchronous fast paths ──────────────────────────────────────
 
+  /// If this strategy wraps another one, returns the wrapped strategy.
+  ///
+  /// Used for capability detection through wrappers — e.g. finding a
+  /// [WalStorageStrategy] under encryption/quota/retry/metrics wrappers.
+  /// Without this, a wrapper silently hides transactional capabilities and
+  /// every write degrades to its own auto-transaction (no atomicity).
+  /// Default: null (not a wrapper).
+  StorageStrategy? get innerStorage => null;
+
   /// If non-null, the current byte length of the storage without awaiting.
   /// Implementations where writes are synchronous (e.g. [MemoryStorageStrategy])
   /// override this to avoid a microtask bounce in hot paths.

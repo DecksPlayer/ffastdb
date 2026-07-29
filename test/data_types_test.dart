@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'package:ffastdb/ffastdb.dart';
 import 'package:ffastdb/src/storage/memory_storage_strategy.dart';
 import 'package:test/test.dart';
@@ -281,6 +283,57 @@ void main() {
       expect(retrieved['location'], isA<Map>());
       expect(retrieved['location']['latitude'], closeTo(34.0522, 0.0001));
       expect(retrieved['location']['longitude'], closeTo(-118.2437, 0.0001));
+    });
+
+    test('supports Uint8List (binary) — round-trips as Uint8List, not List',
+        () async {
+      // Regression: JsonEncoder never calls toEncodable for Uint8List (it
+      // implements List<int>), so blobs silently became JSON int arrays and
+      // were revived as List<dynamic>. The fix pre-encodes them to a
+      // base64 sentinel before encoding.
+      final payload = Uint8List.fromList(List.generate(4096, (i) => (i * 7) & 0xFF));
+      final nested = Uint8List.fromList([0xDE, 0xAD, 0xBE, 0xEF]);
+
+      final doc = {
+        'name': 'binary-doc',
+        'payload': payload,
+        'chunks': [nested, nested],
+        'meta': {'thumb': nested},
+      };
+
+      final id = await db.insert(doc);
+      final retrieved = await db.findById(id);
+
+      expect(retrieved['payload'], isA<Uint8List>());
+      expect(retrieved['payload'] as Uint8List, equals(payload));
+      expect(retrieved['chunks'][0], isA<Uint8List>());
+      expect(retrieved['chunks'][0] as Uint8List, equals(nested));
+      expect(retrieved['meta']['thumb'], isA<Uint8List>());
+      expect(retrieved['meta']['thumb'] as Uint8List, equals(nested));
+      // Plain int lists must NOT be confused with blobs.
+      final id2 = await db.insert({'scores': [1, 2, 3]});
+      final r2 = await db.findById(id2);
+      expect(r2['scores'], isA<List<dynamic>>());
+      expect(r2['scores'], equals([1, 2, 3]));
+    });
+
+    test('user strings starting with   survive the round trip', () async {
+      // Regression: sentinel escaping also lived in the dead toEncodable
+      // branch, so a user string like 'dt:foo' would hit revive() and
+      // crash on DateTime.parse.
+      final nul = String.fromCharCode(0);
+      final doc = {
+        'sneaky': '${nul}dt:not-a-date',
+        'blobby': '${nul}bl:QUJD', // looks like a blob sentinel but is user data
+        'normal': 'hello',
+      };
+
+      final id = await db.insert(doc);
+      final retrieved = await db.findById(id);
+
+      expect(retrieved['sneaky'], equals('${nul}dt:not-a-date'));
+      expect(retrieved['blobby'], equals('${nul}bl:QUJD'));
+      expect(retrieved['normal'], equals('hello'));
     });
 
     test('handles large documents with all types', () async {
