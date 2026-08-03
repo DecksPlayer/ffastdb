@@ -1,9 +1,229 @@
 # ffastdb — Bugs Confirmados
 
-> Análisis técnico sobre el código fuente: `fastdb.dart`, `_crud_operations.dart`, `fast_query.dart`, `fts_index.dart`, `hash_index.dart`, `btree.dart`.
-> Versión analizada: v0.2.7+
+> Análisis técnico sobre el código fuente.  
+> **Versión analizada:** v0.3.1  
+> **Última revisión:** 2026-08-03
 
-> **⚠️ NOTA (2026-07-27):** Este documento es histórico. La auditoría completa y el plan de corrección vigente están en [`FIX_PLAN.md`](FIX_PLAN.md). Los bugs de este documento ya están corregidos en el código actual (ver tabla Resumen).
+> **📌 NOTA:** Los bugs BUG-1 a BUG-6 del registro histórico **están todos corregidos** en el código actual. Este documento ahora refleja el estado real del repositorio con los bugs todavía abiertos.
+
+---
+
+## Estado del registro histórico (BUG-1 a BUG-6)
+
+| Bug | Severidad | Estado | Verificación |
+|-----|-----------|--------|-------------|
+| BUG-1: `_notifyWatchers` ignoraba `doc` | 🔴 Media | ✅ Corregido | [`fastdb.dart` L1052-1083](file:///c:/Users/gonoj/OneDrive/Documentos/GitHub/fastdb/lib/src/fastdb.dart#L1052) — filtra por campo con dot-notation |
+| BUG-2: `isNull()` siempre vacío | 🔴 Alta | ✅ Corregido | [`fast_query.dart` L1100-1103](file:///c:/Users/gonoj/OneDrive/Documentos/GitHub/fastdb/lib/src/query/fast_query.dart#L1100) — complemento vía `rangeSearch` |
+| BUG-3: `deleteImpl` no notificaba watchers | 🔴 Alta | ✅ Corregido | [`_crud_operations.dart` L219](file:///c:/Users/gonoj/OneDrive/Documentos/GitHub/fastdb/lib/src/_crud_operations.dart#L219) — `_notifyWatchers(doc)` |
+| BUG-4: FTS `retainAll` O(n×m) | 🔴 Alta | ✅ Corregido | [`fts_index.dart` L31](file:///c:/Users/gonoj/OneDrive/Documentos/GitHub/fastdb/lib/src/index/fts_index.dart#L31) — `_tokenIndex` es `Map<String, Set<int>>` |
+| BUG-5: `HashIndex.lookup` copia innecesaria | 🟡 Media | ✅ Corregido | `lookupCount()` implementado |
+| BUG-6: `bulkLoad` sin WAL fallback | 🔴 Media | ✅ Corregido | [`btree.dart` L206-213](file:///c:/Users/gonoj/OneDrive/Documentos/GitHub/fastdb/lib/src/index/btree.dart#L206) — free-list antes de rebuild |
+
+---
+
+## Bugs Abiertos — Estado actual (v0.3.1)
+
+---
+
+## OPEN-1: `_readAt` silencia corrupción de CRC32 con `return null`
+
+**Archivo:** [`fastdb.dart` L1137-1139](file:///c:/Users/gonoj/OneDrive/Documentos/GitHub/fastdb/lib/src/fastdb.dart#L1137)  
+**Severidad:** 🔴 Crítica
+
+```dart
+// ACTUAL — corrupción silenciosa:
+if (fullData.length >= totalSize) {
+  final storedCrc = _readInt32(fullData, 4 + length);
+  if (storedCrc != _crc32(fullData.sublist(4, 4 + length))) return null; // ← falla silenciosa
+}
+```
+
+**Impacto:** `findById(id)` retorna `null` cuando el documento está corrupto en disco. El usuario asume que el documento no existe. La corrupción por I/O parcial, truncación o bit-flip pasa desapercibida en producción. No hay log, no hay excepción, no hay alerta.
+
+**Fix:**
+```dart
+if (fullData.length >= totalSize) {
+  final storedCrc = _readInt32(fullData, 4 + length);
+  final computedCrc = _crc32(fullData.sublist(4, 4 + length));
+  if (storedCrc != computedCrc) {
+    throw StateError(
+      'FastDB: CRC32 mismatch at offset $offset '
+      '(expected 0x${computedCrc.toRadixString(16)}, '
+      'got 0x${storedCrc.toRadixString(16)}). '
+      'Document may be corrupted.',
+    );
+  }
+}
+```
+
+---
+
+## OPEN-2: `deleteWhere` no notifica watchers en path exitoso
+
+**Archivo:** [`fastdb.dart` L1249-1296](file:///c:/Users/gonoj/OneDrive/Documentos/GitHub/fastdb/lib/src/fastdb.dart#L1249)  
+**Severidad:** 🔴 Crítica
+
+```dart
+// ACTUAL — path de éxito de deleteWhere (L1281-1289):
+_batchMode = false;
+await _pageManager.flushDirty();
+await storage.flush();
+await _saveHeader();
+_queryCache.clear();
+// ← _notifyWatchersBatch() AUSENTE
+if (_autoCompactThreshold > 0) {
+  await _maybeAutoCompact();
+}
+return count;
+```
+
+**Impacto:** Los `StreamController` registrados vía `db.watch('campo')` **nunca reciben eventos** cuando se eliminan documentos con `deleteWhere`. Las UIs reactivas muestran datos ya borrados hasta el próximo insert/update.
+
+> **Nota:** `deleteImpl` individual ya fue corregido en v0.2.8 (BUG-3). Este bug es específico al path batch de `deleteWhere`.
+
+**Fix (1 línea):**
+```dart
+_queryCache.clear();
+_notifyWatchersBatch(); // ← agregar aquí
+```
+
+---
+
+## OPEN-3: `OperationLog` se escribe ANTES del commit WAL
+
+**Archivo:** [`_crud_operations.dart` L14-19, L74-77, L137-140, L188-191](file:///c:/Users/gonoj/OneDrive/Documentos/GitHub/fastdb/lib/src/_crud_operations.dart#L14)  
+**Severidad:** 🟠 Alta
+
+```dart
+// ACTUAL — insertImpl y demás: log ANTES del WAL
+if (!_db._inTransaction && !_db._batchMode && !_db._isReplayingOpLog) {
+  await _db._opLog.log('insert', id: id, data: doc);  // ← escrito primero
+}
+if (hasWal) await wal.beginTransaction();
+try {
+  // ...
+  if (hasWal) await wal.commit();
+```
+
+**Impacto:** Si el proceso cae entre el `_opLog.log()` y el `wal.commit()`, `_replayOpLog()` intentará reinsertar una operación que nunca se completó. Puede sobreescribir documentos existentes o incrementar `_nextId` incorrectamente. Afecta `insertImpl`, `putImpl`, `updateImpl` y `deleteImpl`.
+
+**Fix:** Mover el log al final del try, post-commit:
+```dart
+if (hasWal) await wal.beginTransaction();
+try {
+  // ... operación completa ...
+  if (hasWal) await wal.commit();
+  // Solo logear DESPUÉS del commit exitoso:
+  if (!_db._inTransaction && !_db._batchMode && !_db._isReplayingOpLog) {
+    await _db._opLog.log('insert', id: id, data: doc);
+  }
+  return id;
+} catch (e) {
+  if (hasWal) await wal.rollback();
+  rethrow;
+}
+```
+
+---
+
+## OPEN-4: `_serialize` usa `doc.cast<String, dynamic>()` lazy
+
+**Archivo:** [`fastdb.dart` L1188-1192](file:///c:/Users/gonoj/OneDrive/Documentos/GitHub/fastdb/lib/src/fastdb.dart#L1188)  
+**Severidad:** 🟠 Alta
+
+```dart
+// ACTUAL — rama "doc ya tiene el ID correcto":
+} else {
+  map = doc.cast<String, dynamic>(); // ← NO valida tipos, solo crea una vista lazy
+}
+```
+
+`Map.cast<K,V>()` no convierte ni valida en el momento del call — crea una vista con casting diferido. Si el mapa tiene claves no-`String` (Firebase, jsonDecode sin tipado), el error aparece dentro del serializer en un punto difícil de trazar.
+
+**Fix (2 líneas):**
+```dart
+final map = Map<String, dynamic>.from(doc as Map);
+if (id != null) map['ffdbID'] = id;
+```
+
+---
+
+## OPEN-5: `_replayOpLog` silencia todos los errores
+
+**Archivo:** [`fastdb.dart` L498-500](file:///c:/Users/gonoj/OneDrive/Documentos/GitHub/fastdb/lib/src/fastdb.dart#L498)  
+**Severidad:** 🟡 Media
+
+```dart
+// ACTUAL
+} catch (_) {
+  // Skip failed replays
+}
+```
+
+**Impacto:** Si el replay falla (storage corrupto, schema incompatible), el usuario no tiene forma de saberlo. El replay continúa sobre un estado inconsistente.
+
+**Fix:**
+```dart
+} catch (e, st) {
+  assert(() {
+    print('[ffastdb] Warning: replay of ${op.type}(id=${op.id}) failed: $e\n$st');
+    return true;
+  }());
+}
+```
+
+---
+
+## Tests de Regresión Recomendados
+
+```dart
+// test/regression_test.dart
+
+test('deleteWhere notifica watchers', () async {
+  db.addIndex('status');
+  await db.insert({'status': 'active'});
+  await db.insert({'status': 'active'});
+  final events = <List<int>>[];
+  db.watch('status').listen(events.add);
+  await db.deleteWhere((q) => q.where('status').equals('active').findIds());
+  await Future.delayed(Duration.zero);
+  expect(events.length, greaterThan(1)); // initial + delete batch
+  expect(events.last, isEmpty);
+});
+
+test('_readAt lanza StateError en CRC32 corrupto', () async {
+  // Escribir doc válido
+  final id = await db.insert({'name': 'Alice'});
+  // Corromper el archivo en disco (flip bits en el payload)
+  // ... (setup específico según storage) ...
+  expect(() => db.findById(id), throwsStateError);
+});
+
+test('oplog no reinsertan docs en crash-recovery', () async {
+  // 1. Insertar doc
+  // 2. Simular crash post-oplog pre-commit
+  // 3. Reabrir → doc no debe duplicarse
+});
+```
+
+---
+
+## Resumen final
+
+| Bug | Severidad | Estado |
+|-----|-----------|--------|
+| OPEN-1: CRC32 mismatch silencioso | 🔴 Crítica | ❌ Abierto |
+| OPEN-2: `deleteWhere` sin notificar watchers | 🔴 Crítica | ❌ Abierto |
+| OPEN-3: OperationLog antes del WAL commit | 🟠 Alta | ❌ Abierto |
+| OPEN-4: `_serialize` cast lazy | 🟠 Alta | ❌ Abierto |
+| OPEN-5: replay errors silenciados | 🟡 Media | ❌ Abierto |
+| BUG-1: `_notifyWatchers` ignoraba `doc` | 🔴 Media | ✅ Corregido (v0.2.8) |
+| BUG-2: `isNull()` siempre vacío | 🔴 Alta | ✅ Corregido (v0.2.8) |
+| BUG-3: `deleteImpl` no notificaba | 🔴 Alta | ✅ Corregido (v0.2.8) |
+| BUG-4: FTS `retainAll` O(n×m) | 🔴 Alta | ✅ Corregido (v0.2.8) |
+| BUG-5: `HashIndex.lookup` copia extra | 🟡 Media | ✅ Corregido |
+| BUG-6: `bulkLoad` sin free-list | 🔴 Media | ✅ Corregido (v0.3.0) |
+
 
 ---
 

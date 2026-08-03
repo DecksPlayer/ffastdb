@@ -405,5 +405,22 @@ void main() {
           reason: 'el rollback debe deshacer también los índices secundarios');
       expect(await db.count(), 1);
     });
+
+    test('clear() vacía la base de datos a 0 registros y reinicia la secuencia', () async {
+      db = FastDB.forTesting(MemoryStorageStrategy());
+      await db.open();
+      db.addIndex('type');
+      await db.insertAll([
+        {'type': 'user', 'name': 'A'},
+        {'type': 'post', 'title': 'B'},
+      ]);
+      expect(await db.count(), 2);
+      await db.clear();
+      expect(await db.count(), 0);
+      expect(await db.getAll(), isEmpty);
+      final newId = await db.insert({'type': 'user', 'name': 'C'});
+      expect(newId, 1, reason: 'clear debe reiniciar la secuencia ID a 1');
+      expect(await db.count(), 1);
+    });
   });
 }

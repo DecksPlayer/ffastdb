@@ -237,6 +237,44 @@ class _StorageManager {
     if (_db.dataStorage != null) await _db.dataStorage!.flush();
   }
 
+  /// Wipes all documents from the database in O(1) time by truncating storage
+  /// and resetting B-Tree and secondary indexes.
+  Future<void> clearImpl() async {
+    final wal = _db._wal;
+    if (!_db._inTransaction && wal != null) await wal.beginTransaction();
+    try {
+      await _db.storage.truncate(PageManager.pageSize);
+      if (_db.dataStorage != null) {
+        await _db.dataStorage!.truncate(0);
+      }
+      _db._pageManager.clearCache();
+      _db._pageManager.clearFreeList();
+      _db._primaryIndex.clearNodeCache();
+      _db._primaryIndex.rootPage = null;
+      for (final idx in _db._secondaryIndexes.values) {
+        idx.clear();
+      }
+
+      _db._nextId = 1;
+      _db._deletedCount = 0;
+      _db._batchEntries.clear();
+
+      await _db._primaryIndex.insert(0, 0);
+      _db._dataOffset = await _db.storage.size;
+
+      await saveHeader();
+      await _db.storage.flush();
+      if (_db.dataStorage != null) await _db.dataStorage!.flush();
+      await _db._opLog.clear();
+      _db._queryCache.clear();
+      if (!_db._inTransaction && wal != null) await wal.commit();
+      _db._notifyWatchersBatch();
+    } catch (e) {
+      if (!_db._inTransaction && wal != null) await wal.rollback();
+      rethrow;
+    }
+  }
+
   /// Applies schema migrations to all documents.
   Future<void> runMigrations(
       int currentVersion, int targetVersion, Map<int, dynamic Function(dynamic)>? migrations) async {

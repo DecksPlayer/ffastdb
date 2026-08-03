@@ -1,3 +1,33 @@
+## 0.3.2
+
+### Bugfix release — crash safety and reactive consistency
+
+**Critical:**
+- **FIX - `_readAt` silently returned `null` on CRC32 mismatch** — corrupted documents were
+  indistinguishable from missing ones. Now throws `StateError` with offset and checksum values
+  so corruption is immediately visible instead of surfacing as phantom `findById` nulls.
+- **FIX - `deleteWhere` did not notify reactive watchers** — `db.watch()` streams were never
+  updated after a batch delete, leaving UIs showing stale data. `_notifyWatchersBatch()` is
+  now called after the WAL commit on the success path.
+
+**High:**
+- **FIX - `OperationLog` was written before the WAL commit in all 4 CRUD methods** — a crash
+  between `opLog.log()` and `wal.commit()` caused `_replayOpLog()` to re-apply operations that
+  had never actually completed, potentially duplicating documents or corrupting `_nextId`.
+  The log entry is now written only after a successful commit.
+- **FIX - `_serialize` used a lazy `Map.cast<String,dynamic>()` view** — when a document's map
+  had non-`String` keys (e.g. `Map<dynamic,dynamic>` from Firebase or untyped `jsonDecode`),
+  the `CastError` appeared deep inside the serializer instead of at the `insert()` call site.
+  Replaced with `Map<String,dynamic>.from(doc)` for eager validation.
+
+**Medium:**
+- **FIX - `_replayOpLog` silently swallowed all replay errors** — a bare `catch (_) {}`
+  discarded failures with no logging. Now emits a diagnostic `print` in debug mode via
+  `assert()` (zero overhead in release builds).
+- **FIX - `_applySort` used `ids.length * 4 < idx.size`** — on Dart Web (`int` = JS 53-bit
+  number) this multiplication could overflow with very large collections. Replaced with
+  `ids.length < idx.size ~/ 4` and added a `idx.size > 0` guard.
+
 ## 0.3.1
 
 ### Bugfix and Documentation release

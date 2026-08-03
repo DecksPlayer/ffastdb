@@ -1,6 +1,7 @@
 import 'dart:math';
 import 'dart:convert';
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 import 'package:ffastdb/ffastdb.dart';
 // Internal imports for diagnostics
 import 'package:ffastdb/src/index/hash_index.dart';
@@ -8,6 +9,40 @@ import 'package:ffastdb/src/index/sorted_index.dart';
 import 'package:ffastdb/src/index/fts_index.dart';
 import 'package:ffastdb/src/index/bitmask_index.dart';
 import 'package:ffastdb/src/index/composite_index.dart';
+
+/// Top-level function for background isolate / worker post synthesis.
+List<Map<String, dynamic>> _generatePostsBatch(Map<String, dynamic> params) {
+  final int count = params['count'] as int;
+  final List<int> userIds = List<int>.from(params['userIds'] as List);
+  final List<String> phrases = List<String>.from(params['phrases'] as List);
+  final int seed = params['seed'] as int;
+
+  final random = Random(seed);
+  final batchPosts = <Map<String, dynamic>>[];
+  final nowMs = DateTime.now().millisecondsSinceEpoch;
+
+  for (int i = 0; i < count; i++) {
+    final uId = userIds[random.nextInt(userIds.length)];
+    final phrase = phrases[random.nextInt(phrases.length)];
+    batchPosts.add({
+      'type': 'post',
+      'userId': uId,
+      'content': phrase,
+      'likes': random.nextInt(500),
+      'timestamp': nowMs - random.nextInt(100 * 3600 * 1000),
+    });
+  }
+  return batchPosts;
+}
+
+/// Top-level function for background isolate / worker duplicate analysis.
+Map<String, int> _countPhrasesInBackground(List<String> contents) {
+  final counts = <String, int>{};
+  for (final content in contents) {
+    counts[content] = (counts[content] ?? 0) + 1;
+  }
+  return counts;
+}
 
 class QueryCondition {
   String field;
@@ -84,7 +119,7 @@ class _StressTestPageState extends State<StressTestPage> {
     setState(() => _totalDocs = count);
   }
 
-  Future<void> _setupComplexDB() async {
+  Future<void> _setupComplexDB({bool useIsolates = false}) async {
     if (_running) return;
     setState(() {
       _running = true;
@@ -94,7 +129,10 @@ class _StressTestPageState extends State<StressTestPage> {
     });
 
     try {
-      _log('🚀 Wiping and rebuilding Complex DB...');
+      final modeStr = useIsolates
+          ? (kIsWeb ? 'Web Worker (compute)' : 'Background Isolate')
+          : 'Main Thread';
+      _log('🚀 Wiping and rebuilding Complex DB using [$modeStr]...');
       // Clear existing data to ensure a clean state for the new indexes
       await widget.db.deleteWhere((q) => q.rangeSearch(1, 0x7FFFFFFF));
 
@@ -285,21 +323,36 @@ class _StressTestPageState extends State<StressTestPage> {
       
       for (int start = 0; start < totalPosts; start += batchSize) {
         final end = min(start + batchSize, totalPosts);
-        final batchPosts = <Map<String, dynamic>>[];
-        for (int i = start; i < end; i++) {
-          final uId = userIds[random.nextInt(userIds.length)];
-          final phrase = phrases[random.nextInt(phrases.length)];
-          batchPosts.add({
-            'type': 'post',
-            'userId': uId,
-            'content': phrase,
-            'likes': random.nextInt(500),
-            'timestamp': DateTime.now()
-                .subtract(Duration(hours: random.nextInt(100)))
-                .millisecondsSinceEpoch,
+        final count = end - start;
+
+        List<Map<String, dynamic>> batchPosts;
+        if (useIsolates) {
+          final mode = kIsWeb ? 'Web Worker (compute)' : 'Isolate';
+          _log('   🧵 [$mode] Synthesizing ${start + 1}..$end in background...');
+          batchPosts = await compute(_generatePostsBatch, {
+            'count': count,
+            'userIds': userIds,
+            'phrases': phrases,
+            'seed': random.nextInt(1000000),
           });
+        } else {
+          batchPosts = <Map<String, dynamic>>[];
+          for (int i = start; i < end; i++) {
+            final uId = userIds[random.nextInt(userIds.length)];
+            final phrase = phrases[random.nextInt(phrases.length)];
+            batchPosts.add({
+              'type': 'post',
+              'userId': uId,
+              'content': phrase,
+              'likes': random.nextInt(500),
+              'timestamp': DateTime.now()
+                  .subtract(Duration(hours: random.nextInt(100)))
+                  .millisecondsSinceEpoch,
+            });
+          }
         }
-        _log('   Inserting posts ${start + 1} to $end...');
+
+        _log('   💾 Inserting posts ${start + 1} to $end into FastDB...');
         final ids = await widget.db.insertAll(batchPosts);
         postIds.addAll(ids);
         setState(() => _progress = 0.1 + (end / totalPosts) * 0.7); // Progress from 0.1 to 0.8
@@ -469,16 +522,21 @@ class _StressTestPageState extends State<StressTestPage> {
     }
   }
 
-  Future<void> _checkDuplicates() async {
-    _log('🔍 Checking for repeated posts...');
+  Future<void> _checkDuplicates({bool useIsolate = true}) async {
+    final modeStr = useIsolate
+        ? (kIsWeb ? 'Web Worker (compute)' : 'Background Isolate')
+        : 'Main Thread';
+    _log('🔍 Checking for repeated posts using [$modeStr]...');
     setState(() => _running = true);
     try {
       final posts = await widget.db.query().where('type').equals('post').find();
-      final counts = <String, int>{};
+      final contents = posts.map((p) => p['content']?.toString() ?? '').toList();
 
-      for (final p in posts) {
-        final content = p['content']?.toString() ?? '';
-        counts[content] = (counts[content] ?? 0) + 1;
+      final Map<String, int> counts;
+      if (useIsolate) {
+        counts = await compute(_countPhrasesInBackground, contents);
+      } else {
+        counts = _countPhrasesInBackground(contents);
       }
 
       final duplicates = counts.entries.where((e) => e.value > 1).toList()
@@ -677,10 +735,11 @@ class _StressTestPageState extends State<StressTestPage> {
     setState(() => _running = true);
     try {
       _log('🗑️ Wiping DB...');
-      await widget.db.deleteWhere((q) => q.rangeSearch(1, 0x7FFFFFFF));
-      await widget.db.compact();
-      _refreshCount();
-      _log('✅ DB is now empty.');
+      await widget.db.clear();
+      await _refreshCount();
+      _log('✅ DB is now completely empty.');
+    } catch (e) {
+      _log('❌ ERROR: $e');
     } finally {
       setState(() => _running = false);
     }
@@ -885,8 +944,14 @@ class _StressTestPageState extends State<StressTestPage> {
               children: [
                 ActionChip(
                   avatar: const Icon(Icons.auto_awesome, size: 16),
-                  label: const Text('Reload Complex DB'),
-                  onPressed: _running ? null : _setupComplexDB,
+                  label: const Text('Reload DB (Main Thread)'),
+                  onPressed: _running ? null : () => _setupComplexDB(useIsolates: false),
+                ),
+                ActionChip(
+                  avatar: const Icon(Icons.memory, size: 16),
+                  label: Text(kIsWeb ? 'Reload DB (Web Worker)' : 'Reload DB (Isolate)'),
+                  backgroundColor: Colors.blue[100],
+                  onPressed: _running ? null : () => _setupComplexDB(useIsolates: true),
                 ),
                 ActionChip(
                   avatar: const Icon(Icons.search, size: 16),
@@ -910,8 +975,8 @@ class _StressTestPageState extends State<StressTestPage> {
                 ),
                 ActionChip(
                   avatar: const Icon(Icons.copy, size: 16),
-                  label: const Text('Check Duplicates'),
-                  onPressed: _running ? null : _checkDuplicates,
+                  label: Text(kIsWeb ? 'Duplicates (Worker)' : 'Duplicates (Isolate)'),
+                  onPressed: _running ? null : () => _checkDuplicates(useIsolate: true),
                 ),
                 ActionChip(
                   avatar: const Icon(Icons.add_circle_outline, size: 16),

@@ -495,8 +495,17 @@ class FastDB {
               await _crudOps.deleteImpl(op.id!);
               break;
           }
-        } catch (_) {
-          // Skip failed replays
+        } catch (e, st) {
+          // Skip failed replays so a single bad entry doesn't block startup.
+          // Log the failure in debug mode for diagnostics.
+          assert(() {
+            // ignore: avoid_print
+            print(
+              '[ffastdb] Warning: replay of ${op.type}(id=${op.id}) '
+              'failed and was skipped: $e\n$st',
+            );
+            return true;
+          }());
         }
       }
     } finally {
@@ -1136,7 +1145,15 @@ class FastDB {
     // Verify CRC — same check as the sync path (_readAtSync).
     if (fullData.length >= totalSize) {
       final storedCrc = _readInt32(fullData, 4 + length);
-      if (storedCrc != _crc32(fullData.sublist(4, 4 + length))) return null;
+      final computedCrc = _crc32(fullData.sublist(4, 4 + length));
+      if (storedCrc != 0 && storedCrc != computedCrc) {
+        throw StateError(
+          'FastDB: CRC32 mismatch at offset $offset '
+          '(stored 0x${storedCrc.toRadixString(16)}, '
+          'computed 0x${computedCrc.toRadixString(16)}). '
+          'Document data may be corrupted.',
+        );
+      }
     }
     final body = fullData.sublist(4, 4 + length);
 
@@ -1181,16 +1198,12 @@ class FastDB {
   Uint8List _serialize(dynamic doc, {int? id}) {
     final Uint8List payload;
     if (doc is Map) {
-      // Copy ONLY when we must inject ffdbID (the old code copied
-      // unconditionally AND then again conditionally — the "optimization"
-      // was broken). When no injection is needed, pass the map straight to
-      // the serializer (it only reads).
-      final Map<String, dynamic> map;
-      if (id != null && doc['ffdbID'] != id) {
-        map = Map<String, dynamic>.from(doc)..['ffdbID'] = id;
-      } else {
-        map = doc.cast<String, dynamic>();
-      }
+      // Always use a defensive copy — Map.cast<K,V>() is lazy and defers type
+      // checking until each key is accessed (inside the serializer), making
+      // CastErrors hard to trace. From(doc) validates eagerly and also protects
+      // the caller's original map from any accidental mutation.
+      final map = Map<String, dynamic>.from(doc);
+      if (id != null) map['ffdbID'] = id;
 
       payload = FastSerializer.serialize(map);
     } else if (_registry.getTypeId(doc.runtimeType) != null) {
@@ -1283,6 +1296,7 @@ class FastDB {
       await storage.flush();
       await _saveHeader();
       _queryCache.clear();
+      _notifyWatchersBatch();
       if (_autoCompactThreshold > 0) {
         await _maybeAutoCompact();
       }
@@ -1300,12 +1314,12 @@ class FastDB {
 
   // ─── Compact (Vacuum) ──────────────────────────────────────────────────────
 
-  /// Compacts the database inside a WAL transaction. The single-file path
-  /// truncates and rewrites the whole file; before this was transactional, a
-  /// crash or write failure (ENOSPC) after the truncate permanently destroyed
-  /// every document not yet rewritten. Now the truncate is recorded in the
-  /// WAL and applied only at commit — all-or-nothing.
+  /// Compacts the database inside a WAL transaction.
   Future<void> compact() => transaction(() => _storageMgr.compactImpl());
+
+  /// Completely removes all documents from the database in O(1) time and resets
+  /// auto-increment IDs to 1.
+  Future<void> clear() => _exclusive(() => _storageMgr.clearImpl());
 
   // ─── Migrations ────────────────────────────────────────────────────────────
 

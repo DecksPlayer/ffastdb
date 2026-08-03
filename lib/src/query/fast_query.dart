@@ -699,7 +699,8 @@ class QueryBuilder {
         // their indexed value — O(k log k) instead of scanning the WHOLE
         // index O(N) to filter k results.
         if (ids.isNotEmpty &&
-            ids.length * 4 < idx.size &&
+            idx.size > 0 &&
+            ids.length < idx.size ~/ 4 &&
             idx.valueOf(ids.first) != null) {
           int cmp(int a, int b) {
             final va = idx.valueOf(a);
