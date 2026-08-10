@@ -32,7 +32,7 @@ class IndexedDbStorageStrategy implements StorageStrategy {
   /// Maximum number of chunks kept in the in-memory LRU cache.
   /// 32 × 64 KB = 2 MB — enough to hold the full B-Tree working set for
   /// most apps while keeping RAM bounded regardless of database size.
-  static const int _maxCachedChunks = 32;
+  static const int _maxCachedChunks = 2048;
 
   final String _dbName;
   final String _storeName = 'ffastdb_store';

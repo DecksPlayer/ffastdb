@@ -78,6 +78,7 @@ class _BatchOperations {
       await _db._pageManager.flushDirty();
       await _db.dataStorage?.flush();
       await _db.storage.flush();
+      await _db._saveIndexes();
       await _db._saveHeader();
       _db._queryCache.clear();
       _db._disableWriteBehind();

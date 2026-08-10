@@ -12,6 +12,7 @@ import 'index/sorted_index.dart';
 import 'index/bitmask_index.dart';
 import 'index/composite_index.dart';
 import 'index/fts_index.dart';
+import 'index/parallel_indexer.dart';
 import 'query/fast_query.dart';
 import 'query/query_cache.dart';
 import 'serialization/fast_serializer.dart';
@@ -431,8 +432,10 @@ class FastDB {
             .where((k) => !loadedKeys.contains(k))
             .toList();
         if (missingKeys.isNotEmpty) {
-          // Some newly registered indexes weren't in the payload, rebuild them!
-          await _indexMgr.rebuildSecondaryIndexes(onProgress: onProgress);
+          // Rebuild ONLY newly added/missing indexes, keeping pre-loaded indexes in RAM
+          for (final key in missingKeys) {
+            await _indexMgr.reindex(field: key);
+          }
         }
       } else {
         await _indexMgr.rebuildSecondaryIndexes(onProgress: onProgress);
@@ -1196,6 +1199,24 @@ class FastDB {
     if (doc is Map) migrateLegacyDoc(doc);
     return doc;
   }
+
+  /// Reads raw document bytes (length header + payload + CRC32) at [offset] without deserialization.
+  Future<Uint8List?> _readRawAt(int offset) async {
+    if (offset < 0) return null;
+    if (dataStorage == null && offset < PageManager.pageSize) return null;
+    final targetStorage = dataStorage ?? storage;
+    const int readAheadSize = 512;
+    final chunk = await targetStorage.read(offset, readAheadSize);
+    if (chunk.length < 4) return null;
+    final length = _readInt32(chunk, 0);
+    if (length <= 0 || length > 10 * 1024 * 1024) return null;
+    final int totalSize = 4 + length + 4;
+    if (totalSize <= chunk.length) {
+      return Uint8List.fromList(chunk.sublist(0, totalSize));
+    }
+    return targetStorage.read(offset, totalSize);
+  }
+
 
   // Serialization & Encoding
 

@@ -1,3 +1,7 @@
+## 0.3.3
+**Fix - Delete** - Clear all the docs in the database works well
+**Fix - Rebuild Indexes** - Rebuild all the indexes in the database works well 
+
 ## 0.3.2
 
 ### Bugfix release — crash safety and reactive consistency

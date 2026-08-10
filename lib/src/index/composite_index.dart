@@ -88,6 +88,13 @@ class CompositeIndex extends SecondaryIndex {
   }
 
   @override
+  void addAll(Map<int, dynamic> entries) {
+    for (final e in entries.entries) {
+      add(e.key, e.value);
+    }
+  }
+
+  @override
   Iterable<int> search(String operator, dynamic value) {
     if (operator == 'equals') return lookup(value);
     return [];

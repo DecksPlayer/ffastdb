@@ -81,6 +81,13 @@ class FtsIndex extends SecondaryIndex {
     }
   }
 
+  @override
+  void addAll(Map<int, dynamic> entries) {
+    for (final e in entries.entries) {
+      add(e.key, e.value);
+    }
+  }
+
   /// Searches for documents matching the query tokens.
   /// Returns docs matching ALL tokens (AND semantics).
   @override

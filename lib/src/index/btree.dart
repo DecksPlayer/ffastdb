@@ -679,6 +679,54 @@ class BTree {
     }
   }
 
+  /// Returns all (key, offset) pairs where key is between [low] and [high] (inclusive).
+  Future<List<MapEntry<int, int>>> rangeSearchEntries(int low, int high) async {
+    final results = <MapEntry<int, int>>[];
+    if (rootPage == null || rootPage == 0) return results;
+    final seenIds = <int>{};
+    await _rangeNodeEntries(rootPage!, low, high, results, null, seenIds);
+    return results;
+  }
+
+  Future<void> _rangeNodeEntries(
+    int pageIdx,
+    int low,
+    int high,
+    List<MapEntry<int, int>> out,
+    Set<int>? visited,
+    Set<int>? seenIds,
+  ) async {
+    visited ??= {};
+    if (!visited.add(pageIdx)) return;
+
+    BTreeNode? node = _readNodeSync(pageIdx);
+    node ??= await _readNode(pageIdx);
+
+    for (int i = 0; i < node.keys.length; i++) {
+      final k = node.keys[i];
+
+      if (!node.isLeaf && k >= low) {
+        if (node.values[i] > 0) {
+          await _rangeNodeEntries(node.values[i], low, high, out, visited, seenIds);
+        }
+      }
+
+      if (k > high) return;
+
+      if (k >= low && node.isLeaf && (seenIds == null || seenIds.add(k))) {
+        out.add(MapEntry(k, node.values[i]));
+      }
+    }
+
+    if (!node.isLeaf &&
+        node.values.length > node.keys.length &&
+        (node.keys.isEmpty || node.keys.last <= high)) {
+      if (node.values.last > 0) {
+        await _rangeNodeEntries(node.values.last, low, high, out, visited, seenIds);
+      }
+    }
+  }
+
   // ─── Helpers ─────────────────────────────────────────────────────────────
 
   /// Returns the first index `i` such that `keys[i] >= key` (lower bound).

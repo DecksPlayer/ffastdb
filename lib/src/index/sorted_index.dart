@@ -127,6 +127,67 @@ class SortedIndex implements SecondaryIndex {
   }
 
   @override
+  void addAll(Map<int, dynamic> entries) {
+    if (entries.isEmpty) return;
+
+    final valid = <MapEntry<int, dynamic>>[];
+    for (final e in entries.entries) {
+      if (e.value != null) {
+        _reverse[e.key] = e.value;
+        valid.add(e);
+      }
+    }
+
+    if (valid.isEmpty) return;
+
+    final newLen = _length + valid.length;
+    while (_capacity < newLen) {
+      _capacity *= 2;
+    }
+
+    if (_capacity > _docIds.length) {
+      final newDocIds = Uint32List(_capacity);
+      newDocIds.setRange(0, _length, _docIds);
+      _docIds = newDocIds;
+
+      final newKeys = List<dynamic>.filled(_capacity, null);
+      newKeys.setRange(0, _length, _keys);
+      _keys = newKeys;
+    }
+
+    for (int i = 0; i < valid.length; i++) {
+      _docIds[_length + i] = valid[i].key;
+      _keys[_length + i] = valid[i].value;
+    }
+    _length = newLen;
+
+    _sortAll();
+  }
+
+  void _sortAll() {
+    if (_length <= 1) return;
+
+    final indices = List<int>.generate(_length, (i) => i);
+    indices.sort((a, b) {
+      final cmp = _compare(_keys[a], _keys[b]);
+      if (cmp != 0) return cmp;
+      return _docIds[a].compareTo(_docIds[b]);
+    });
+
+    final sortedDocIds = Uint32List(_capacity);
+    final sortedKeys = List<dynamic>.filled(_capacity, null);
+
+    for (int i = 0; i < _length; i++) {
+      final idx = indices[i];
+      sortedDocIds[i] = _docIds[idx];
+      sortedKeys[i] = _keys[idx];
+    }
+
+    _docIds = sortedDocIds;
+    _keys = sortedKeys;
+  }
+
+  @override
   void remove(int docId, [dynamic fieldValue]) {
     if (fieldValue == null) return;
     

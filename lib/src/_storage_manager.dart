@@ -232,6 +232,7 @@ class _StorageManager {
     }
 
     _db._deletedCount = 0;
+    await saveIndexes();
     await saveHeader();
     await _db.storage.flush();
     if (_db.dataStorage != null) await _db.dataStorage!.flush();
