@@ -262,6 +262,11 @@ class _StorageManager {
       await _db._primaryIndex.insert(0, 0);
       _db._dataOffset = await _db.storage.size;
 
+      // Zero out the secondary-index block pointer (bytes 16-23) so that
+      // loadIndexes() on the next open does not find a stale offset/length
+      // and reload old index data from beyond the now-truncated file.
+      await _db.storage.write(16, Uint8List(8));
+
       await saveHeader();
       await _db.storage.flush();
       if (_db.dataStorage != null) await _db.dataStorage!.flush();
