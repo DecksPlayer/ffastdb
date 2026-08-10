@@ -368,7 +368,11 @@ class FastDB {
   /// Rebuilds secondary indexes from live documents.
   ///
   /// Pass [field] to rebuild only that index; omit to rebuild all.
-  Future<void> reindex([String? field]) => _indexMgr.reindex(field);
+  /// [batchSize] controls how many documents are fetched concurrently per
+  /// iteration (default 32). Increase for faster storage, decrease for
+  /// memory-constrained environments.
+  Future<void> reindex({String? field, int batchSize = 32}) =>
+      _indexMgr.reindex(field: field, batchSize: batchSize);
 
   // ─── Open / Close ─────────────────────────────────────────────────────────
 

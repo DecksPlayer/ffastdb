@@ -45,7 +45,7 @@ void main() async {
   // Now try the actual reindex
   print('\nCalling reindex("city")...');
   try {
-    await db.reindex('city');
+    await db.reindex(field: 'city');
     print('  reindex() completed successfully');
   } catch (e) {
     print('  ERROR during reindex(): $e');

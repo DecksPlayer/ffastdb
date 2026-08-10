@@ -93,7 +93,10 @@ class IndexManager {
   /// Pass [field] to rebuild only that index; omit to rebuild all.
   /// Deduplicates IDs from rangeSearch to guard against B-Tree structural
   /// inconsistencies from pre-0.0.24 versions.
-  Future<void> reindex([String? field]) async {
+  ///
+  /// Uses concurrent batch I/O ([batchSize] reads in parallel via Future.wait)
+  /// to dramatically reduce total wall-clock time compared to serial reads.
+  Future<void> reindex({String? field, int batchSize = 32}) async {
     if (field != null) {
       final idx = _db._secondaryIndexes[field];
       if (idx == null) throw ArgumentError('No index registered for field "$field"');
@@ -102,26 +105,46 @@ class IndexManager {
       // BUG FIX: Deduplicate IDs — rangeSearch may return same ID multiple times
       // from B-Tree structural inconsistencies in pre-0.0.24 databases.
       final allIds = LinkedHashSet<int>.from(rawIds).toList();
-      for (int i = 0; i < allIds.length; i++) {
-        final doc = await _db.findById(allIds[i]);
-        if (doc is Map) {
-          final castedDoc = Map<String, dynamic>.from(doc);
-          final val = _extractField(castedDoc, field);
-          if (val != null) idx.add(allIds[i], val);
-        }
-        if (i > 0 && i % 250 == 0) await Future.delayed(Duration.zero);
-      }
+      await _reindexField(idx, allIds, field, batchSize: batchSize);
       // Invalidate query cache since the index was rebuilt
       _db._queryCache.clear();
     } else {
-      await rebuildSecondaryIndexes();
+      await rebuildSecondaryIndexes(batchSize: batchSize);
       // Invalidate query cache since all indexes were rebuilt
       _db._queryCache.clear();
     }
   }
 
+  Future<void> _reindexField(
+    SecondaryIndex idx,
+    List<int> allIds,
+    String field, {
+    int batchSize = 250,
+  }) async {
+    final effectiveBatchSize = batchSize > 0 ? batchSize : 250;
+    for (int i = 0; i < allIds.length; i += effectiveBatchSize) {
+      final end = (i + effectiveBatchSize < allIds.length) ? i + effectiveBatchSize : allIds.length;
+      final batch = allIds.sublist(i, end);
+
+      final docs = await Future.wait(
+        batch.map((id) => _db._findById(id)),
+        eagerError: false,
+      );
+
+      for (int j = 0; j < batch.length; j++) {
+        final doc = docs[j];
+        if (doc is Map) {
+          final val = _extractField(doc, field);
+          if (val != null) idx.add(batch[j], val);
+        }
+      }
+
+      await Future.delayed(Duration.zero);
+    }
+  }
+
   /// Indexes a single document into all secondary indexes.
-  void indexDocument(int id, Map<String, dynamic> doc) {
+  void indexDocument(int id, Map doc) {
     for (final idx in _db._secondaryIndexes.values) {
       if (idx is CompositeIndex) {
         final values = idx.fieldNames.map((f) => _extractField(doc, f)).toList();
@@ -137,7 +160,7 @@ class IndexManager {
   }
 
   /// Removes a document from all secondary indexes.
-  void removeDocument(int id, Map<String, dynamic> doc) {
+  void removeDocument(int id, Map doc) {
     for (final idx in _db._secondaryIndexes.values) {
       if (idx is CompositeIndex) {
         final values = idx.fieldNames.map((f) => _extractField(doc, f)).toList();
@@ -151,7 +174,7 @@ class IndexManager {
     }
   }
 
-  dynamic _extractField(Map<String, dynamic> doc, String fieldPath) {
+  dynamic _extractField(Map doc, String fieldPath) {
     if (!fieldPath.contains('.')) return doc[fieldPath];
     
     final parts = fieldPath.split('.');
@@ -163,32 +186,48 @@ class IndexManager {
     return current;
   }
 
-  /// Rebuilds all secondary indexes from live documents.
+  /// Rebuilds all secondary indexes from live documents using concurrent
+  /// batch reads. [batchSize] controls how many documents are read in
+  /// parallel per iteration (default 250).
+  ///
   /// Deduplicates IDs to prevent index corruption from B-Tree structural issues.
-  Future<void> rebuildSecondaryIndexes({void Function(double)? onProgress}) async {
+  Future<void> rebuildSecondaryIndexes({
+    void Function(double)? onProgress,
+    int batchSize = 250,
+  }) async {
     if (_db._secondaryIndexes.isEmpty) return;
     for (final idx in _db._secondaryIndexes.values) idx.clear();
     final rawIds = await _db._primaryIndex.rangeSearch(1, 0x7FFFFFFF);
-    // BUG FIX: Deduplicate IDs — rangeSearch may return same ID multiple times
-    // from B-Tree structural inconsistencies in pre-0.0.24 databases.
-    // This was exposed when 0.0.23 added implicit rebuildSecondaryIndexes() on startup.
     final allIds = LinkedHashSet<int>.from(rawIds).toList();
-    for (int i = 0; i < allIds.length; i++) {
-      final id = allIds[i];
-      try {
-        final doc = await _db.findById(id);
+
+    final effectiveBatchSize = batchSize > 0 ? batchSize : 250;
+
+    for (int i = 0; i < allIds.length; i += effectiveBatchSize) {
+      final end = (i + effectiveBatchSize < allIds.length) ? i + effectiveBatchSize : allIds.length;
+      final batch = allIds.sublist(i, end);
+
+      final docs = await Future.wait(
+        batch.map((id) async {
+          try {
+            return await _db._findById(id);
+          } catch (_) {
+            return null;
+          }
+        }),
+        eagerError: false,
+      );
+
+      for (int j = 0; j < batch.length; j++) {
+        final doc = docs[j];
         if (doc is Map) {
-          indexDocument(id, Map<String, dynamic>.from(doc));
+          indexDocument(batch[j], doc);
         }
-      } catch (_) {
-        // Corrupt document — skip and continue indexing the rest.
-        // It will be removed on the next compact().
       }
-      if (i > 0 && i % 250 == 0) {
-        if (onProgress != null) onProgress(i / allIds.length);
-        await Future.delayed(Duration.zero);
-      }
+
+      if (onProgress != null) onProgress((end / allIds.length).clamp(0.0, 1.0));
+      await Future.delayed(Duration.zero);
     }
+
     if (onProgress != null) onProgress(1.0);
   }
 }

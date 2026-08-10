@@ -130,7 +130,7 @@ Future<void> main(List<String> args) async {
       var i = 0;
       while (true) {
         await db.insert(doc(i));
-        if (i % 25 == 24) await db.reindex('status');
+        if (i % 25 == 24) await db.reindex(field: 'status');
         i++;
       }
     case 'blob':
