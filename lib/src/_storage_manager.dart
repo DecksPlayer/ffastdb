@@ -207,6 +207,15 @@ class _StorageManager {
       _db._primaryIndex.rootPage = null;                // force a fresh root on first insert
       for (final idx in _db._secondaryIndexes.values) idx.clear();
 
+      // Zero out the secondary-index block pointer (bytes 16-23) — same fix
+      // as clearImpl(). Without this, saveIndexes() below sees the STALE
+      // pre-compact offset/length and, if the freshly-rebuilt index still
+      // fits in that old length, "reuses" that offset directly instead of
+      // computing a fresh one from the (now much smaller, rebuilt) file
+      // size — landing the index blob in the middle of the just-rewritten
+      // document data and corrupting it.
+      await _db.storage.write(16, Uint8List(8));
+
       // Create the initial sentinel entry (id=0, offset=0) — same as open().
       await _db._primaryIndex.insert(0, 0);
       // Mark header dirty so clean-flag byte is written below.
