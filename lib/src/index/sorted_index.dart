@@ -524,7 +524,16 @@ class SortedIndex implements SecondaryIndex {
       switch (tag) {
         case 1: off += 4;
         case 2: case 5: off += 8;
-        case 3: off += readInt32();
+        case 3:
+          // NOT `off += readInt32()`: readInt32() already advances `off` by
+          // 4 as a side effect (past the length field itself), but Dart
+          // evaluates the `off` being added-to BEFORE that side effect runs
+          // — so `off += readInt32()` silently drops those 4 bytes, then
+          // corrupts every read after it once idCount is parsed a few bytes
+          // too early (garbage int becomes a huge id count → runs off the
+          // end of the array). Read the length into a local first instead.
+          final strLen = readInt32();
+          off += strLen;
         case 4: off += 1;
       }
       final idCount = readInt32();

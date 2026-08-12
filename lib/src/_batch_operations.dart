@@ -51,12 +51,16 @@ class _BatchOperations {
         await _db._primaryIndex.bulkLoad(_db._batchEntries);
         _db._batchEntries.clear();
 
-        // 3. Index chunk into secondary indexes
+        // 3. Index chunk into secondary indexes — batched (see
+        // indexDocumentsBatch: one add() per document is O(n) per call for
+        // SortedIndex, making a large chunk O(n^2) in its own size).
+        final chunkDocs = <MapEntry<int, Map<String, dynamic>>>[];
         for (int j = i; j < end; j++) {
           if (docs[j] is Map) {
-            _db._indexDocument(ids[j], Map<String, dynamic>.from(docs[j]));
+            chunkDocs.add(MapEntry(ids[j], Map<String, dynamic>.from(docs[j])));
           }
         }
+        _db._indexMgr.indexDocumentsBatch(chunkDocs);
         
         // 4. Checkpoint header to ensure _nextId recovery works if crash occurs
         // This is crucial for Duplicate ID prevention.

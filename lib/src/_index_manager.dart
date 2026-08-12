@@ -124,13 +124,23 @@ class IndexManager {
     final effectiveBatchSize = batchSize > 0 ? batchSize : 5000;
     final extractedMap = <int, dynamic>{};
 
+    // The document field(s) to extract are the INDEX's own field name(s) —
+    // NOT necessarily `field`, which is the index's key in _secondaryIndexes
+    // and only happens to equal the document field for Hash/Sorted/Bitmask
+    // indexes. FtsIndex is keyed "_fts_<field>" (its own fieldName is the
+    // plain field, e.g. "content"), and CompositeIndex needs ALL of its
+    // fieldNames, not its "a+b" join key. Using `field` directly here used
+    // to extract nothing for both — silently leaving them empty after any
+    // reindex (e.g. the fallback path `open()` takes for an index whose
+    // persisted blob failed to load).
+    final composite = idx is CompositeIndex ? idx : null;
+    final fieldPaths = composite != null ? composite.fieldNames : [idx.fieldName];
+
     for (int i = 0; i < docEntries.length; i += effectiveBatchSize) {
       final end = (i + effectiveBatchSize < docEntries.length) ? i + effectiveBatchSize : docEntries.length;
       final batch = docEntries.sublist(i, end);
 
-      final rawResults = await Future.wait(
-        batch.map((e) => _db._readRawAt(e.value)),
-      );
+      final rawResults = await _db._batchReadRaw(batch);
 
       final rawDocs = <MapEntry<int, Uint8List>>[];
       for (int j = 0; j < batch.length; j++) {
@@ -140,12 +150,19 @@ class IndexManager {
         }
       }
 
-      final extractedDocs = await runParallelExtraction(rawDocs, [field]);
+      final extractedDocs = await runParallelExtraction(rawDocs, fieldPaths);
 
       for (final doc in extractedDocs) {
-        final val = doc.fields[field];
-        if (val != null) {
-          extractedMap[doc.docId] = val;
+        if (composite != null) {
+          final values = fieldPaths.map((f) => doc.fields[f]).toList();
+          if (values.any((v) => v != null)) {
+            extractedMap[doc.docId] = values;
+          }
+        } else {
+          final val = doc.fields[idx.fieldName];
+          if (val != null) {
+            extractedMap[doc.docId] = val;
+          }
         }
       }
 
@@ -168,6 +185,45 @@ class IndexManager {
         final val = _extractField(doc, idx.fieldName);
         if (val != null) idx.add(id, val);
       }
+    }
+  }
+
+  /// Batched version of [indexDocument] for bulk operations (insertAll,
+  /// compact rebuild): collects field values per index across the WHOLE
+  /// batch and applies them with one [SecondaryIndex.addAll] call each,
+  /// instead of one [SecondaryIndex.add] call per document.
+  ///
+  /// Matters most for SortedIndex, whose add() does an O(n) array shift to
+  /// keep entries sorted — calling it once per document while indexing a
+  /// 10,000-doc insertAll chunk costs O(n) per call against an index that
+  /// keeps growing, i.e. O(n^2) for the chunk. addAll() sorts the whole
+  /// (existing + new) array ONCE, i.e. O(n log n) — the same trick
+  /// [rebuildSecondaryIndexes] already uses.
+  void indexDocumentsBatch(List<MapEntry<int, Map<String, dynamic>>> docs) {
+    if (_db._secondaryIndexes.isEmpty || docs.isEmpty) return;
+
+    final fieldValues = <SecondaryIndex, Map<int, dynamic>>{
+      for (final idx in _db._secondaryIndexes.values) idx: <int, dynamic>{}
+    };
+
+    for (final entry in docs) {
+      final id = entry.key;
+      final doc = entry.value;
+      for (final idx in _db._secondaryIndexes.values) {
+        if (idx is CompositeIndex) {
+          final values = idx.fieldNames.map((f) => _extractField(doc, f)).toList();
+          if (values.any((v) => v != null)) {
+            fieldValues[idx]![id] = values;
+          }
+        } else {
+          final val = _extractField(doc, idx.fieldName);
+          if (val != null) fieldValues[idx]![id] = val;
+        }
+      }
+    }
+
+    for (final entry in fieldValues.entries) {
+      entry.key.addAll(entry.value);
     }
   }
 
@@ -237,9 +293,7 @@ class IndexManager {
       final end = (i + effectiveBatchSize < uniqueEntries.length) ? i + effectiveBatchSize : uniqueEntries.length;
       final batch = uniqueEntries.sublist(i, end);
 
-      final rawResults = await Future.wait(
-        batch.map((e) => _db._readRawAt(e.value)),
-      );
+      final rawResults = await _db._batchReadRaw(batch);
 
       final rawDocs = <MapEntry<int, Uint8List>>[];
       for (int j = 0; j < batch.length; j++) {

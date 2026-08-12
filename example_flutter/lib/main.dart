@@ -1,4 +1,4 @@
-import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:flutter/foundation.dart' show kIsWeb, debugPrint;
 import 'package:flutter/material.dart';
 import 'package:ffastdb/ffastdb.dart';
 import 'package:path_provider/path_provider.dart';
@@ -9,6 +9,13 @@ import 'stress_test_page.dart';
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
+  // debugPrint (not dart:developer's log()) — log() only shows up in
+  // DevTools' Logging view, never in the plain `flutter run` / IDE debug
+  // console. debugPrint shows in both, and on every hot restart (main()
+  // genuinely re-runs on hot restart — the isolate is torn down and
+  // recreated, so nothing here is "stale").
+  debugPrint('[ffastdb] main() start');
+
   // On web/WASM the directory is ignored — openDatabase() uses localStorage.
   // On native, path_provider gives a suitable persistent directory.
   String dir = '';
@@ -17,14 +24,37 @@ void main() async {
     dir = appDir.path;
   }
 
+  // Timed + progress-logged open: if open() is slow, this tells you WHY —
+  // either it's stuck rebuilding secondary indexes (progress ticks below,
+  // which only happens when the last shutdown wasn't clean — e.g. a Flutter
+  // hot restart, which never calls db.close()) or something else entirely
+  // (in which case you'll only see the start/end lines with a big gap).
+  final openSw = Stopwatch()..start();
+  debugPrint('[ffastdb] openDatabase: starting…');
+  double lastLoggedProgress = -1;
   final db = await openDatabase(
-    'wordnotes', 
-    directory: dir, 
+    'wordnotes',
+    directory: dir,
     version: 1,
     indexes: ['type', 'userId', 'postId'],
     sortedIndexes: ['word', 'content', 'likes'],
     ftsIndexes: ['content'],
     compositeIndexes: [['type', 'userId']],
+    onProgress: (p) {
+      // rebuildSecondaryIndexes() reports 0.0..1.0 — only fires on a dirty
+      // (unclean-shutdown) open, so seeing this at all is itself a signal.
+      if (p - lastLoggedProgress >= 0.1 || p >= 1.0) {
+        lastLoggedProgress = p;
+        debugPrint(
+          '[ffastdb] openDatabase: rebuilding indexes ${(p * 100).toStringAsFixed(0)}% '
+          '(${openSw.elapsedMilliseconds}ms elapsed)',
+        );
+      }
+    },
+  );
+  openSw.stop();
+  debugPrint(
+    '[ffastdb] openDatabase: done in ${openSw.elapsedMilliseconds}ms, ${await db.count()} docs',
   );
 
   runApp(WordAnnotatorApp(db: db));
@@ -78,12 +108,20 @@ class _WordListPageState extends State<WordListPage> {
   }
 
   Future<void> _load() async {
-    final ids = await widget.db.rangeSearch(1, 0x7FFFFFFF);
+    // NOT rangeSearch() + findById() per id: that fetches EVERY document in
+    // the whole database (including the stress-test page's ~100k seeded
+    // posts/users/comments, which share this same DB) one network/disk
+    // round-trip at a time, just to throw almost all of them away below.
+    // With 100k stress-test docs present this alone is what looked like the
+    // app being "stuck blank" after a fast-looking open() — not the DB open,
+    // but this screen's own load path. `word` already has a sorted index
+    // (registered in main()), so ask the DB to filter server-side instead:
+    // only docs that HAVE a `word` field come back at all.
+    final docs = await widget.db.query().where('word').isNotNull().find();
     final maps = <Map<String, dynamic>>[];
-    for (final id in ids) {
-      final doc = await widget.db.findById(id);
+    for (final doc in docs) {
       if (doc is Map<String, dynamic> && doc['word'] is String && doc['note'] is String) {
-        maps.add({...doc, '__dbId': id});
+        maps.add({...doc, '__dbId': doc['ffdbID']});
       }
     }
     maps.sort((a, b) =>

@@ -1,4 +1,4 @@
-# FFastDB 🚀 `v0.3.1`
+# FFastDB 🚀 `v0.3.5`
 
 A high-performance, pure-Dart NoSQL database for Flutter & server-side Dart.
 
@@ -562,15 +562,48 @@ FastDB
 
 ## Performance
 
-Benchmarks on a mid-range device (in-memory storage):
+Measured with `dart run benchmark/*.dart` on the Dart VM (desktop, release-equivalent).
+Numbers are throughput (docs/sec), not fixed durations — bulk operations use `insertAll()`,
+which batches writes and defers index updates until the whole batch is applied.
 
-| Operation | FastDB | Hive |
-|---|---|---|
-| Single insert | ~0.3 ms | ~0.1 ms |
-| Batch 5k inserts | **89 ms** | N/A |
-| Lookup by ID (B-Tree) | ~1.8 ms | O(n) |
-| Query by index (1 667/5 000) | ~3 ms | O(n) |
-| LRU cache hit rate | **100 %** | N/A |
+**In-memory storage** (`benchmark/million_benchmark.dart`):
+
+| Operation | Throughput |
+|---|---|
+| Batch insert (1M docs) | 118.6k ops/s |
+| Sequential insert (1M docs) | 139.1k ops/s |
+| `findById` (DB size: 1M) | 285.2k ops/s |
+| HashIndex query (DB size: 1M) | 1.54M ops/s |
+| SortedIndex range query (DB size: 1M) | 794.3k ops/s |
+
+**Real disk storage** (`benchmark/disk_insert_benchmark.dart`, `WalStorageStrategy` + `IoStorageStrategy` — the default native backend, with WAL crash-safety on):
+
+| Operation | Throughput |
+|---|---|
+| `insertAll()`, 100k docs, no indexes | ~80k docs/s |
+| `insertAll()`, 1,000,000 docs, no indexes | ~34k docs/s |
+| `reindex()`, 100k docs, 1 index | ~45k docs/s |
+
+These are all bulk-path numbers (`insertAll()` / `reindex()`), which batch I/O and index
+updates. Individual `insert()`/`update()` calls are WAL-transactional (durable per call) and
+correspondingly slower — see `benchmark/batch_write_benchmark.dart` for a side-by-side of
+single inserts vs. `insertAll()` on the same dataset.
+
+**Flutter Database Comparison Benchmark** (`flutter_benchmark/`, real disk I/O, `n = 10,000` docs):
+
+| Operation | `ffastdb` | `isar_community` | `sembast` | Key Insight |
+|---|---|---|---|---|
+| `insertAll` (bulk) | **39.7k ops/s** | **153.8k ops/s** | 15.3k ops/s | `ffastdb` is **2.6× faster** than `sembast`. |
+| `singleInsert` (durable WAL) | **382 ops/s** | **498 ops/s** | 97 ops/s | `ffastdb` WAL speed is **4× faster** than `sembast`. |
+| `queryIndexed` (2k queries) | 151 ops/s | **583 ops/s** | 245 ops/s | `isar` leads in query execution; `ffastdb` page cache handles disk reads. |
+| `findById` (5k lookups) | **13.9k ops/s** | 9.2k ops/s | **333.3k ops/s** | `ffastdb` B-Tree lookups are **1.5× faster** than `isar`. |
+
+Run the benchmark suite:
+```bash
+cd flutter_benchmark
+dart run bin/run_benchmark.dart 10000
+```
+
 
 ---
 

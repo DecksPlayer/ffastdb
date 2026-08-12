@@ -111,20 +111,30 @@ class _StorageManager {
           case 5: idx = CompositeIndex.deserialize(indexBytes);
           default: continue;
         }
-        // If the user changed index type between startups (e.g. HashIndex →
-        // SortedIndex), the pre-registered type wins — discard the old blob so
-        // _rebuildSecondaryIndexes() will rebuild with the correct type.
-        final existing = _db._secondaryIndexes[idx.fieldName];
-        if (existing != null && existing.runtimeType != idx.runtimeType) {
-          continue;
-        }
 
+        // The _secondaryIndexes map key is NOT always idx.fieldName: FtsIndex
+        // is keyed "_fts_<field>" (idx.fieldName is just the plain field —
+        // shared with, e.g., a SortedIndex on the same field, which is a
+        // DIFFERENT registered index) and CompositeIndex is keyed by its
+        // joined field names. Compute the real key FIRST — looking up by
+        // idx.fieldName directly could find an unrelated index sharing that
+        // plain field name and reject this one as a "type mismatch",
+        // silently discarding it even though nothing is actually wrong.
         String key = idx.fieldName;
         if (idx is FtsIndex) {
           key = '_fts_${idx.fieldName}';
         } else if (idx is CompositeIndex) {
           key = idx.fieldNames.join('+');
         }
+
+        // If the user changed index type between startups (e.g. HashIndex →
+        // SortedIndex), the pre-registered type wins — discard the old blob so
+        // _rebuildSecondaryIndexes() will rebuild with the correct type.
+        final existing = _db._secondaryIndexes[key];
+        if (existing != null && existing.runtimeType != idx.runtimeType) {
+          continue;
+        }
+
         _db._secondaryIndexes[key] = idx;
         loadedKeys.add(key);
       }
@@ -224,19 +234,25 @@ class _StorageManager {
       }
       _db._dataOffset = await _db.storage.size;
 
+      // Secondary-index population is deferred to one batched call after
+      // this loop (see indexDocumentsBatch) — indexDocument() per document
+      // is O(n) per call for SortedIndex (array shift to stay sorted),
+      // which made compacting a large dataset O(n^2) in the live doc count.
+      final toIndex = <MapEntry<int, Map<String, dynamic>>>[];
       int i = 0;
       for (final entry in docs.entries) {
         final data = _db._serialize(entry.value, id: entry.key);
         await _db.storage.write(_db._dataOffset, data);
         await _db._primaryIndex.insert(entry.key, _db._dataOffset);
         if (entry.value is Map<String, dynamic>) {
-          _db._indexDocument(entry.key, entry.value as Map<String, dynamic>);
+          toIndex.add(MapEntry(entry.key, entry.value as Map<String, dynamic>));
         }
         // Track actual file end including any new B-Tree pages allocated during insert.
         _db._dataOffset = _db.storage.sizeSync ?? await _db.storage.size;
         if (i > 0 && i % 250 == 0) await Future.delayed(Duration.zero);
         i++;
       }
+      _db._indexMgr.indexDocumentsBatch(toIndex);
       await _db._pageManager.flushDirty();
     }
 

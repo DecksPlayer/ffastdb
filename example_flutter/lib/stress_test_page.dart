@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
 import 'package:ffastdb/ffastdb.dart';
+import 'package:path_provider/path_provider.dart';
 // Internal imports for diagnostics
 import 'package:ffastdb/src/index/hash_index.dart';
 import 'package:ffastdb/src/index/sorted_index.dart';
@@ -91,11 +92,17 @@ class _StressTestPageState extends State<StressTestPage> {
   }
 
   void _log(String msg) {
+    // Millisecond-resolution timestamp — with only whole seconds you can't
+    // tell a 200ms step from a 900ms one just by reading two log lines.
+    final ts = DateTime.now().toString().split(' ').last.substring(0, 12);
+    // debugPrint (not dart:developer's log()) — log() only shows in
+    // DevTools' Logging view, never in the plain `flutter run` / IDE debug
+    // console. debugPrint shows in both, and also throttles output so a
+    // burst of lines (like this loop) doesn't get silently dropped by the
+    // Android/iOS log pipe the way a raw print() can.
+    debugPrint('[ffastdb.stress] $msg');
     setState(() {
-      _logs.insert(
-        0,
-        '${DateTime.now().toString().split(' ').last.substring(0, 8)} - $msg',
-      );
+      _logs.insert(0, '$ts - $msg');
     });
   }
 
@@ -109,7 +116,14 @@ class _StressTestPageState extends State<StressTestPage> {
       if (count == 0) {
         _setupComplexDB();
       } else {
-        _log('ℹ️ Database already contains $_totalDocs documents.');
+        // Note: on every restart AFTER the first successful seed, this is
+        // the ONLY branch that runs — _setupComplexDB() (and all its
+        // per-step timing logs) does NOT run again, since it only seeds
+        // when the DB is empty. If you're not seeing step-by-step logs on
+        // hot restart, this is why: there's nothing left to seed. What you
+        // WILL always see, on every restart, are the "[ffastdb] openDatabase"
+        // lines printed from main() — that's the thing to watch for timing.
+        _log('ℹ️ Database already contains $count documents (not re-seeding).');
       }
     });
   }
@@ -128,6 +142,16 @@ class _StressTestPageState extends State<StressTestPage> {
       _searchResults.clear();
     });
 
+    // Per-step timing: which of these phases is actually slow — the
+    // deleteWhere() wipe, the posts insertAll loop, or something after it —
+    // instead of just knowing the whole thing took a while.
+    final totalSw = Stopwatch()..start();
+    final stepSw = Stopwatch()..start();
+    void logStep(String msg) {
+      _log('$msg (${stepSw.elapsedMilliseconds}ms)');
+      stepSw.reset();
+    }
+
     try {
       final modeStr = useIsolates
           ? (kIsWeb ? 'Web Worker (compute)' : 'Background Isolate')
@@ -135,6 +159,7 @@ class _StressTestPageState extends State<StressTestPage> {
       _log('🚀 Wiping and rebuilding Complex DB using [$modeStr]...');
       // Clear existing data to ensure a clean state for the new indexes
       await widget.db.deleteWhere((q) => q.rangeSearch(1, 0x7FFFFFFF));
+      logStep('🗑️ Wipe done');
 
       final random = Random();
 
@@ -155,6 +180,7 @@ class _StressTestPageState extends State<StressTestPage> {
         });
       }
       final userIds = await widget.db.insertAll(usersToInsert);
+      logStep('👤 Users insertAll done');
 
       final basePhrases = [
         "Exploring the hidden gems of the city.",
@@ -351,10 +377,15 @@ class _StressTestPageState extends State<StressTestPage> {
             });
           }
         }
+        // Splits synthesis (CPU, building the Dart maps) from insertAll
+        // (the DB write) — if ONE of these two is what's slow, this tells
+        // you which, instead of a single number covering both.
+        logStep('   🧪 Synthesized ${start + 1}..$end');
 
         _log('   💾 Inserting posts ${start + 1} to $end into FastDB...');
         final ids = await widget.db.insertAll(batchPosts);
         postIds.addAll(ids);
+        logStep('   💾 insertAll ${start + 1}..$end done');
         setState(() => _progress = 0.1 + (end / totalPosts) * 0.7); // Progress from 0.1 to 0.8
         await Future.delayed(Duration.zero);
       }
@@ -375,9 +406,10 @@ class _StressTestPageState extends State<StressTestPage> {
         if (i % 250 == 0) setState(() => _progress = 0.8 + (i / 1000 * 0.15));
       }
       await widget.db.insertAll(commentsToInsert);
+      logStep('💬 Comments insertAll done');
       setState(() => _progress = 0.95);
 
-      _log('✨ Complex DB Loaded Successfully!');
+      _log('✨ Complex DB Loaded Successfully! Total: ${totalSw.elapsedMilliseconds}ms');
       _log('📊 Post-Load Diagnostics:');
       for (final entry in widget.db.indexes.all.entries) {
         _log('   Index [${entry.key}]: size=${entry.value.size}');
@@ -693,6 +725,157 @@ class _StressTestPageState extends State<StressTestPage> {
     }
   }
 
+  /// Closes the DB and reopens it, comparing query results before and after
+  /// on every index type (Hash, Sorted, FTS, Composite).
+  ///
+  /// This is the exact round-trip (saveIndexes() at close → loadIndexes() at
+  /// open) where FTS and Composite indexes were found coming back silently
+  /// EMPTY at scale — no exception, just zero results, which is why it took
+  /// a dedicated check like this to catch instead of showing up as a crash.
+  /// A "Reload DB" run alone never exercises this: it rebuilds indexes from
+  /// documents in memory and never round-trips through the persisted blob.
+  ///
+  /// WARNING: closes `widget.db`. Every other screen holds its OWN reference
+  /// to the same (now stale) instance — there's no live way to hand them a
+  /// new one, so this always ends with a "restart the app" prompt, exactly
+  /// like Factory Reset above.
+  Future<void> _verifyPersistence() async {
+    if (_running) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('Verificar persistencia'),
+        content: const Text(
+          'Esto CIERRA la base de datos, la vuelve a abrir, y compara los '
+          'resultados de una consulta por cada tipo de índice (Hash, Sorted, '
+          'FTS, Composite) antes y después. Vas a necesitar hacer un HOT '
+          'RESTART de la app al terminar — las otras pantallas quedan con '
+          'una referencia vieja a la base.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancelar'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Verificar'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+
+    setState(() => _running = true);
+    final results = <String, bool>{};
+    try {
+      _log('🔒 Verificando persistencia: tomando snapshot ANTES de cerrar...');
+
+      final beforeCount = await widget.db.count();
+      final beforeHash =
+          (await widget.db.query().where('type').equals('post').find()).length;
+      final beforeSorted =
+          (await widget.db.query().where('likes').between(0, 100).find())
+              .length;
+      final beforeFts =
+          (await widget.db.query().where('content').fts('cat').find())
+              .length;
+      final samplePost =
+          await widget.db.query().where('type').equals('post').limit(1).find();
+      final sampleUserId =
+          samplePost.isNotEmpty ? samplePost.first['userId'] as int? : null;
+      final beforeComposite = sampleUserId == null
+          ? -1
+          : (await widget.db
+                  .query()
+                  .where('type')
+                  .equals('post')
+                  .where('userId')
+                  .equals(sampleUserId)
+                  .find())
+              .length;
+
+      _log('   count=$beforeCount hash=$beforeHash sorted=$beforeSorted '
+          'fts=$beforeFts composite=$beforeComposite (userId=$sampleUserId)');
+
+      _log('🔒 Cerrando la base de datos...');
+      await widget.db.close();
+
+      _log('🔓 Reabriendo...');
+      String dir = '';
+      if (!kIsWeb) {
+        final appDir = await getApplicationDocumentsDirectory();
+        dir = appDir.path;
+      }
+      final reopened = await openDatabase(
+        'wordnotes',
+        directory: dir,
+        version: 1,
+        indexes: const ['type', 'userId', 'postId'],
+        sortedIndexes: const ['word', 'content', 'likes'],
+        ftsIndexes: const ['content'],
+        compositeIndexes: const [
+          ['type', 'userId'],
+        ],
+      );
+
+      final afterCount = await reopened.count();
+      final afterHash =
+          (await reopened.query().where('type').equals('post').find()).length;
+      final afterSorted =
+          (await reopened.query().where('likes').between(0, 100).find())
+              .length;
+      final afterFts =
+          (await reopened.query().where('content').fts('cat').find()).length;
+      final afterComposite = sampleUserId == null
+          ? -1
+          : (await reopened
+                  .query()
+                  .where('type')
+                  .equals('post')
+                  .where('userId')
+                  .equals(sampleUserId)
+                  .find())
+              .length;
+
+      _log('   count=$afterCount hash=$afterHash sorted=$afterSorted '
+          'fts=$afterFts composite=$afterComposite');
+
+      results['count (B-Tree)'] = beforeCount == afterCount;
+      results['type (Hash)'] = beforeHash == afterHash;
+      results['likes (Sorted)'] = beforeSorted == afterSorted;
+      results['content (FTS)'] = beforeFts == afterFts;
+      results['type+userId (Composite)'] = beforeComposite == afterComposite;
+
+      for (final entry in results.entries) {
+        _log('${entry.value ? '✅' : '❌'} ${entry.key}: '
+            '${entry.value ? 'coincide' : 'NO COINCIDE — se perdieron datos al recargar'}');
+      }
+
+      await reopened.close();
+      await FfastDb.disposeInstance();
+    } catch (e) {
+      _log('❌ ERROR durante la verificación: $e');
+      results['exception'] = false;
+    } finally {
+      setState(() => _running = false);
+      final allPassed = results.values.every((v) => v);
+      if (mounted) {
+        showDialog(
+          context: context,
+          barrierDismissible: false,
+          builder: (_) => AlertDialog(
+            title: Text(allPassed ? '✅ Todo coincide' : '❌ Se encontraron diferencias'),
+            content: Text(
+              '${allPassed ? 'Los 5 chequeos coinciden antes y después de cerrar/reabrir.' : 'Revisá el log — algún índice no sobrevivió el cierre/reapertura.'}'
+              '\n\nLa base quedó cerrada. Hacé un HOT RESTART para seguir usando la app.',
+            ),
+          ),
+        );
+      }
+    }
+  }
+
   Future<void> _massiveUpdate() async {
     _log('⚡ Massive Update: Modifying all posts...');
     setState(() => _running = true);
@@ -994,6 +1177,12 @@ class _StressTestPageState extends State<StressTestPage> {
                   label: const Text('Massive Delete'),
                   onPressed: _running ? null : _massiveDelete,
                   backgroundColor: Colors.red[200],
+                ),
+                ActionChip(
+                  avatar: const Icon(Icons.published_with_changes, size: 16),
+                  label: const Text('Verificar persistencia'),
+                  onPressed: _running ? null : _verifyPersistence,
+                  backgroundColor: Colors.purple[100],
                 ),
               ],
             ),

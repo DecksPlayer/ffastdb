@@ -811,6 +811,7 @@ class FastDB {
     _rangeSearch,
     watch,
     _queryCache,
+    _batchFindByIds,
   );
 
   Future<List<dynamic>> findWhere(
@@ -1149,6 +1150,18 @@ class FastDB {
     } else {
       fullData = await targetStorage.read(offset, totalSize);
     }
+    return _deserializeRecord(fullData, length, offset);
+  }
+
+  /// Parses one record's already-in-memory bytes
+  /// (`[4-byte length][payload][4-byte CRC32]`) into a document.
+  ///
+  /// Factored out of [_readAt] so [_batchFindByIds] can deserialize records
+  /// fetched via one large contiguous read instead of one `storage.read()`
+  /// call per document — see [_batchReadRaw] for why that matters on real
+  /// disk storage.
+  dynamic _deserializeRecord(Uint8List fullData, int length, int offset) {
+    final int totalSize = 4 + length + 4;
     // Verify CRC — same check as the sync path (_readAtSync).
     if (fullData.length >= totalSize) {
       final storedCrc = _readInt32(fullData, 4 + length);
@@ -1217,6 +1230,109 @@ class FastDB {
     return targetStorage.read(offset, totalSize);
   }
 
+  /// Reads raw document bytes for a batch of (id, offset) entries.
+  ///
+  /// Documents written by normal inserts/insertAll sit back-to-back in the
+  /// file, so a batch's entries are almost always densely packed — fetching
+  /// them with [Future.wait] over individually-awaited reads still means one
+  /// `read()` call (and one trip through IoStorageStrategy's serializing
+  /// lock, each allocating its own Completer/Future) PER DOCUMENT. Measured
+  /// on 100k docs: only ~5% of that time is actual disk I/O: the rest is
+  /// Dart-side Future/lock-chain overhead from making 100k separate calls.
+  ///
+  /// Instead, this reads the whole batch's byte span in ONE call and slices
+  /// each record out of the shared buffer in memory. Falls back to the
+  /// existing per-entry path (a) entirely, if the span is too sparse to be
+  /// worth it (e.g. many deletions scattered between the batch's live docs),
+  /// or (b) per-entry, if a specific record turns out to extend past what
+  /// was fetched (larger than [_batchReadTailCeiling], or near EOF).
+  ///
+  /// Shared by [IndexManager] (reindex) and [_QueryOperations] (regular
+  /// queries / `getAll()`) — both resolve many ids to full records and both
+  /// used to pay the per-call overhead above before this existed.
+  static const int _batchReadAvgDocCeiling = 4096;
+  static const int _batchReadTailCeiling = 64 * 1024;
+
+  Future<List<Uint8List?>> _batchReadRaw(List<MapEntry<int, int>> batch) async {
+    if (batch.isEmpty) return const [];
+    if (batch.length == 1) return [await _readRawAt(batch[0].value)];
+
+    int minOffset = batch[0].value;
+    int maxOffset = batch[0].value;
+    for (final e in batch) {
+      if (e.value < minOffset) minOffset = e.value;
+      if (e.value > maxOffset) maxOffset = e.value;
+    }
+
+    final span = maxOffset - minOffset;
+    if (span > batch.length * _batchReadAvgDocCeiling) {
+      // Too sparse — reading the whole span would fetch mostly dead space.
+      return Future.wait(batch.map((e) => _readRawAt(e.value)));
+    }
+
+    final targetStorage = dataStorage ?? storage;
+    final chunk = await targetStorage.read(minOffset, span + _batchReadTailCeiling);
+
+    final results = List<Uint8List?>.filled(batch.length, null);
+    for (int i = 0; i < batch.length; i++) {
+      final localOffset = batch[i].value - minOffset;
+      if (localOffset + 4 > chunk.length) {
+        results[i] = await _readRawAt(batch[i].value);
+        continue;
+      }
+      final length = _readInt32(chunk, localOffset);
+      if (length <= 0 || length > 10 * 1024 * 1024) {
+        results[i] = null;
+        continue;
+      }
+      final totalSize = 4 + length + 4;
+      if (localOffset + totalSize <= chunk.length) {
+        results[i] = Uint8List.fromList(chunk.sublist(localOffset, localOffset + totalSize));
+      } else {
+        // Record extends past the fetched span — fetch it directly instead.
+        results[i] = await _readRawAt(batch[i].value);
+      }
+    }
+    return results;
+  }
+
+  /// Batch-resolves ids to fully deserialized documents, using
+  /// [_batchReadRaw] instead of one `_readAt()`-style storage read per id.
+  /// Preserves [ids]' order; ids with no B-Tree entry are silently skipped
+  /// (matches [_findById] returning `null` for missing ids, filtered out by
+  /// callers already — [_QueryOperations.findByIdsImpl] and `getAll()`).
+  Future<List<dynamic>> _batchFindByIds(List<int> ids) async {
+    if (ids.isEmpty) return const [];
+
+    final entries = <MapEntry<int, int>>[];
+    for (final id in ids) {
+      final offset = await _primaryIndex.search(id);
+      if (offset != null) {
+        entries.add(MapEntry(id, offset));
+      } else if (_batchEntries.isNotEmpty) {
+        // Read-your-writes in batch/transaction mode (see _findById).
+        for (final e in _batchEntries) {
+          if (e.key == id) {
+            entries.add(e);
+            break;
+          }
+        }
+      }
+    }
+    if (entries.isEmpty) return const [];
+
+    final rawResults = await _batchReadRaw(entries);
+    final docs = <dynamic>[];
+    for (int i = 0; i < entries.length; i++) {
+      final raw = rawResults[i];
+      if (raw == null || raw.length < 4) continue;
+      final length = _readInt32(raw, 0);
+      if (length <= 0) continue;
+      final doc = _deserializeRecord(raw, length, entries[i].value);
+      if (doc != null) docs.add(doc);
+    }
+    return docs;
+  }
 
   // Serialization & Encoding
 

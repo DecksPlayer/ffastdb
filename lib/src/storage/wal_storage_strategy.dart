@@ -424,6 +424,18 @@ class WalStorageStrategy implements StorageStrategy {
         groupEnd++;
       }
 
+      // Single-entry group (the common case — e.g. a lone document write,
+      // B-Tree page, or header update that doesn't touch anything else in
+      // the transaction): write its data directly, no merge buffer needed.
+      // This keeps small transactions (a single insert() is typically 2-4
+      // entries, usually all far apart) as cheap as the pre-coalescing code.
+      if (groupEnd == i) {
+        final e = entries[order[i]];
+        await _main.write(e.offset, e.data);
+        i = groupEnd + 1;
+        continue;
+      }
+
       // Second pass: allocate exactly one buffer for the group and paint each
       // entry into it once — in ORIGINAL (temporal) order, not offset order.
       // Offset order only decided the group's bounds above; two entries can

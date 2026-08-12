@@ -131,6 +131,15 @@ class BufferedStorageStrategy implements StorageStrategy {
     for (int g = 0; g < groupBounds.length; g += 2) {
       final start = groupBounds[g];
       final end = groupBounds[g + 1];
+
+      // Single-entry group — the common case for small, spread-out writes:
+      // write its data directly, no merge buffer needed.
+      if (end - start == 1) {
+        final entry = _pendingWrites[start];
+        await _inner.write(entry.offset, entry.data);
+        continue;
+      }
+
       final rangeOffset = _pendingWrites[start].offset;
       int rangeLen = 0;
       for (int i = start; i < end; i++) {
