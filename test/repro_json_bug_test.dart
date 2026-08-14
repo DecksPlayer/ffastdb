@@ -1,7 +1,5 @@
 import 'dart:io';
 import 'package:ffastdb/ffastdb.dart';
-import 'package:ffastdb/src/storage/io/io_storage_strategy.dart';
-import 'package:ffastdb/src/storage/wal_storage_strategy.dart';
 import 'package:test/test.dart';
 
 void main() {
@@ -19,15 +17,11 @@ void main() {
           ),
         );
 
-        // 1. Insert a JSON document (Map)
         final doc = {'foo': 'bar', 'id_str': '2d2ee1fa-77d2-421f-8cc3-fb33611e48f7'};
         final id = await db.insert(doc);
-        print('Inserted document with ID: $id');
 
-        // 2. Try to retrieve it
         final retrieved = await db.findById(id);
-        print('Retrieved: $retrieved');
-        
+
         expect(retrieved, isNotNull);
         expect(retrieved, isA<Map>());
         expect(retrieved['foo'], equals('bar'));
@@ -42,4 +36,3 @@ void main() {
     });
   });
 }
-

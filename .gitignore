@@ -6,6 +6,16 @@ benchmark_*.csv
 benchmark_*.png
 debug_test.dart.ignore
 
+# flutter_benchmark — comparison benchmark (ffastdb vs isar_community vs
+# sembast). Only ever run via `dart run`/`flutter test`, never actually built
+# for a specific platform, so the platform scaffolding doesn't need tracking.
+flutter_benchmark/android/
+flutter_benchmark/ios/
+flutter_benchmark/linux/
+flutter_benchmark/macos/
+flutter_benchmark/web/
+flutter_benchmark/windows/
+
 # Flutter generated / build artifacts
 **/build/
 **/.flutter-plugins

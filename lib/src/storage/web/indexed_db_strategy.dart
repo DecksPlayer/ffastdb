@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:js_interop';
+import 'dart:math' show min;
 import 'dart:typed_data';
 
 import 'package:web/web.dart' as web;
@@ -7,46 +8,64 @@ import '../storage_strategy.dart';
 
 /// [StorageStrategy] for Web that uses `IndexedDB` for persistence.
 ///
-/// Data is stored as fixed-size **chunks** (64 KB each) so that [flush] only
-/// writes the chunks that were modified since the last flush.  This avoids
-/// copying the entire database buffer to JavaScript on every write — the
-/// primary cause of OOM crashes on web when databases grow beyond a few MB.
+/// Data is stored as fixed-size **chunks** (64 KB each). Chunks are loaded
+/// **lazily** from IndexedDB on first access rather than all at once at
+/// [open] time, keeping RAM usage proportional to the *working set* rather
+/// than the full database size.
 ///
-/// Format in IndexedDB (objectStore "ffastdb_store"):
-///   - `<name>_meta`   → usedSize (JSUint8Array, 4 bytes LE)
-///   - `<name>_c<i>`   → chunk *i* (JSUint8Array, up to [_chunkSize] bytes)
+/// A bounded LRU cache of at most [_maxCachedChunks] chunks (32 × 64 KB =
+/// 2 MB) is maintained in RAM. Clean chunks are evicted when the cache is
+/// full; dirty (not-yet-flushed) chunks are never evicted.
 ///
-/// Backward-compatible: on [open], if the legacy single-key format
-/// (`<name>_buffer`) is detected it is loaded and migrated to chunks on the
-/// next [flush].
+/// ## Format in IndexedDB (objectStore `"ffastdb_store"`)
+///   - `<name>_meta`  → usedSize (JSUint8Array, 4 bytes LE)
+///   - `<name>_c<i>`  → chunk *i* (JSUint8Array, up to [_chunkSize] bytes)
+///
+/// ## Backward compatibility
+/// If the legacy single-key format (`<name>_buffer`) is detected on [open],
+/// the bytes are loaded into the chunk cache and migrated to the chunked
+/// format on the next [flush].
 class IndexedDbStorageStrategy implements StorageStrategy {
-  /// Chunk size in bytes.  64 KB gives a good trade-off between granularity
-  /// (a 4 KB page write only dirties one chunk) and transaction overhead
-  /// (a 50 MB DB ≈ 800 chunks, well within a single IDB transaction).
-  static const int _chunkSize = 65536; // 64 KB
+  /// Chunk size in bytes — 64 KB gives good granularity vs. IDB overhead.
+  static const int _chunkSize = 65536;
+
+  /// Maximum number of chunks kept in the in-memory LRU cache.
+  /// 32 × 64 KB = 2 MB — enough to hold the full B-Tree working set for
+  /// most apps while keeping RAM bounded regardless of database size.
+  static const int _maxCachedChunks = 2048;
 
   final String _dbName;
   final String _storeName = 'ffastdb_store';
   final String _dataKey;
 
   web.IDBDatabase? _database;
-  Uint8List _buffer = Uint8List(0);
+
+  // ── Sparse chunk cache ───────────────────────────────────────────────────
+  // Only chunks that have been accessed (read or written) since open() are
+  // held in RAM. The map is bounded by _maxCachedChunks via LRU eviction.
+  final Map<int, Uint8List> _chunks = {};
+
+  // LRU order: front = oldest, back = most-recently-used.
+  // List.remove() is O(n) but with ≤ 32 entries that's negligible.
+  final List<int> _lruOrder = [];
+
   int _usedSize = 0;
 
-  /// Indices of chunks modified since the last [flush].
+  /// Chunk indices modified since the last [flush].
+  /// Dirty chunks are never evicted from [_chunks] until after flush commits.
   final Set<int> _dirtyChunks = {};
 
   /// Number of chunk keys persisted in IndexedDB after the last flush.
   /// Used to delete orphan chunks after [truncate] / compact.
   int _persistedChunkCount = 0;
 
-  /// `true` when the legacy single-key format was loaded on [open] and needs
-  /// migration to chunks on the next [flush].
+  /// `true` when the legacy single-key format was loaded and needs migration
+  /// to the chunked format on the next [flush].
   bool _migrateLegacy = false;
 
   IndexedDbStorageStrategy(this._dbName) : _dataKey = _dbName;
 
-  // ── Open / Load ──────────────────────────────────────────────────────────
+  // ── Open ─────────────────────────────────────────────────────────────────
 
   @override
   Future<void> open() async {
@@ -60,11 +79,11 @@ class IndexedDbStorageStrategy implements StorageStrategy {
 
     request.onsuccess = (web.Event event) {
       _database = request.result as web.IDBDatabase;
-      _loadData().then((_) => completer.complete()).catchError((e) {
-        // FAIL-CLOSED: never "start fresh" on a load error — the next flush
-        // would overwrite the persisted data with the empty/partial buffer.
+      _loadMetadata().then((_) => completer.complete()).catchError((e) {
+        // FAIL-CLOSED: a metadata load failure must not silently start fresh
+        // because the next flush() would overwrite persisted data.
         completer.completeError(
-            'IndexedDbStorageStrategy: failed to load existing data: $e');
+            'IndexedDbStorageStrategy: failed to load metadata: $e');
       });
     }.toJS;
 
@@ -75,116 +94,85 @@ class IndexedDbStorageStrategy implements StorageStrategy {
     return completer.future;
   }
 
-  /// Loads data from IndexedDB — tries the chunked format first, then falls
-  /// back to the legacy single-key format for backward compatibility.
-  Future<void> _loadData() async {
-    // 1. Try chunked format (has a _meta key).
+  /// Reads only the `_meta` key to learn [_usedSize] and [_persistedChunkCount].
+  /// Chunk data is NOT loaded here — it is fetched lazily on first [read].
+  Future<void> _loadMetadata() async {
+    // 1. Chunked format: read metadata only.
     final meta = await _idbGet('${_dataKey}_meta');
     if (meta != null) {
       final metaBytes = (meta as JSUint8Array).toDart;
       if (metaBytes.length >= 4) {
-        final size = _readUint32(metaBytes, 0);
-        if (size > 0) await _loadChunked(size);
+        _usedSize = _readUint32(metaBytes, 0);
+        _persistedChunkCount = _usedSize == 0
+            ? 0
+            : (_usedSize + _chunkSize - 1) ~/ _chunkSize;
       }
       return;
     }
 
-    // 2. Fallback: legacy single-key format (`<name>_buffer`).
+    // 2. Legacy single-key format (`<name>_buffer`): load all bytes and split
+    //    into chunks so the next flush() migrates to the chunked format.
     final legacy = await _idbGet('${_dataKey}_buffer');
     if (legacy != null) {
-      _buffer = (legacy as JSUint8Array).toDart;
-      _usedSize = _buffer.length;
+      final bytes = (legacy as JSUint8Array).toDart;
+      _writeInternal(0, bytes); // populates _chunks and marks them dirty
       _migrateLegacy = true;
-      // Mark every chunk dirty so the next flush() migrates to chunked format.
-      _markAllChunksDirty();
     }
   }
 
-  /// Loads all chunks from a single readonly transaction and composes the
-  /// in-memory buffer.
-  Future<void> _loadChunked(int size) async {
-    _usedSize = size;
-    final chunkCount = (size + _chunkSize - 1) ~/ _chunkSize;
-    _buffer = Uint8List(_roundUpBuffer(size));
-    _persistedChunkCount = chunkCount;
-    if (chunkCount == 0) return;
-
-    final completer = Completer<void>();
-    final txn = _database!.transaction(_storeName.toJS, 'readonly');
-    final store = txn.objectStore(_storeName);
-
-    for (int i = 0; i < chunkCount; i++) {
-      final idx = i;
-      final req = store.get('${_dataKey}_c$idx'.toJS);
-      req.onsuccess = ((web.Event e) {
-        final r = req.result;
-        if (r != null) {
-          final bytes = (r as JSUint8Array).toDart;
-          final start = idx * _chunkSize;
-          final end = (start + bytes.length > size) ? size : start + bytes.length;
-          _buffer.setRange(start, end, bytes);
-        }
-      }).toJS;
-    }
-
-    txn.oncomplete = ((web.Event e) => completer.complete()).toJS;
-    // A load error with an existing _meta key means chunks are missing or
-    // corrupt: propagate so open() fails instead of silently starting with a
-    // partially zeroed buffer that a later flush() would persist.
-    txn.onerror = ((web.Event e) => completer.completeError(
-        StateError('IndexedDbStorageStrategy: failed to load chunks'))).toJS;
-
-    return completer.future;
-  }
-
-  /// Reads a single value from IndexedDB by [key].
-  Future<JSAny?> _idbGet(String key) {
-    final completer = Completer<JSAny?>();
-    final txn = _database!.transaction(_storeName.toJS, 'readonly');
-    final store = txn.objectStore(_storeName);
-    final req = store.get(key.toJS);
-    req.onsuccess = ((web.Event e) => completer.complete(req.result)).toJS;
-    req.onerror = ((web.Event e) => completer.complete(null)).toJS;
-    return completer.future;
-  }
-
-  // ── Read / Write (in-memory buffer) ──────────────────────────────────────
+  // ── Read ─────────────────────────────────────────────────────────────────
 
   @override
   Future<Uint8List> read(int offset, int size) async {
     if (offset >= _usedSize) return Uint8List(size);
-    final end = (offset + size > _usedSize) ? _usedSize : offset + size;
-    final result = Uint8List(size);
-    result.setRange(0, end - offset, _buffer, offset);
-    return result;
+
+    // Fast path: every required chunk is already in the cache.
+    final cached = readSync(offset, size);
+    if (cached != null) return cached;
+
+    // Slow path: load missing chunks from IndexedDB, then serve from cache.
+    final end = min(offset + size, _usedSize);
+    final firstChunk = offset ~/ _chunkSize;
+    final lastChunk = (end - 1) ~/ _chunkSize;
+    await _loadChunksFromIdb(firstChunk, lastChunk);
+
+    return readSync(offset, size) ?? Uint8List(size);
   }
+
+  // ── Write ────────────────────────────────────────────────────────────────
 
   @override
   Future<void> write(int offset, Uint8List data) async {
     _writeInternal(offset, data);
   }
 
+  /// Writes [data] starting at [offset], splitting across chunk boundaries.
+  /// All affected chunks are allocated in [_chunks] and marked dirty.
   void _writeInternal(int offset, Uint8List data) {
     if (data.isEmpty) return;
     final required = offset + data.length;
-    if (required > _buffer.length) {
-      final newLen = _roundUpBuffer(required);
-      final grown = Uint8List(newLen);
-      if (_buffer.isNotEmpty) grown.setRange(0, _buffer.length, _buffer);
-      _buffer = grown;
-    }
-    _buffer.setRange(offset, offset + data.length, data);
     if (required > _usedSize) _usedSize = required;
 
-    // Mark affected chunks as dirty.
-    final firstChunk = offset ~/ _chunkSize;
-    final lastChunk = (offset + data.length - 1) ~/ _chunkSize;
-    for (int c = firstChunk; c <= lastChunk; c++) {
-      _dirtyChunks.add(c);
+    int remaining = data.length;
+    int dataOff = 0;
+    int cur = offset;
+
+    while (remaining > 0) {
+      final ci = cur ~/ _chunkSize;
+      final chunkOff = cur % _chunkSize;
+      final n = min(_chunkSize - chunkOff, remaining);
+
+      final chunk = _getOrCreateChunk(ci);
+      chunk.setRange(chunkOff, chunkOff + n, data, dataOff);
+      _dirtyChunks.add(ci);
+
+      cur += n;
+      dataOff += n;
+      remaining -= n;
     }
   }
 
-  // ── Flush (chunked, incremental) ─────────────────────────────────────────
+  // ── Flush ────────────────────────────────────────────────────────────────
 
   @override
   Future<void> flush() async {
@@ -195,23 +183,26 @@ class IndexedDbStorageStrategy implements StorageStrategy {
     final txn = _database!.transaction(_storeName.toJS, 'readwrite');
     final store = txn.objectStore(_storeName);
 
-    // Snapshot the dirty set for THIS transaction. Writes arriving while the
-    // IDB transaction is in-flight add new markers that must NOT be cleared
-    // by this flush — and if the transaction fails, none of the markers may
-    // be cleared so the next flush() retries them.
+    // Snapshot the dirty set for this transaction. New dirty markers added
+    // while the IDB transaction is in-flight must survive for the next flush.
     final flushedChunks = Set<int>.of(_dirtyChunks);
 
-    // Write only dirty chunks — each JS copy is at most 64 KB instead of
-    // the entire buffer, reducing peak memory from O(DB size) to O(64 KB).
     for (final ci in flushedChunks) {
+      final chunk = _chunks[ci];
+      if (chunk == null) continue;
+
       final start = ci * _chunkSize;
       if (start >= _usedSize) continue;
-      final end = (start + _chunkSize > _usedSize) ? _usedSize : start + _chunkSize;
-      final chunk = _buffer.sublist(start, end);
-      store.put(chunk.toJS as JSAny, '${_dataKey}_c$ci'.toJS);
+      final end = min(start + _chunkSize, _usedSize);
+
+      // Write only the used portion of this chunk.
+      final slice = (end - start) < chunk.length
+          ? Uint8List.sublistView(chunk, 0, end - start)
+          : chunk;
+      store.put(slice.toJS as JSAny, '${_dataKey}_c$ci'.toJS);
     }
 
-    // Delete orphan chunks that are now beyond usedSize (after truncate/compact).
+    // Delete orphan chunks beyond the current usedSize (after truncate/compact).
     final currentChunkCount =
         _usedSize == 0 ? 0 : (_usedSize + _chunkSize - 1) ~/ _chunkSize;
     for (int i = currentChunkCount; i < _persistedChunkCount; i++) {
@@ -223,15 +214,15 @@ class IndexedDbStorageStrategy implements StorageStrategy {
     _writeUint32(metaBytes, 0, _usedSize);
     store.put(metaBytes.toJS as JSAny, '${_dataKey}_meta'.toJS);
 
-    // Delete legacy key on migration.
+    // Delete legacy key on first migration flush.
     if (_migrateLegacy) {
       store.delete('${_dataKey}_buffer'.toJS);
       _migrateLegacy = false;
     }
 
     txn.oncomplete = ((web.Event e) {
-      // Clear dirty state only after the transaction actually committed;
-      // markers added while it was in-flight survive for the next flush().
+      // Clear dirty markers only after the transaction actually commits.
+      // Markers added while in-flight survive for the next flush().
       _dirtyChunks.removeAll(flushedChunks);
       _persistedChunkCount = currentChunkCount;
       completer.complete();
@@ -248,16 +239,16 @@ class IndexedDbStorageStrategy implements StorageStrategy {
   Future<void> truncate(int size) async {
     if (size >= _usedSize) return;
     _usedSize = size;
-    // Remove dirty markers for chunks now entirely beyond the new size.
+
+    // Remove chunks entirely beyond the new size from both cache and dirty set.
     final maxChunk = size == 0 ? -1 : (size - 1) ~/ _chunkSize;
     _dirtyChunks.removeWhere((c) => c > maxChunk);
-    // Reclaim backing-buffer memory on significant shrink.
-    if (_buffer.length > size + 512 * 1024) {
-      final shrunk = Uint8List(size > 0 ? _roundUpBuffer(size) : 0);
-      if (size > 0) shrunk.setRange(0, size, _buffer);
-      _buffer = shrunk;
+    final toEvict = _chunks.keys.where((c) => c > maxChunk).toList();
+    for (final c in toEvict) {
+      _chunks.remove(c);
+      _lruOrder.remove(c);
     }
-    // Orphan chunk cleanup in IndexedDB happens in flush().
+    // Orphan chunk deletion in IndexedDB happens in flush().
   }
 
   @override
@@ -273,7 +264,7 @@ class IndexedDbStorageStrategy implements StorageStrategy {
   // ── Synchronous fast paths ────────────────────────────────────────────────
 
   @override
-  StorageStrategy? get innerStorage => null; // not a wrapper
+  StorageStrategy? get innerStorage => null;
 
   @override
   int? get sizeSync => _usedSize;
@@ -287,35 +278,130 @@ class IndexedDbStorageStrategy implements StorageStrategy {
     return true;
   }
 
+  /// Returns data if every required chunk is in the cache, or `null` on a
+  /// cache miss so FastDB can fall back to the async [read] path.
   @override
   Uint8List? readSync(int offset, int size) {
     if (offset >= _usedSize) return Uint8List(size);
-    final end = (offset + size > _usedSize) ? _usedSize : offset + size;
+
+    final end = min(offset + size, _usedSize);
     final result = Uint8List(size);
-    result.setRange(0, end - offset, _buffer, offset);
+    int cur = offset;
+    int resultOff = 0;
+
+    while (cur < end) {
+      final ci = cur ~/ _chunkSize;
+      final chunkOff = cur % _chunkSize;
+      final n = min(_chunkSize - chunkOff, end - cur);
+
+      final chunk = _chunks[ci];
+      if (chunk == null) return null; // Cache miss → caller uses async read()
+
+      _touchLru(ci);
+      result.setRange(resultOff, resultOff + n, chunk, chunkOff);
+      cur += n;
+      resultOff += n;
+    }
+
     return result;
   }
 
-  // ── Helpers ───────────────────────────────────────────────────────────────
+  // ── LRU cache helpers ────────────────────────────────────────────────────
 
-  void _markAllChunksDirty() {
-    final n = (_usedSize + _chunkSize - 1) ~/ _chunkSize;
-    for (int i = 0; i < n; i++) {
-      _dirtyChunks.add(i);
+  /// Returns the chunk at [ci], allocating a zeroed one if absent.
+  /// Marks it as most-recently-used and evicts stale clean chunks if needed.
+  Uint8List _getOrCreateChunk(int ci) {
+    var chunk = _chunks[ci];
+    if (chunk == null) {
+      chunk = Uint8List(_chunkSize);
+      _chunks[ci] = chunk;
+    }
+    _touchLru(ci);
+    return chunk;
+  }
+
+  /// Moves [ci] to the back of [_lruOrder] (most-recently-used) and evicts
+  /// the oldest clean chunk(s) when the cache exceeds [_maxCachedChunks].
+  void _touchLru(int ci) {
+    _lruOrder.remove(ci);
+    _lruOrder.add(ci);
+    _evictCleanChunks();
+  }
+
+  /// Evicts the oldest clean (non-dirty) chunks until [_chunks] fits within
+  /// [_maxCachedChunks]. Dirty chunks are skipped — they must stay in RAM
+  /// until [flush] persists them.
+  void _evictCleanChunks() {
+    int i = 0;
+    while (_chunks.length > _maxCachedChunks && i < _lruOrder.length) {
+      final candidate = _lruOrder[i];
+      if (!_dirtyChunks.contains(candidate)) {
+        _chunks.remove(candidate);
+        _lruOrder.removeAt(i);
+        // Don't advance i — the next element shifted into position i.
+      } else {
+        i++;
+      }
     }
   }
 
-  /// Rounds [n] up to the next power-of-two (minimum 4096).
-  static int _roundUpBuffer(int n) {
-    if (n <= 4096) return 4096;
-    int v = n - 1;
-    v |= v >> 1;
-    v |= v >> 2;
-    v |= v >> 4;
-    v |= v >> 8;
-    v |= v >> 16;
-    return v + 1;
+  // ── IDB helpers ──────────────────────────────────────────────────────────
+
+  /// Fetches chunks [firstChunk]..[lastChunk] (inclusive) that are not
+  /// already in [_chunks] using a single readonly IDB transaction, then
+  /// adds them to the cache and runs one eviction pass.
+  Future<void> _loadChunksFromIdb(int firstChunk, int lastChunk) async {
+    final toLoad = <int>[
+      for (int i = firstChunk; i <= lastChunk; i++)
+        if (!_chunks.containsKey(i)) i,
+    ];
+    if (toLoad.isEmpty) return;
+
+    final completer = Completer<void>();
+    final txn = _database!.transaction(_storeName.toJS, 'readonly');
+    final store = txn.objectStore(_storeName);
+
+    for (final idx in toLoad) {
+      final req = store.get('${_dataKey}_c$idx'.toJS);
+      req.onsuccess = ((web.Event e) {
+        final r = req.result;
+        final chunk = Uint8List(_chunkSize);
+        if (r != null) {
+          final bytes = (r as JSUint8Array).toDart;
+          chunk.setRange(0, bytes.length, bytes);
+        }
+        _chunks[idx] = chunk;
+        // Add to LRU without triggering eviction yet — all loaded chunks
+        // must survive until the transaction completes.
+        _lruOrder.remove(idx);
+        _lruOrder.add(idx);
+      }).toJS;
+    }
+
+    txn.oncomplete = ((web.Event e) {
+      // Single eviction pass after all chunks are loaded.
+      _evictCleanChunks();
+      completer.complete();
+    }).toJS;
+    txn.onerror = ((web.Event e) => completer.completeError(
+        StateError(
+            'IndexedDbStorageStrategy: failed to load chunks $toLoad'))).toJS;
+
+    return completer.future;
   }
+
+  /// Reads a single value from IndexedDB by [key].
+  Future<JSAny?> _idbGet(String key) {
+    final completer = Completer<JSAny?>();
+    final txn = _database!.transaction(_storeName.toJS, 'readonly');
+    final store = txn.objectStore(_storeName);
+    final req = store.get(key.toJS);
+    req.onsuccess = ((web.Event e) => completer.complete(req.result)).toJS;
+    req.onerror = ((web.Event e) => completer.complete(null)).toJS;
+    return completer.future;
+  }
+
+  // ── Byte helpers ──────────────────────────────────────────────────────────
 
   static int _readUint32(Uint8List b, int off) =>
       (b[off] & 0xFF) |

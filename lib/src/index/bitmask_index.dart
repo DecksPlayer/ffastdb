@@ -71,6 +71,13 @@ class BitmaskIndex implements SecondaryIndex {
     }
   }
 
+  @override
+  void addAll(Map<int, dynamic> entries) {
+    for (final e in entries.entries) {
+      add(e.key, e.value);
+    }
+  }
+
   /// Grows [_maxDocId] to accommodate at least [minDocId] documents,
   /// and expands all existing bitsets to the new word count.
   void _grow(int minDocId) {

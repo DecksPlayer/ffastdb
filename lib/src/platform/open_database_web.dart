@@ -19,7 +19,7 @@ Future<FastDB> openDatabase(
   String name, {
   String? directory,
   int cacheCapacity = 64,
-  double autoCompactThreshold = double.minPositive,
+  double autoCompactThreshold = 0.3,
   int version = 1,
   Map<int, dynamic Function(dynamic)>? migrations,
   List<String> indexes = const [],

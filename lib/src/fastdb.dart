@@ -12,6 +12,7 @@ import 'index/sorted_index.dart';
 import 'index/bitmask_index.dart';
 import 'index/composite_index.dart';
 import 'index/fts_index.dart';
+import 'index/parallel_indexer.dart';
 import 'query/fast_query.dart';
 import 'query/query_cache.dart';
 import 'serialization/fast_serializer.dart';
@@ -368,7 +369,11 @@ class FastDB {
   /// Rebuilds secondary indexes from live documents.
   ///
   /// Pass [field] to rebuild only that index; omit to rebuild all.
-  Future<void> reindex([String? field]) => _indexMgr.reindex(field);
+  /// [batchSize] controls how many documents are fetched concurrently per
+  /// iteration (default 32). Increase for faster storage, decrease for
+  /// memory-constrained environments.
+  Future<void> reindex({String? field, int batchSize = 32}) =>
+      _indexMgr.reindex(field: field, batchSize: batchSize);
 
   // ─── Open / Close ─────────────────────────────────────────────────────────
 
@@ -427,8 +432,10 @@ class FastDB {
             .where((k) => !loadedKeys.contains(k))
             .toList();
         if (missingKeys.isNotEmpty) {
-          // Some newly registered indexes weren't in the payload, rebuild them!
-          await _indexMgr.rebuildSecondaryIndexes(onProgress: onProgress);
+          // Rebuild ONLY newly added/missing indexes, keeping pre-loaded indexes in RAM
+          for (final key in missingKeys) {
+            await _indexMgr.reindex(field: key);
+          }
         }
       } else {
         await _indexMgr.rebuildSecondaryIndexes(onProgress: onProgress);
@@ -495,8 +502,17 @@ class FastDB {
               await _crudOps.deleteImpl(op.id!);
               break;
           }
-        } catch (_) {
-          // Skip failed replays
+        } catch (e, st) {
+          // Skip failed replays so a single bad entry doesn't block startup.
+          // Log the failure in debug mode for diagnostics.
+          assert(() {
+            // ignore: avoid_print
+            print(
+              '[ffastdb] Warning: replay of ${op.type}(id=${op.id}) '
+              'failed and was skipped: $e\n$st',
+            );
+            return true;
+          }());
         }
       }
     } finally {
@@ -795,6 +811,7 @@ class FastDB {
     _rangeSearch,
     watch,
     _queryCache,
+    _batchFindByIds,
   );
 
   Future<List<dynamic>> findWhere(
@@ -1133,10 +1150,30 @@ class FastDB {
     } else {
       fullData = await targetStorage.read(offset, totalSize);
     }
+    return _deserializeRecord(fullData, length, offset);
+  }
+
+  /// Parses one record's already-in-memory bytes
+  /// (`[4-byte length][payload][4-byte CRC32]`) into a document.
+  ///
+  /// Factored out of [_readAt] so [_batchFindByIds] can deserialize records
+  /// fetched via one large contiguous read instead of one `storage.read()`
+  /// call per document — see [_batchReadRaw] for why that matters on real
+  /// disk storage.
+  dynamic _deserializeRecord(Uint8List fullData, int length, int offset) {
+    final int totalSize = 4 + length + 4;
     // Verify CRC — same check as the sync path (_readAtSync).
     if (fullData.length >= totalSize) {
       final storedCrc = _readInt32(fullData, 4 + length);
-      if (storedCrc != _crc32(fullData.sublist(4, 4 + length))) return null;
+      final computedCrc = _crc32(fullData.sublist(4, 4 + length));
+      if (storedCrc != 0 && storedCrc != computedCrc) {
+        throw StateError(
+          'FastDB: CRC32 mismatch at offset $offset '
+          '(stored 0x${storedCrc.toRadixString(16)}, '
+          'computed 0x${computedCrc.toRadixString(16)}). '
+          'Document data may be corrupted.',
+        );
+      }
     }
     final body = fullData.sublist(4, 4 + length);
 
@@ -1176,21 +1213,138 @@ class FastDB {
     return doc;
   }
 
+  /// Reads raw document bytes (length header + payload + CRC32) at [offset] without deserialization.
+  Future<Uint8List?> _readRawAt(int offset) async {
+    if (offset < 0) return null;
+    if (dataStorage == null && offset < PageManager.pageSize) return null;
+    final targetStorage = dataStorage ?? storage;
+    const int readAheadSize = 512;
+    final chunk = await targetStorage.read(offset, readAheadSize);
+    if (chunk.length < 4) return null;
+    final length = _readInt32(chunk, 0);
+    if (length <= 0 || length > 10 * 1024 * 1024) return null;
+    final int totalSize = 4 + length + 4;
+    if (totalSize <= chunk.length) {
+      return Uint8List.fromList(chunk.sublist(0, totalSize));
+    }
+    return targetStorage.read(offset, totalSize);
+  }
+
+  /// Reads raw document bytes for a batch of (id, offset) entries.
+  ///
+  /// Documents written by normal inserts/insertAll sit back-to-back in the
+  /// file, so a batch's entries are almost always densely packed — fetching
+  /// them with [Future.wait] over individually-awaited reads still means one
+  /// `read()` call (and one trip through IoStorageStrategy's serializing
+  /// lock, each allocating its own Completer/Future) PER DOCUMENT. Measured
+  /// on 100k docs: only ~5% of that time is actual disk I/O: the rest is
+  /// Dart-side Future/lock-chain overhead from making 100k separate calls.
+  ///
+  /// Instead, this reads the whole batch's byte span in ONE call and slices
+  /// each record out of the shared buffer in memory. Falls back to the
+  /// existing per-entry path (a) entirely, if the span is too sparse to be
+  /// worth it (e.g. many deletions scattered between the batch's live docs),
+  /// or (b) per-entry, if a specific record turns out to extend past what
+  /// was fetched (larger than [_batchReadTailCeiling], or near EOF).
+  ///
+  /// Shared by [IndexManager] (reindex) and [_QueryOperations] (regular
+  /// queries / `getAll()`) — both resolve many ids to full records and both
+  /// used to pay the per-call overhead above before this existed.
+  static const int _batchReadAvgDocCeiling = 4096;
+  static const int _batchReadTailCeiling = 64 * 1024;
+
+  Future<List<Uint8List?>> _batchReadRaw(List<MapEntry<int, int>> batch) async {
+    if (batch.isEmpty) return const [];
+    if (batch.length == 1) return [await _readRawAt(batch[0].value)];
+
+    int minOffset = batch[0].value;
+    int maxOffset = batch[0].value;
+    for (final e in batch) {
+      if (e.value < minOffset) minOffset = e.value;
+      if (e.value > maxOffset) maxOffset = e.value;
+    }
+
+    final span = maxOffset - minOffset;
+    if (span > batch.length * _batchReadAvgDocCeiling) {
+      // Too sparse — reading the whole span would fetch mostly dead space.
+      return Future.wait(batch.map((e) => _readRawAt(e.value)));
+    }
+
+    final targetStorage = dataStorage ?? storage;
+    final chunk = await targetStorage.read(minOffset, span + _batchReadTailCeiling);
+
+    final results = List<Uint8List?>.filled(batch.length, null);
+    for (int i = 0; i < batch.length; i++) {
+      final localOffset = batch[i].value - minOffset;
+      if (localOffset + 4 > chunk.length) {
+        results[i] = await _readRawAt(batch[i].value);
+        continue;
+      }
+      final length = _readInt32(chunk, localOffset);
+      if (length <= 0 || length > 10 * 1024 * 1024) {
+        results[i] = null;
+        continue;
+      }
+      final totalSize = 4 + length + 4;
+      if (localOffset + totalSize <= chunk.length) {
+        results[i] = Uint8List.fromList(chunk.sublist(localOffset, localOffset + totalSize));
+      } else {
+        // Record extends past the fetched span — fetch it directly instead.
+        results[i] = await _readRawAt(batch[i].value);
+      }
+    }
+    return results;
+  }
+
+  /// Batch-resolves ids to fully deserialized documents, using
+  /// [_batchReadRaw] instead of one `_readAt()`-style storage read per id.
+  /// Preserves [ids]' order; ids with no B-Tree entry are silently skipped
+  /// (matches [_findById] returning `null` for missing ids, filtered out by
+  /// callers already — [_QueryOperations.findByIdsImpl] and `getAll()`).
+  Future<List<dynamic>> _batchFindByIds(List<int> ids) async {
+    if (ids.isEmpty) return const [];
+
+    final entries = <MapEntry<int, int>>[];
+    for (final id in ids) {
+      final offset = await _primaryIndex.search(id);
+      if (offset != null) {
+        entries.add(MapEntry(id, offset));
+      } else if (_batchEntries.isNotEmpty) {
+        // Read-your-writes in batch/transaction mode (see _findById).
+        for (final e in _batchEntries) {
+          if (e.key == id) {
+            entries.add(e);
+            break;
+          }
+        }
+      }
+    }
+    if (entries.isEmpty) return const [];
+
+    final rawResults = await _batchReadRaw(entries);
+    final docs = <dynamic>[];
+    for (int i = 0; i < entries.length; i++) {
+      final raw = rawResults[i];
+      if (raw == null || raw.length < 4) continue;
+      final length = _readInt32(raw, 0);
+      if (length <= 0) continue;
+      final doc = _deserializeRecord(raw, length, entries[i].value);
+      if (doc != null) docs.add(doc);
+    }
+    return docs;
+  }
+
   // Serialization & Encoding
 
   Uint8List _serialize(dynamic doc, {int? id}) {
     final Uint8List payload;
     if (doc is Map) {
-      // Copy ONLY when we must inject ffdbID (the old code copied
-      // unconditionally AND then again conditionally — the "optimization"
-      // was broken). When no injection is needed, pass the map straight to
-      // the serializer (it only reads).
-      final Map<String, dynamic> map;
-      if (id != null && doc['ffdbID'] != id) {
-        map = Map<String, dynamic>.from(doc)..['ffdbID'] = id;
-      } else {
-        map = doc.cast<String, dynamic>();
-      }
+      // Always use a defensive copy — Map.cast<K,V>() is lazy and defers type
+      // checking until each key is accessed (inside the serializer), making
+      // CastErrors hard to trace. From(doc) validates eagerly and also protects
+      // the caller's original map from any accidental mutation.
+      final map = Map<String, dynamic>.from(doc);
+      if (id != null) map['ffdbID'] = id;
 
       payload = FastSerializer.serialize(map);
     } else if (_registry.getTypeId(doc.runtimeType) != null) {
@@ -1283,6 +1437,7 @@ class FastDB {
       await storage.flush();
       await _saveHeader();
       _queryCache.clear();
+      _notifyWatchersBatch();
       if (_autoCompactThreshold > 0) {
         await _maybeAutoCompact();
       }
@@ -1300,12 +1455,12 @@ class FastDB {
 
   // ─── Compact (Vacuum) ──────────────────────────────────────────────────────
 
-  /// Compacts the database inside a WAL transaction. The single-file path
-  /// truncates and rewrites the whole file; before this was transactional, a
-  /// crash or write failure (ENOSPC) after the truncate permanently destroyed
-  /// every document not yet rewritten. Now the truncate is recorded in the
-  /// WAL and applied only at commit — all-or-nothing.
+  /// Compacts the database inside a WAL transaction.
   Future<void> compact() => transaction(() => _storageMgr.compactImpl());
+
+  /// Completely removes all documents from the database in O(1) time and resets
+  /// auto-increment IDs to 1.
+  Future<void> clear() => _exclusive(() => _storageMgr.clearImpl());
 
   // ─── Migrations ────────────────────────────────────────────────────────────
 

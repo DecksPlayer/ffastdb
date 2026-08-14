@@ -653,7 +653,7 @@ class BTree {
     for (int i = 0; i < node.keys.length; i++) {
       final k = node.keys[i];
 
-      if (!node.isLeaf && k > low) {
+      if (!node.isLeaf && k >= low) {
         if (node.values[i] > 0) {
           await _rangeNode(node.values[i], low, high, out, visited, seenIds);
         }
@@ -675,6 +675,54 @@ class BTree {
         (node.keys.isEmpty || node.keys.last <= high)) {
       if (node.values.last > 0) {
         await _rangeNode(node.values.last, low, high, out, visited, seenIds);
+      }
+    }
+  }
+
+  /// Returns all (key, offset) pairs where key is between [low] and [high] (inclusive).
+  Future<List<MapEntry<int, int>>> rangeSearchEntries(int low, int high) async {
+    final results = <MapEntry<int, int>>[];
+    if (rootPage == null || rootPage == 0) return results;
+    final seenIds = <int>{};
+    await _rangeNodeEntries(rootPage!, low, high, results, null, seenIds);
+    return results;
+  }
+
+  Future<void> _rangeNodeEntries(
+    int pageIdx,
+    int low,
+    int high,
+    List<MapEntry<int, int>> out,
+    Set<int>? visited,
+    Set<int>? seenIds,
+  ) async {
+    visited ??= {};
+    if (!visited.add(pageIdx)) return;
+
+    BTreeNode? node = _readNodeSync(pageIdx);
+    node ??= await _readNode(pageIdx);
+
+    for (int i = 0; i < node.keys.length; i++) {
+      final k = node.keys[i];
+
+      if (!node.isLeaf && k >= low) {
+        if (node.values[i] > 0) {
+          await _rangeNodeEntries(node.values[i], low, high, out, visited, seenIds);
+        }
+      }
+
+      if (k > high) return;
+
+      if (k >= low && node.isLeaf && (seenIds == null || seenIds.add(k))) {
+        out.add(MapEntry(k, node.values[i]));
+      }
+    }
+
+    if (!node.isLeaf &&
+        node.values.length > node.keys.length &&
+        (node.keys.isEmpty || node.keys.last <= high)) {
+      if (node.values.last > 0) {
+        await _rangeNodeEntries(node.values.last, low, high, out, visited, seenIds);
       }
     }
   }
@@ -708,6 +756,7 @@ class BTree {
   /// page byte cache. Returns null only when neither cache holds the page.
   /// Calling this avoids microtask scheduling on hot paths.
   BTreeNode? _readNodeSync(int pageIdx) {
+    if (pageIdx <= 0) return null;
     final cached = _nodeCache[pageIdx];
     if (cached != null) return cached;
     final page = pageManager.readPageSync(pageIdx);
@@ -721,6 +770,9 @@ class BTree {
   }
 
   Future<BTreeNode> _readNode(int pageIdx) async {
+    if (pageIdx <= 0) {
+      return BTreeNode(pageIndex: 0, isLeaf: true, keys: [], values: []);
+    }
     final sync = _readNodeSync(pageIdx);
     if (sync != null) return sync;
     final data = await pageManager.readPage(pageIdx);

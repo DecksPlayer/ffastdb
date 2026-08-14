@@ -87,34 +87,74 @@ class BufferedStorageStrategy implements StorageStrategy {
       return a.seq.compareTo(b.seq);
     });
 
-    // Coalesce adjacent/overlapping writes
-    final coalesced = <_WalEntry>[];
-    var cur = _pendingWrites.first;
+    // Group adjacent/overlapping writes by bounds only (no copying yet) —
+    // copying on every merge step here would re-copy the whole accumulated
+    // range for each additional entry, i.e. O(n^2) bytes for n writes to a
+    // contiguous region (exactly what sequential document inserts produce).
+    //
+    // Only writes that TOUCH or OVERLAP (no gap) are grouped — the merged
+    // buffer below is built with setRange() calls that cover only the bytes
+    // each entry actually specifies, so a real gap between two writes would
+    // be left as zeros and clobber whatever pre-existing bytes lived there.
+    // Bridging small gaps was tried and reverted: it silently zeroed
+    // untouched bytes between writes (e.g. header sub-fields written by
+    // separate calls within one transaction).
+    final groupBounds = <int>[]; // pairs of (startIndex, endIndex) into _pendingWrites
+    int groupStart = 0;
+    int rangeEnd = _pendingWrites.first.offset + _pendingWrites.first.data.length;
 
     for (int i = 1; i < _pendingWrites.length; i++) {
       final next = _pendingWrites[i];
-      final curEnd = cur.offset + cur.data.length;
-
-      if (next.offset <= curEnd + 512) {
-        // Merge: extend current range to cover both, then apply `next` on top
-        // (it is newer). This also handles `next` fully contained in `cur` —
-        // previously those newer bytes were silently discarded (data corruption).
+      if (next.offset <= rangeEnd) {
         final nextEnd = next.offset + next.data.length;
-        final newLen = (nextEnd > curEnd ? nextEnd : curEnd) - cur.offset;
-        final merged = Uint8List(newLen);
-        merged.setRange(0, cur.data.length, cur.data);
-        merged.setRange(next.offset - cur.offset, next.offset - cur.offset + next.data.length, next.data);
-        cur = _WalEntry(cur.offset, merged, cur.seq);
+        if (nextEnd > rangeEnd) rangeEnd = nextEnd;
       } else {
-        coalesced.add(cur);
-        cur = next;
+        groupBounds.add(groupStart);
+        groupBounds.add(i);
+        groupStart = i;
+        rangeEnd = next.offset + next.data.length;
       }
     }
-    coalesced.add(cur);
+    groupBounds.add(groupStart);
+    groupBounds.add(_pendingWrites.length);
 
-    // Single flush per coalesced range
-    for (final entry in coalesced) {
-      await _inner.write(entry.offset, entry.data);
+    // Second pass: allocate exactly one buffer per group and paint each
+    // entry into it once — in SEQ (temporal) order, not offset order. Offset
+    // order only decided the group's bounds above; two overlapping entries
+    // at DIFFERENT offsets can sort in the OPPOSITE order from when they
+    // were actually written (e.g. a single write at offset X, then later a
+    // wider write starting at X, then — earlier than that wider write but
+    // at offset X+something — a third write that offset-sorts AFTER it).
+    // Painting in offset order would let that earlier write clobber the
+    // later, wider one. Re-sorting each group by seq restores "last write
+    // wins" by real time regardless of how offsets happened to sort.
+    for (int g = 0; g < groupBounds.length; g += 2) {
+      final start = groupBounds[g];
+      final end = groupBounds[g + 1];
+
+      // Single-entry group — the common case for small, spread-out writes:
+      // write its data directly, no merge buffer needed.
+      if (end - start == 1) {
+        final entry = _pendingWrites[start];
+        await _inner.write(entry.offset, entry.data);
+        continue;
+      }
+
+      final rangeOffset = _pendingWrites[start].offset;
+      int rangeLen = 0;
+      for (int i = start; i < end; i++) {
+        final entry = _pendingWrites[i];
+        final entryEnd = entry.offset - rangeOffset + entry.data.length;
+        if (entryEnd > rangeLen) rangeLen = entryEnd;
+      }
+      final merged = Uint8List(rangeLen);
+      final group = _pendingWrites.sublist(start, end)
+        ..sort((a, b) => a.seq.compareTo(b.seq));
+      for (final entry in group) {
+        final relOffset = entry.offset - rangeOffset;
+        merged.setRange(relOffset, relOffset + entry.data.length, entry.data);
+      }
+      await _inner.write(rangeOffset, merged);
     }
 
     await _inner.flush();

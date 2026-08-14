@@ -1,3 +1,70 @@
+# Changelog
+
+## 0.3.5
+
+### Fixed — performance
+
+- **`BufferedStorageStrategy` could be unexpectedly slow when many different offsets are written in a single `flush()` call.** If the pending writes are widely scattered (e.g. each writes to a different index block or document offset), the `mergeChunks` logic could create many individual `_writeChunk` sub-ranges, resulting in more I/O operations than necessary.
+
+## 0.3.4
+
+### Fixed — data loss / correctness
+
+- **FTS and Composite indexes could come back silently empty after closing and reopening the database.** Three compounding bugs in the index-persistence path:
+  - `SortedIndex.deserialize()` corrupted its read cursor on any string-valued entry (`off += readInt32()` discarded 4 bytes due to Dart's compound-assignment evaluation order — the RHS's side effect on `off` isn't visible to the addition), throwing a `RangeError` once entries existed.
+  - That exception was swallowed by `loadIndexes()`, silently aborting the load of every index serialized after the failing one — including FTS and Composite.
+  - The fallback path (`reindex(field:)`, used for any index whose persisted blob failed to load) extracted the wrong document field for FTS (used its `_secondaryIndexes` map key, e.g. `_fts_content`, instead of the actual field `content`) and didn't handle Composite's multi-field extraction at all — so even the fallback silently produced empty indexes.
+- `loadIndexes()` also looked up an index's "already registered" check by its plain `fieldName`, which for FtsIndex can collide with an unrelated Hash/Sorted index registered on the same field name — could incorrectly discard a valid loaded FTS index as a "type mismatch".
+- `compact()` (single-file mode) could corrupt live document data: it didn't clear the stale pre-compact index-block pointer in the header, so `saveIndexes()` could reuse an offset from the old (larger) file layout that now overlapped freshly rewritten documents in the smaller, compacted file.
+
+### Fixed — performance
+
+- `insertAll()` and `compact()`'s rebuild path indexed documents one at a time (`SecondaryIndex.add()`), which is an O(n) array shift per call for `SortedIndex` — making indexing a batch O(n²) in its own size. Both now batch field values per index and apply them with one `addAll()` call per index per chunk.
+- `WalStorageStrategy` (the default native storage) applied every buffered write to the main file individually — one syscall per document. Writes are now coalesced into a handful of large sequential writes per transaction, with correct "last write wins" ordering preserved for overlapping ranges.
+- For transactions larger than the in-RAM buffering threshold (huge `insertAll` calls), each streamed write hit the WAL file with its own syscall — up to ~1M for a 1M-document batch. These are now accumulated in a rolling buffer and flushed every few MB instead.
+- `BufferedStorageStrategy.commit()`'s write-coalescing was O(n²) in the number of pending writes (re-copied the whole accumulated buffer on every additional write).
+- `reindex()` / `rebuildSecondaryIndexes()` read each document with its own `read()` call — mostly Dart-side Future/lock overhead rather than actual I/O. Densely-packed batches now fetch their whole byte span in one read and slice records out of the shared buffer in memory.
+- Net effect: 1M-document `insertAll` went from not completing in 5+ minutes to ~34s; `reindex()` on 100k documents went from ~6s to ~2.7s; a 100k-document `insertAll` with Hash + Sorted + FTS + Composite indexes together went from visibly quadratic per-batch growth to flat.
+
+### Notes
+
+- The two fixes above to `WalStorageStrategy`/`BufferedStorageStrategy` write-coalescing were themselves iterated on during development after being found to zero out untouched bytes between non-adjacent writes, and to break "last write wins" for writes that overlap out of offset order — both are covered by the final implementation and its tests.
+- Individual (non-batched) `insert()`/`update()` calls are unaffected by the coalescing changes: transactions with a single write (the common case) take a direct fast path with no extra allocation.
+
+## 0.3.3
+**Fix - Delete** - Clear all the docs in the database works well
+**Fix - Rebuild Indexes** - Rebuild all the indexes in the database works well 
+
+## 0.3.2
+
+### Bugfix release — crash safety and reactive consistency
+
+**Critical:**
+- **FIX - `_readAt` silently returned `null` on CRC32 mismatch** — corrupted documents were
+  indistinguishable from missing ones. Now throws `StateError` with offset and checksum values
+  so corruption is immediately visible instead of surfacing as phantom `findById` nulls.
+- **FIX - `deleteWhere` did not notify reactive watchers** — `db.watch()` streams were never
+  updated after a batch delete, leaving UIs showing stale data. `_notifyWatchersBatch()` is
+  now called after the WAL commit on the success path.
+
+**High:**
+- **FIX - `OperationLog` was written before the WAL commit in all 4 CRUD methods** — a crash
+  between `opLog.log()` and `wal.commit()` caused `_replayOpLog()` to re-apply operations that
+  had never actually completed, potentially duplicating documents or corrupting `_nextId`.
+  The log entry is now written only after a successful commit.
+- **FIX - `_serialize` used a lazy `Map.cast<String,dynamic>()` view** — when a document's map
+  had non-`String` keys (e.g. `Map<dynamic,dynamic>` from Firebase or untyped `jsonDecode`),
+  the `CastError` appeared deep inside the serializer instead of at the `insert()` call site.
+  Replaced with `Map<String,dynamic>.from(doc)` for eager validation.
+
+**Medium:**
+- **FIX - `_replayOpLog` silently swallowed all replay errors** — a bare `catch (_) {}`
+  discarded failures with no logging. Now emits a diagnostic `print` in debug mode via
+  `assert()` (zero overhead in release builds).
+- **FIX - `_applySort` used `ids.length * 4 < idx.size`** — on Dart Web (`int` = JS 53-bit
+  number) this multiplication could overflow with very large collections. Replaced with
+  `ids.length < idx.size ~/ 4` and added a `idx.size > 0` guard.
+
 ## 0.3.1
 
 ### Bugfix and Documentation release
@@ -369,4 +436,3 @@ Durability release. Breaking for custom `StorageStrategy` implementations only.
  - Reactive watchers
  - Auto-compact
  - First version
-

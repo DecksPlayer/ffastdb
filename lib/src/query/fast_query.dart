@@ -32,6 +32,17 @@ class QueryBuilder {
   /// Optional callback to watch secondary indexes.
   final Stream<List<int>> Function(String field)? _watchStream;
 
+  /// Optional callback to resolve many ids to documents at once.
+  ///
+  /// When available (FastDB injects [FastDB._batchFindByIds]), [find] and
+  /// [_fullScan] use it instead of `Future.wait(ids.map(_fetchById))` — on
+  /// real disk storage, N "concurrent" [_fetchById] calls still serialize
+  /// through the storage layer's own lock one at a time, paying N times the
+  /// Future/Completer overhead for what a single batched read does in one
+  /// I/O call. Falls back to the per-id path when null (e.g. a QueryBuilder
+  /// built directly, without a database reference).
+  final Future<List<dynamic>> Function(List<int> ids)? _batchFetchByIds;
+
   final List<List<_Condition>> _orGroups = [
     [],
   ]; // AND within groups, OR between groups
@@ -56,6 +67,7 @@ class QueryBuilder {
     this._primarySearch,
     this._watchStream,
     QueryCache? cache,
+    this._batchFetchByIds,
   ]) : _queryCache = cache ?? _defaultCache;
 
   /// Stream that emits matching documents every time any of the queried fields change.
@@ -223,8 +235,10 @@ class QueryBuilder {
     }
     final ids = await findIds();
     if (ids.isEmpty) return const [];
-    // Resolve documents concurrently (same pattern as findByIdsImpl) instead
-    // of one sequential await per document.
+    // Batched resolution when available — see [_batchFetchByIds]. Falls back
+    // to one Future per id (still concurrent, just not I/O-batched) for a
+    // QueryBuilder built without a database reference.
+    if (_batchFetchByIds != null) return _batchFetchByIds(ids);
     final docs = await Future.wait(ids.map(_fetchById), eagerError: false);
     return [for (final d in docs) ?d];
   }
@@ -699,7 +713,8 @@ class QueryBuilder {
         // their indexed value — O(k log k) instead of scanning the WHOLE
         // index O(N) to filter k results.
         if (ids.isNotEmpty &&
-            ids.length * 4 < idx.size &&
+            idx.size > 0 &&
+            ids.length < idx.size ~/ 4 &&
             idx.valueOf(ids.first) != null) {
           int cmp(int a, int b) {
             final va = idx.valueOf(a);

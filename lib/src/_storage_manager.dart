@@ -111,20 +111,30 @@ class _StorageManager {
           case 5: idx = CompositeIndex.deserialize(indexBytes);
           default: continue;
         }
-        // If the user changed index type between startups (e.g. HashIndex →
-        // SortedIndex), the pre-registered type wins — discard the old blob so
-        // _rebuildSecondaryIndexes() will rebuild with the correct type.
-        final existing = _db._secondaryIndexes[idx.fieldName];
-        if (existing != null && existing.runtimeType != idx.runtimeType) {
-          continue;
-        }
 
+        // The _secondaryIndexes map key is NOT always idx.fieldName: FtsIndex
+        // is keyed "_fts_<field>" (idx.fieldName is just the plain field —
+        // shared with, e.g., a SortedIndex on the same field, which is a
+        // DIFFERENT registered index) and CompositeIndex is keyed by its
+        // joined field names. Compute the real key FIRST — looking up by
+        // idx.fieldName directly could find an unrelated index sharing that
+        // plain field name and reject this one as a "type mismatch",
+        // silently discarding it even though nothing is actually wrong.
         String key = idx.fieldName;
         if (idx is FtsIndex) {
           key = '_fts_${idx.fieldName}';
         } else if (idx is CompositeIndex) {
           key = idx.fieldNames.join('+');
         }
+
+        // If the user changed index type between startups (e.g. HashIndex →
+        // SortedIndex), the pre-registered type wins — discard the old blob so
+        // _rebuildSecondaryIndexes() will rebuild with the correct type.
+        final existing = _db._secondaryIndexes[key];
+        if (existing != null && existing.runtimeType != idx.runtimeType) {
+          continue;
+        }
+
         _db._secondaryIndexes[key] = idx;
         loadedKeys.add(key);
       }
@@ -207,6 +217,15 @@ class _StorageManager {
       _db._primaryIndex.rootPage = null;                // force a fresh root on first insert
       for (final idx in _db._secondaryIndexes.values) idx.clear();
 
+      // Zero out the secondary-index block pointer (bytes 16-23) — same fix
+      // as clearImpl(). Without this, saveIndexes() below sees the STALE
+      // pre-compact offset/length and, if the freshly-rebuilt index still
+      // fits in that old length, "reuses" that offset directly instead of
+      // computing a fresh one from the (now much smaller, rebuilt) file
+      // size — landing the index blob in the middle of the just-rewritten
+      // document data and corrupting it.
+      await _db.storage.write(16, Uint8List(8));
+
       // Create the initial sentinel entry (id=0, offset=0) — same as open().
       await _db._primaryIndex.insert(0, 0);
       // Mark header dirty so clean-flag byte is written below.
@@ -215,26 +234,76 @@ class _StorageManager {
       }
       _db._dataOffset = await _db.storage.size;
 
+      // Secondary-index population is deferred to one batched call after
+      // this loop (see indexDocumentsBatch) — indexDocument() per document
+      // is O(n) per call for SortedIndex (array shift to stay sorted),
+      // which made compacting a large dataset O(n^2) in the live doc count.
+      final toIndex = <MapEntry<int, Map<String, dynamic>>>[];
       int i = 0;
       for (final entry in docs.entries) {
         final data = _db._serialize(entry.value, id: entry.key);
         await _db.storage.write(_db._dataOffset, data);
         await _db._primaryIndex.insert(entry.key, _db._dataOffset);
         if (entry.value is Map<String, dynamic>) {
-          _db._indexDocument(entry.key, entry.value as Map<String, dynamic>);
+          toIndex.add(MapEntry(entry.key, entry.value as Map<String, dynamic>));
         }
         // Track actual file end including any new B-Tree pages allocated during insert.
         _db._dataOffset = _db.storage.sizeSync ?? await _db.storage.size;
         if (i > 0 && i % 250 == 0) await Future.delayed(Duration.zero);
         i++;
       }
+      _db._indexMgr.indexDocumentsBatch(toIndex);
       await _db._pageManager.flushDirty();
     }
 
     _db._deletedCount = 0;
+    await saveIndexes();
     await saveHeader();
     await _db.storage.flush();
     if (_db.dataStorage != null) await _db.dataStorage!.flush();
+  }
+
+  /// Wipes all documents from the database in O(1) time by truncating storage
+  /// and resetting B-Tree and secondary indexes.
+  Future<void> clearImpl() async {
+    final wal = _db._wal;
+    if (!_db._inTransaction && wal != null) await wal.beginTransaction();
+    try {
+      await _db.storage.truncate(PageManager.pageSize);
+      if (_db.dataStorage != null) {
+        await _db.dataStorage!.truncate(0);
+      }
+      _db._pageManager.clearCache();
+      _db._pageManager.clearFreeList();
+      _db._primaryIndex.clearNodeCache();
+      _db._primaryIndex.rootPage = null;
+      for (final idx in _db._secondaryIndexes.values) {
+        idx.clear();
+      }
+
+      _db._nextId = 1;
+      _db._deletedCount = 0;
+      _db._batchEntries.clear();
+
+      await _db._primaryIndex.insert(0, 0);
+      _db._dataOffset = await _db.storage.size;
+
+      // Zero out the secondary-index block pointer (bytes 16-23) so that
+      // loadIndexes() on the next open does not find a stale offset/length
+      // and reload old index data from beyond the now-truncated file.
+      await _db.storage.write(16, Uint8List(8));
+
+      await saveHeader();
+      await _db.storage.flush();
+      if (_db.dataStorage != null) await _db.dataStorage!.flush();
+      await _db._opLog.clear();
+      _db._queryCache.clear();
+      if (!_db._inTransaction && wal != null) await wal.commit();
+      _db._notifyWatchersBatch();
+    } catch (e) {
+      if (!_db._inTransaction && wal != null) await wal.rollback();
+      rethrow;
+    }
   }
 
   /// Applies schema migrations to all documents.

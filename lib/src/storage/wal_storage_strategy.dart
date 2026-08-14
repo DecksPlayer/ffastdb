@@ -83,6 +83,16 @@ class WalStorageStrategy implements StorageStrategy {
   /// to the WAL file instead of being buffered in RAM.
   static const int _txStreamThreshold = 8 * 1024 * 1024; // 8 MB
 
+  /// Rolling buffer for streamed entries' ENCODED bytes (header+data+CRC),
+  /// flushed to the WAL file every [_streamFlushBytes] instead of once per
+  /// entry — turns e.g. 1M individual `wal.write()` syscalls (one per small
+  /// document, ~75% of a 1M-doc `insertAll`'s total time) into a couple
+  /// hundred. Always flushed before the entry data is needed elsewhere (a
+  /// commit, or a read-your-writes lookup) — see [_flushStreamBuffer].
+  final BytesBuilder _streamBuffer = BytesBuilder();
+  int _streamBufferBytes = 0;
+  static const int _streamFlushBytes = 4 * 1024 * 1024; // 4 MB
+
   /// The WAL is checkpointed (truncated) only when it exceeds this size —
   /// not after every commit (that was a truncate+fsync storm per operation).
   static const int _checkpointThreshold = 1024 * 1024; // 1 MB
@@ -273,6 +283,10 @@ class WalStorageStrategy implements StorageStrategy {
   Future<void> commit() async {
     if (!_txOpen) return;
 
+    // 0. Flush any streamed entries still sitting in the rolling buffer so
+    //    _walPos is correct before the block below appends at it.
+    await _flushStreamBuffer();
+
     // 1. Write all buffered entries + the COMMIT marker to the WAL file in a
     //    SINGLE write call (streamed entries are already there). The COMMIT
     //    marker is the atomic point of no return. A recorded truncate is
@@ -301,13 +315,8 @@ class WalStorageStrategy implements StorageStrategy {
       if (truncateTo != null) {
         await _main.truncate(truncateTo);
       }
-      for (final entry in _txEntries) {
-        await _main.write(entry.offset, entry.data);
-      }
-      for (final s in _txStreamed) {
-        final data = await _wal.read(s.walPos + 25, s.length); // +25: entry header
-        await _main.write(s.offset, data);
-      }
+      await _applyCoalesced(_txEntries);
+      await _applyStreamed(_txStreamed);
       await _main.flush();
     } catch (e) {
       // Committed but half-applied: block further operations until recovery.
@@ -339,6 +348,12 @@ class WalStorageStrategy implements StorageStrategy {
     _txStreamed.clear();
     _txBufferedBytes = 0;
     _txTruncateTo = null;
+    // Discard any streamed bytes not yet flushed. Already-flushed ones carry
+    // no COMMIT marker either, so the checkpoint below (or recovery, if the
+    // process dies first) discards them the same way it already did before
+    // stream buffering existed.
+    _streamBuffer.clear();
+    _streamBufferBytes = 0;
     if (_commitMarkerWritten) {
       // The COMMIT marker is already durable in the WAL: this transaction
       // passed its atomic point and a failure happened DURING APPLY.
@@ -356,6 +371,147 @@ class WalStorageStrategy implements StorageStrategy {
       await _checkpoint();
     }
     // WAL entries are ignored on next recovery since there's no COMMIT marker
+  }
+
+  /// Applies buffered [entries] to [_main], coalescing adjacent/overlapping
+  /// writes into as few I/O calls as possible. Sequential document inserts
+  /// (and page-flush ranges) write at contiguous offsets, so a transaction of
+  /// N small writes typically collapses into a handful of large ones —
+  /// turning N syscalls into a few.
+  ///
+  /// Only entries that TOUCH or OVERLAP (no gap) are grouped together — the
+  /// merged buffer is built with setRange() calls that cover only the bytes
+  /// each entry actually specifies, so bridging a real gap between two
+  /// writes would leave zeros there and clobber whatever pre-existing bytes
+  /// (from an earlier, already-committed transaction) lived in that gap —
+  /// e.g. the header's clean-shutdown-flag byte sitting between the header
+  /// and free-page-list sub-fields, when only those two (not the flag) are
+  /// written in the same transaction. Safe regardless of grouping otherwise:
+  /// the WAL already holds each entry individually and durably (written
+  /// before this method runs), and [_recover] always replays committed
+  /// entries at their ORIGINAL granularity with an idempotent "already
+  /// applied?" check — this method only changes how many I/O calls the
+  /// (already-durable) apply step takes, never what ends up on disk.
+  Future<void> _applyCoalesced(List<_WalEntry> entries) async {
+    if (entries.isEmpty) return;
+    if (entries.length == 1) {
+      await _main.write(entries.first.offset, entries.first.data);
+      return;
+    }
+
+    // Sort by offset to find contiguous/overlapping GROUPS only — this
+    // ordering is not used to decide which write wins an overlap (see the
+    // painting step below, which re-sorts each group by original index).
+    final order = List<int>.generate(entries.length, (i) => i)
+      ..sort((a, b) {
+        final oa = entries[a].offset, ob = entries[b].offset;
+        if (oa != ob) return oa.compareTo(ob);
+        return a.compareTo(b);
+      });
+
+    int i = 0;
+    while (i < order.length) {
+      // First pass: grow the group by comparing bounds only (no copying) —
+      // copying per step here would re-copy the whole accumulated range for
+      // every additional entry (O(n^2) bytes for n contiguous writes).
+      int groupEnd = i;
+      int rangeEnd = entries[order[i]].offset + entries[order[i]].data.length;
+      while (groupEnd + 1 < order.length) {
+        final next = entries[order[groupEnd + 1]];
+        if (next.offset > rangeEnd) break;
+        final nextEnd = next.offset + next.data.length;
+        if (nextEnd > rangeEnd) rangeEnd = nextEnd;
+        groupEnd++;
+      }
+
+      // Single-entry group (the common case — e.g. a lone document write,
+      // B-Tree page, or header update that doesn't touch anything else in
+      // the transaction): write its data directly, no merge buffer needed.
+      // This keeps small transactions (a single insert() is typically 2-4
+      // entries, usually all far apart) as cheap as the pre-coalescing code.
+      if (groupEnd == i) {
+        final e = entries[order[i]];
+        await _main.write(e.offset, e.data);
+        i = groupEnd + 1;
+        continue;
+      }
+
+      // Second pass: allocate exactly one buffer for the group and paint each
+      // entry into it once — in ORIGINAL (temporal) order, not offset order.
+      // Offset order only decided the group's bounds above; two entries can
+      // overlap while sorting in the OPPOSITE order from when they were
+      // actually written (e.g. a single-page write at offset X followed
+      // later by a two-page write starting at the SAME offset X — same
+      // offset tie is fine, but a third write at X+pageSize from EARLIER
+      // than the two-page write sorts AFTER it purely by offset). Painting
+      // in offset order would let that earlier write clobber the later one.
+      // Sorting group members back to original-index order restores "last
+      // write wins" by real time regardless of how offsets happened to sort.
+      final rangeOffset = entries[order[i]].offset;
+      final merged = Uint8List(rangeEnd - rangeOffset);
+      final groupOriginalIndices = [for (int k = i; k <= groupEnd; k++) order[k]]..sort();
+      for (final idx in groupOriginalIndices) {
+        final e = entries[idx];
+        final rel = e.offset - rangeOffset;
+        merged.setRange(rel, rel + e.data.length, e.data);
+      }
+      await _main.write(rangeOffset, merged);
+      i = groupEnd + 1;
+    }
+  }
+
+  /// Above this many bytes, streamed entries are read back from the WAL file
+  /// and applied to [_main] in bounded chunks rather than all at once —
+  /// keeps peak RAM proportional to the chunk size, not to the whole
+  /// transaction (re-reading everything into RAM at once would defeat the
+  /// point of streaming, which exists to bound RAM for huge transactions).
+  static const int _applyChunkBytes = 8 * 1024 * 1024; // 8 MB
+
+  /// Applies entries that were streamed straight to the WAL file during a
+  /// huge transaction (see [_txStreamThreshold]) to [_main].
+  ///
+  /// Streamed entries were appended back-to-back to the WAL file (nothing
+  /// else writes to it mid-transaction), so a whole chunk's worth of entries
+  /// — headers, data and CRCs included — can be fetched with ONE read call
+  /// instead of one read per entry, then coalesced onto [_main] the same way
+  /// [_applyCoalesced] does for RAM-buffered entries. This is what makes
+  /// bulk-inserting e.g. 1M small documents (which blows well past the 8MB
+  /// RAM-buffering threshold) apply in a handful of large I/O calls instead
+  /// of ~2M tiny ones (one read + one write per document).
+  Future<void> _applyStreamed(
+      List<({int offset, int length, int walPos})> streamed) async {
+    if (streamed.isEmpty) return;
+
+    int i = 0;
+    while (i < streamed.length) {
+      // Grow the chunk while it stays within the RAM budget (a single entry
+      // larger than the budget still gets its own chunk of exactly one).
+      int j = i;
+      int bytes = streamed[i].length;
+      while (j + 1 < streamed.length &&
+          bytes + streamed[j + 1].length <= _applyChunkBytes) {
+        j++;
+        bytes += streamed[j].length;
+      }
+
+      final chunkStart = streamed[i].walPos;
+      final last = streamed[j];
+      final chunkEnd = last.walPos + 25 + last.length + 4; // +25 header, +4 CRC
+      final raw = await _wal.read(chunkStart, chunkEnd - chunkStart);
+
+      final entries = <_WalEntry>[];
+      for (int k = i; k <= j; k++) {
+        final s = streamed[k];
+        final dataStart = s.walPos - chunkStart + 25; // skip this entry's header
+        entries.add(_WalEntry(
+            txId: _txId,
+            offset: s.offset,
+            data: Uint8List.sublistView(raw, dataStart, dataStart + s.length)));
+      }
+      await _applyCoalesced(entries);
+
+      i = j + 1;
+    }
   }
 
   /// Truncates the WAL after all entries have been applied to main storage.
@@ -379,12 +535,17 @@ class WalStorageStrategy implements StorageStrategy {
         _txEntries.add(_WalEntry(txId: _txId, offset: offset, data: data));
         _txBufferedBytes += data.length;
       } else {
-        // Huge transactions (e.g. insertAll of 100k docs): stream the entry
-        // directly to the WAL file and keep only its metadata — bounds RAM.
-        final entry = _WalEntry(txId: _txId, offset: offset, data: data);
-        final walPos = _walPos;
-        await _writeWalEntry(_kEntryWrite, entry);
+        // Huge transactions (e.g. insertAll of 1M docs): the entry's data is
+        // never held in RAM as a whole (bounds RAM) — its ENCODED bytes go
+        // into a small rolling buffer instead, flushed to the WAL file every
+        // few MB rather than with one write() syscall per entry.
+        final walPos = _walPos + _streamBufferBytes;
+        _encodeWalEntry(_streamBuffer, _kEntryWrite, _txId, offset, data);
+        _streamBufferBytes += 25 + data.length + 4; // header + data + CRC
         _txStreamed.add((offset: offset, length: data.length, walPos: walPos));
+        if (_streamBufferBytes >= _streamFlushBytes) {
+          await _flushStreamBuffer();
+        }
       }
     } else {
       // Auto-wrap in a single-op transaction
@@ -441,7 +602,10 @@ class WalStorageStrategy implements StorageStrategy {
     for (final entry in _txEntries) {
       overlay(entry.offset, entry.data);
     }
-    // Streamed entries live in the WAL file (RAM-bounded transactions).
+    // Streamed entries live in the WAL file (RAM-bounded transactions) — but
+    // some may still be sitting in the unflushed rolling buffer rather than
+    // actually on disk yet. Flush first so every entry below is readable.
+    if (_streamBufferBytes > 0) await _flushStreamBuffer();
     for (final s in _txStreamed) {
       if (s.offset + s.length <= offset || s.offset >= readEnd) continue;
       final data = await _wal.read(s.walPos + 25, s.length); // +25: header
@@ -523,12 +687,19 @@ class WalStorageStrategy implements StorageStrategy {
     _addInt32(buf, _crc32(payload));
   }
 
-  Future<void> _writeWalEntry(int type, _WalEntry entry) async {
-    final buf = BytesBuilder();
-    _encodeWalEntry(buf, type, entry.txId, entry.offset, entry.data);
-    final bytes = buf.toBytes();
+  /// Flushes the rolling stream buffer (see [_streamBuffer]) to the WAL file
+  /// with one write() call, if it has anything in it. Called whenever the
+  /// buffer crosses [_streamFlushBytes], and unconditionally before anything
+  /// that needs the streamed bytes to actually be on disk: [commit] (so
+  /// [_walPos] is correct before the RAM-buffered entries + COMMIT marker are
+  /// appended) and [read] (so the read-your-writes overlay for [_txStreamed]
+  /// entries doesn't read stale/missing bytes for ones not yet flushed).
+  Future<void> _flushStreamBuffer() async {
+    if (_streamBufferBytes == 0) return;
+    final bytes = _streamBuffer.takeBytes();
     await _wal.write(_walPos, bytes);
     _walPos += bytes.length;
+    _streamBufferBytes = 0;
   }
 
   // ─── Checksum ────────────────────────────────────────────────────────────

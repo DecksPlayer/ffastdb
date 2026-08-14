@@ -10,14 +10,9 @@ class _CrudOperations {
     final wal = _db._wal;
     final hasWal = !_db._inTransaction && !_db._batchMode && wal != null;
     final id = _db._nextId++;
-    
-    // Log operation before starting
-    if (!_db._inTransaction && !_db._batchMode && !_db._isReplayingOpLog) {
-      await _db._opLog.log('insert', id: id, data: doc);
-    }
 
     if (hasWal) await wal.beginTransaction();
-    
+
     try {
       final data = _db._serialize(doc, id: id);
       final targetStorage = _db.dataStorage ?? _db.storage;
@@ -53,6 +48,11 @@ class _CrudOperations {
         _db._notifyWatchers(doc);
       }
       if (hasWal) await wal.commit();
+      // Log AFTER commit: if the process dies between log() and commit(),
+      // _replayOpLog() would re-insert an operation that never completed.
+      if (!_db._inTransaction && !_db._batchMode && !_db._isReplayingOpLog) {
+        await _db._opLog.log('insert', id: id, data: doc);
+      }
       if (!_db._inTransaction && !_db._batchMode) await _db._opLog.maybeCheckpoint();
       return id;
     } catch (e) {
@@ -70,16 +70,11 @@ class _CrudOperations {
           id, 'id', 'FastDB ids must be >= 1 (ids <= 0 are not reachable by queries)');
     }
     final oldOffset = await _db._primaryIndex.search(id);
-    
-    // Log operation before starting
-    if (!_db._inTransaction && !_db._batchMode && !_db._isReplayingOpLog) {
-      await _db._opLog.log('put', id: id, data: value);
-    }
 
     final wal = _db._wal;
     final hasWal = !_db._inTransaction && !_db._batchMode && wal != null;
     if (hasWal) await wal.beginTransaction();
-    
+
     try {
       if (oldOffset != null) {
         _db._deletedCount++;
@@ -115,6 +110,10 @@ class _CrudOperations {
       _db._queryCache.clear();
       _db._notifyWatchers(value);
       if (hasWal) await wal.commit();
+      // Log AFTER commit (see insertImpl for rationale).
+      if (!_db._inTransaction && !_db._batchMode && !_db._isReplayingOpLog) {
+        await _db._opLog.log('put', id: id, data: value);
+      }
       if (!_db._inTransaction && !_db._batchMode) await _db._opLog.maybeCheckpoint();
     } catch (e) {
       if (hasWal) await wal.rollback();
@@ -133,11 +132,6 @@ class _CrudOperations {
     }
     final oldOffset = await _db._primaryIndex.search(id);
     final merged = Map<String, dynamic>.from(existing as Map<String, dynamic>)..addAll(fields);
-
-    // Log operation before starting
-    if (!_db._inTransaction && !_db._batchMode && !_db._isReplayingOpLog) {
-      await _db._opLog.log('update', id: id, data: fields);
-    }
 
     final wal = _db._wal;
     final hasWal = !_db._inTransaction && !_db._batchMode && wal != null;
@@ -171,6 +165,10 @@ class _CrudOperations {
         _db._notifyWatchers(merged);
       }
       if (hasWal) await wal.commit();
+      // Log AFTER commit (see insertImpl for rationale).
+      if (!_db._inTransaction && !_db._batchMode && !_db._isReplayingOpLog) {
+        await _db._opLog.log('update', id: id, data: fields);
+      }
       if (!_db._inTransaction && !_db._batchMode) await _db._opLog.maybeCheckpoint();
       return true;
     } catch (e) {
@@ -185,10 +183,6 @@ class _CrudOperations {
     if (offset == null) return false;
     if (_db.dataStorage == null && offset < PageManager.pageSize) return false;
     final doc = await _db._readAt(offset);
-    // Log operation before starting
-    if (!_db._inTransaction && !_db._batchMode && !_db._isReplayingOpLog) {
-      await _db._opLog.log('delete', id: id);
-    }
 
     final wal = _db._wal;
     final hasWal = !_db._inTransaction && !_db._batchMode && wal != null;
@@ -219,6 +213,10 @@ class _CrudOperations {
         _db._notifyWatchers(doc);
       }
       if (hasWal) await wal.commit();
+      // Log AFTER commit (see insertImpl for rationale).
+      if (!_db._inTransaction && !_db._batchMode && !_db._isReplayingOpLog) {
+        await _db._opLog.log('delete', id: id);
+      }
       if (!_db._inTransaction && !_db._batchMode) await _db._opLog.maybeCheckpoint();
       if (_db._autoCompactThreshold > 0 && !_db._inTransaction && !_db._batchMode) {
         await _db._maybeAutoCompact();

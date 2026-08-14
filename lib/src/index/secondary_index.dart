@@ -6,6 +6,13 @@ abstract class SecondaryIndex {
   /// Adds a document ID → field value mapping to the index.
   void add(int docId, dynamic fieldValue);
 
+  /// Bulk adds docId → fieldValue mappings.
+  void addAll(Map<int, dynamic> entries) {
+    for (final e in entries.entries) {
+      add(e.key, e.value);
+    }
+  }
+
   /// Removes a document ID from the index.
   void remove(int docId, dynamic fieldValue);
 

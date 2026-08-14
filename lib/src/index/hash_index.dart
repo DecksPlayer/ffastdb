@@ -115,6 +115,13 @@ class HashIndex implements SecondaryIndex {
   }
 
   @override
+  void addAll(Map<int, dynamic> entries) {
+    for (final e in entries.entries) {
+      add(e.key, e.value);
+    }
+  }
+
+  @override
   void remove(int docId, [dynamic fieldValue]) {
     if (fieldValue == null) return;
     

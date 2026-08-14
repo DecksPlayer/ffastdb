@@ -903,7 +903,7 @@ void main() {
       expect(await db.query().where('city').equals('London').findIds(), isEmpty);
 
       // Now reindex
-      await db.reindex('city');
+      await db.reindex(field: 'city');
 
       final londonIds = await db.query().where('city').equals('London').findIds();
       expect(londonIds.length, 2);
@@ -937,7 +937,7 @@ void main() {
     test('reindex throws for unknown field', () async {
       final db = FastDB(MemoryStorageStrategy());
       await db.open();
-      expect(() => db.reindex('no_such_field'), throwsArgumentError);
+      expect(() => db.reindex(field: 'no_such_field'), throwsArgumentError);
       await db.close();
     });
   });

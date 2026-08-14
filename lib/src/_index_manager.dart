@@ -93,35 +93,87 @@ class IndexManager {
   /// Pass [field] to rebuild only that index; omit to rebuild all.
   /// Deduplicates IDs from rangeSearch to guard against B-Tree structural
   /// inconsistencies from pre-0.0.24 versions.
-  Future<void> reindex([String? field]) async {
+  ///
+  /// Uses concurrent batch I/O ([batchSize] reads in parallel via Future.wait)
+  /// to dramatically reduce total wall-clock time compared to serial reads.
+  Future<void> reindex({String? field, int batchSize = 5000}) async {
     if (field != null) {
       final idx = _db._secondaryIndexes[field];
       if (idx == null) throw ArgumentError('No index registered for field "$field"');
       idx.clear();
-      final rawIds = await _db._primaryIndex.rangeSearch(1, _db._nextId - 1);
-      // BUG FIX: Deduplicate IDs — rangeSearch may return same ID multiple times
-      // from B-Tree structural inconsistencies in pre-0.0.24 databases.
-      final allIds = LinkedHashSet<int>.from(rawIds).toList();
-      for (int i = 0; i < allIds.length; i++) {
-        final doc = await _db.findById(allIds[i]);
-        if (doc is Map) {
-          final castedDoc = Map<String, dynamic>.from(doc);
-          final val = _extractField(castedDoc, field);
-          if (val != null) idx.add(allIds[i], val);
-        }
-        if (i > 0 && i % 250 == 0) await Future.delayed(Duration.zero);
+      final entries = await _db._primaryIndex.rangeSearchEntries(1, _db._nextId - 1);
+      final seen = <int>{};
+      final uniqueEntries = <MapEntry<int, int>>[];
+      for (final e in entries) {
+        if (seen.add(e.key)) uniqueEntries.add(e);
       }
-      // Invalidate query cache since the index was rebuilt
+      await _reindexField(idx, uniqueEntries, field, batchSize: batchSize);
       _db._queryCache.clear();
     } else {
-      await rebuildSecondaryIndexes();
-      // Invalidate query cache since all indexes were rebuilt
+      await rebuildSecondaryIndexes(batchSize: batchSize);
       _db._queryCache.clear();
     }
   }
 
+  Future<void> _reindexField(
+    SecondaryIndex idx,
+    List<MapEntry<int, int>> docEntries,
+    String field, {
+    int batchSize = 5000,
+  }) async {
+    final effectiveBatchSize = batchSize > 0 ? batchSize : 5000;
+    final extractedMap = <int, dynamic>{};
+
+    // The document field(s) to extract are the INDEX's own field name(s) —
+    // NOT necessarily `field`, which is the index's key in _secondaryIndexes
+    // and only happens to equal the document field for Hash/Sorted/Bitmask
+    // indexes. FtsIndex is keyed "_fts_<field>" (its own fieldName is the
+    // plain field, e.g. "content"), and CompositeIndex needs ALL of its
+    // fieldNames, not its "a+b" join key. Using `field` directly here used
+    // to extract nothing for both — silently leaving them empty after any
+    // reindex (e.g. the fallback path `open()` takes for an index whose
+    // persisted blob failed to load).
+    final composite = idx is CompositeIndex ? idx : null;
+    final fieldPaths = composite != null ? composite.fieldNames : [idx.fieldName];
+
+    for (int i = 0; i < docEntries.length; i += effectiveBatchSize) {
+      final end = (i + effectiveBatchSize < docEntries.length) ? i + effectiveBatchSize : docEntries.length;
+      final batch = docEntries.sublist(i, end);
+
+      final rawResults = await _db._batchReadRaw(batch);
+
+      final rawDocs = <MapEntry<int, Uint8List>>[];
+      for (int j = 0; j < batch.length; j++) {
+        final raw = rawResults[j];
+        if (raw != null) {
+          rawDocs.add(MapEntry(batch[j].key, raw));
+        }
+      }
+
+      final extractedDocs = await runParallelExtraction(rawDocs, fieldPaths);
+
+      for (final doc in extractedDocs) {
+        if (composite != null) {
+          final values = fieldPaths.map((f) => doc.fields[f]).toList();
+          if (values.any((v) => v != null)) {
+            extractedMap[doc.docId] = values;
+          }
+        } else {
+          final val = doc.fields[idx.fieldName];
+          if (val != null) {
+            extractedMap[doc.docId] = val;
+          }
+        }
+      }
+
+      await Future.delayed(Duration.zero);
+    }
+
+    idx.addAll(extractedMap);
+  }
+
   /// Indexes a single document into all secondary indexes.
-  void indexDocument(int id, Map<String, dynamic> doc) {
+  void indexDocument(int id, Map doc) {
     for (final idx in _db._secondaryIndexes.values) {
       if (idx is CompositeIndex) {
         final values = idx.fieldNames.map((f) => _extractField(doc, f)).toList();
@@ -136,8 +188,47 @@ class IndexManager {
     }
   }
 
+  /// Batched version of [indexDocument] for bulk operations (insertAll,
+  /// compact rebuild): collects field values per index across the WHOLE
+  /// batch and applies them with one [SecondaryIndex.addAll] call each,
+  /// instead of one [SecondaryIndex.add] call per document.
+  ///
+  /// Matters most for SortedIndex, whose add() does an O(n) array shift to
+  /// keep entries sorted — calling it once per document while indexing a
+  /// 10,000-doc insertAll chunk costs O(n) per call against an index that
+  /// keeps growing, i.e. O(n^2) for the chunk. addAll() sorts the whole
+  /// (existing + new) array ONCE, i.e. O(n log n) — the same trick
+  /// [rebuildSecondaryIndexes] already uses.
+  void indexDocumentsBatch(List<MapEntry<int, Map<String, dynamic>>> docs) {
+    if (_db._secondaryIndexes.isEmpty || docs.isEmpty) return;
+
+    final fieldValues = <SecondaryIndex, Map<int, dynamic>>{
+      for (final idx in _db._secondaryIndexes.values) idx: <int, dynamic>{}
+    };
+
+    for (final entry in docs) {
+      final id = entry.key;
+      final doc = entry.value;
+      for (final idx in _db._secondaryIndexes.values) {
+        if (idx is CompositeIndex) {
+          final values = idx.fieldNames.map((f) => _extractField(doc, f)).toList();
+          if (values.any((v) => v != null)) {
+            fieldValues[idx]![id] = values;
+          }
+        } else {
+          final val = _extractField(doc, idx.fieldName);
+          if (val != null) fieldValues[idx]![id] = val;
+        }
+      }
+    }
+
+    for (final entry in fieldValues.entries) {
+      entry.key.addAll(entry.value);
+    }
+  }
+
   /// Removes a document from all secondary indexes.
-  void removeDocument(int id, Map<String, dynamic> doc) {
+  void removeDocument(int id, Map doc) {
     for (final idx in _db._secondaryIndexes.values) {
       if (idx is CompositeIndex) {
         final values = idx.fieldNames.map((f) => _extractField(doc, f)).toList();
@@ -151,7 +242,7 @@ class IndexManager {
     }
   }
 
-  dynamic _extractField(Map<String, dynamic> doc, String fieldPath) {
+  dynamic _extractField(Map doc, String fieldPath) {
     if (!fieldPath.contains('.')) return doc[fieldPath];
     
     final parts = fieldPath.split('.');
@@ -163,32 +254,81 @@ class IndexManager {
     return current;
   }
 
-  /// Rebuilds all secondary indexes from live documents.
+  /// Rebuilds all secondary indexes from live documents using concurrent
+  /// batch reads and background Isolate field extraction.
+  /// [batchSize] controls how many documents are read in parallel per iteration (default 5000).
+  ///
   /// Deduplicates IDs to prevent index corruption from B-Tree structural issues.
-  Future<void> rebuildSecondaryIndexes({void Function(double)? onProgress}) async {
+  Future<void> rebuildSecondaryIndexes({
+    void Function(double)? onProgress,
+    int batchSize = 5000,
+  }) async {
     if (_db._secondaryIndexes.isEmpty) return;
     for (final idx in _db._secondaryIndexes.values) idx.clear();
-    final rawIds = await _db._primaryIndex.rangeSearch(1, 0x7FFFFFFF);
-    // BUG FIX: Deduplicate IDs — rangeSearch may return same ID multiple times
-    // from B-Tree structural inconsistencies in pre-0.0.24 databases.
-    // This was exposed when 0.0.23 added implicit rebuildSecondaryIndexes() on startup.
-    final allIds = LinkedHashSet<int>.from(rawIds).toList();
-    for (int i = 0; i < allIds.length; i++) {
-      final id = allIds[i];
-      try {
-        final doc = await _db.findById(id);
-        if (doc is Map) {
-          indexDocument(id, Map<String, dynamic>.from(doc));
-        }
-      } catch (_) {
-        // Corrupt document — skip and continue indexing the rest.
-        // It will be removed on the next compact().
-      }
-      if (i > 0 && i % 250 == 0) {
-        if (onProgress != null) onProgress(i / allIds.length);
-        await Future.delayed(Duration.zero);
+
+    final entries = await _db._primaryIndex.rangeSearchEntries(1, 0x7FFFFFFF);
+    final seen = <int>{};
+    final uniqueEntries = <MapEntry<int, int>>[];
+    for (final e in entries) {
+      if (seen.add(e.key)) uniqueEntries.add(e);
+    }
+
+    final fieldPathsSet = <String>{};
+    for (final idx in _db._secondaryIndexes.values) {
+      if (idx is CompositeIndex) {
+        fieldPathsSet.addAll(idx.fieldNames);
+      } else {
+        fieldPathsSet.add(idx.fieldName);
       }
     }
+    final fieldPaths = fieldPathsSet.toList();
+
+    final effectiveBatchSize = batchSize > 0 ? batchSize : 5000;
+
+    final fieldValuesPerIndex = <SecondaryIndex, Map<int, dynamic>>{
+      for (final idx in _db._secondaryIndexes.values) idx: <int, dynamic>{}
+    };
+
+    for (int i = 0; i < uniqueEntries.length; i += effectiveBatchSize) {
+      final end = (i + effectiveBatchSize < uniqueEntries.length) ? i + effectiveBatchSize : uniqueEntries.length;
+      final batch = uniqueEntries.sublist(i, end);
+
+      final rawResults = await _db._batchReadRaw(batch);
+
+      final rawDocs = <MapEntry<int, Uint8List>>[];
+      for (int j = 0; j < batch.length; j++) {
+        final raw = rawResults[j];
+        if (raw != null) {
+          rawDocs.add(MapEntry(batch[j].key, raw));
+        }
+      }
+
+      final extractedDocs = await runParallelExtraction(rawDocs, fieldPaths);
+
+      for (final doc in extractedDocs) {
+        for (final idx in _db._secondaryIndexes.values) {
+          if (idx is CompositeIndex) {
+            final values = idx.fieldNames.map((f) => doc.fields[f]).toList();
+            if (values.any((v) => v != null)) {
+              idx.add(doc.docId, values);
+            }
+          } else {
+            final val = doc.fields[idx.fieldName];
+            if (val != null) {
+              fieldValuesPerIndex[idx]![doc.docId] = val;
+            }
+          }
+        }
+      }
+
+      if (onProgress != null) onProgress((end / uniqueEntries.length).clamp(0.0, 1.0));
+      await Future.delayed(Duration.zero);
+    }
+
+    for (final entry in fieldValuesPerIndex.entries) {
+      entry.key.addAll(entry.value);
+    }
+
     if (onProgress != null) onProgress(1.0);
   }
 }
