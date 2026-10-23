@@ -45,6 +45,7 @@
 - Auto-compaction no longer scans the whole database after each delete.
 - Large transactions that read a lot (`updateWhere`, migrations, `compact`) are no longer quadratic with the WAL.
 - Faster chunk cache on the web (IndexedDB).
+- Reads run concurrently with each other (only writes are exclusive); `findById` ~1.7x faster.
 
 ### Removed
 

@@ -51,8 +51,8 @@ const bool _runningOnWeb = identical(0, 0.0);
 /// - **Setup** — registerAdapter, addIndex, addSortedIndex, reindex
 /// - **CRUD Operations** — insert, put, update, delete, insertAll, updateWhere, deleteWhere
 /// - **Batch & Transactions** — beginBatch, commitBatch, transaction
-/// - **Query Operations** — find, findWhere, getAll, stream, count, exists, rangeSearch
-/// - **Batch Reads** — findById, findByIdBatch (parallel reads)
+/// - **Query Operations** — find, findWhere, getAll, findStream, count, exists, rangeSearch
+/// - **Batch Reads** — findById, findByIds (one batched read)
 /// - **Aggregations** — sumWhere, avgWhere, minWhere, maxWhere, countWhere
 /// - **Watchers** — watch, _notifyWatchers (reactive streams)
 /// - **Internal Helpers** — Serialization, persistence, caching, indexing
@@ -122,7 +122,7 @@ class FastDB {
       _exclusive(() async {
         await _beforeWrite();
         return fn();
-      });
+      }, write: true);
 
   /// Marks the file dirty before its first modification since the last
   /// clean point. The old code did this unconditionally in open(), so even a
@@ -155,31 +155,81 @@ class FastDB {
     _cleanOnDisk = storage.needsExplicitFlush;
   }
 
-  Future<T> _exclusive<T>(Future<T> Function() fn) {
-    if (_isClosed) {
-      throw StateError(
+  // ── Lock: shared reads, exclusive writes ──────────────────────────────────
+  // Reads run concurrently with each other but never with a write (or
+  // close). A read that arrives while a write is running or queued waits
+  // behind it — writers are never starved. Serializing reads with each other
+  // halved indexed-query throughput.
+
+  /// Exclusive operations queued on (or running under) the lock, incl. close().
+  int _lockDepth = 0;
+
+  /// Shared reads in flight that started without queueing.
+  int _activeReads = 0;
+  Completer<void>? _readsDrained;
+
+  /// Runs [op] exclusively, after every previously queued operation and
+  /// after the shared reads in flight.
+  Future<T> _enqueue<T>(Future<T> Function() op) {
+    final Future<T> next;
+    if (_lockDepth > 0) {
+      next = _writeLock.then((_) => op());
+    } else if (_activeReads > 0) {
+      next = (_readsDrained ??= Completer<void>()).future.then((_) => op());
+    } else {
+      next = op(); // idle: start now, no extra hop
+    }
+    _lockDepth++;
+    _writeLock = next.then((_) {}, onError: (_) {}).whenComplete(() => _lockDepth--);
+    return next;
+  }
+
+  Future<T> _sharedRead<T>(Future<T> Function() fn) {
+    _activeReads++;
+    Future<T> f;
+    try {
+      f = fn();
+    } catch (e, st) {
+      f = Future<T>.error(e, st);
+    }
+    // The caller awaits [f] itself; the bookkeeping is a side listener.
+    // Returning `f.whenComplete(...)` instead put an extra future hop on
+    // every read's path (~35% of indexed-query throughput).
+    f.then(_readDone, onError: (Object _) => _readDone(null));
+    return f;
+  }
+
+  void _readDone(Object? _) {
+    if (--_activeReads == 0) {
+      final drained = _readsDrained;
+      _readsDrained = null;
+      drained?.complete();
+    }
+  }
+
+  StateError _closedError() => StateError(
         'Cannot perform operations on a closed database'
         '${name != null ? " \"$name\"" : ""}.',
       );
-    }
+
+  /// Runs [fn] under the lock: shared for reads, exclusive for [write]s.
+  /// Writes first re-sync the document write offset (single-file mode:
+  /// B-Tree page allocations and document writes share the end of the file).
+  Future<T> _exclusive<T>(Future<T> Function() fn, {bool write = false}) {
+    if (_isClosed) throw _closedError();
     if (_inOwnTransaction) return fn();
-    final next = _writeLock.then((_) async {
-      if (_isClosed) {
-        throw StateError(
-          'Cannot perform operations on a closed database'
-          '${name != null ? " \"$name\"" : ""}.',
-        );
-      }
-      // Synchronize data offset before every exclusive operation to ensure
-      // B-Tree page allocations and document writes don't overlap.
-      if (dataStorage == null) {
+    if (!write && _lockDepth == 0) return _sharedRead(fn);
+    return _enqueue(() async {
+      if (_isClosed) throw _closedError();
+      if (write && dataStorage == null) {
         _dataOffset = storage.sizeSync ?? await storage.size;
       }
-      return await fn();
+      return fn();
     });
-    _writeLock = next.then((_) {}, onError: (_) {});
-    return next;
   }
+
+  /// Read-only [_exclusive] (also handed to [QueryBuilder] as its runner).
+  Future<T> _exclusiveRead<T>(Future<T> Function() fn) => _exclusive(fn);
 
   final List<MapEntry<int, int>> _batchEntries = [];
   int _dataOffset = 0;
@@ -556,7 +606,7 @@ class FastDB {
 
     // Use the exclusive lock to ensure all pending writes are finished before closing.
     // We cannot use _exclusive() helper because it checks _isClosed.
-    final next = _writeLock.then((_) async {
+    return _enqueue(() async {
       if (_isClosed) return;
       _isClosed = true;
 
@@ -593,8 +643,6 @@ class FastDB {
       final err = closeError;
       if (err != null) throw err;
     });
-    _writeLock = next.then((_) {}, onError: (_) {});
-    return next;
   }
 
   /// Makes everything durable AND persists the secondary indexes, so that if
@@ -612,7 +660,7 @@ class FastDB {
       return;
     }
     await _persistCleanState();
-  });
+  }, write: true);
 
   // ─── CRUD Operations ──────────────────────────────────────────────────────
   // Single-document create, read, update, delete operations.
@@ -830,7 +878,7 @@ class FastDB {
     watch,
     _queryCache,
     _batchFindByIds,
-    _exclusive, // terminal operations run under the lock
+    _exclusiveRead, // terminal operations run under the lock
   );
 
   Future<List<dynamic>> findWhere(

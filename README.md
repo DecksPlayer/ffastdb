@@ -1,6 +1,6 @@
 # FFastDB 🚀 `v0.3.5`
 
-A high-performance, pure-Dart NoSQL database for Flutter & server-side Dart.
+A fast, crash-safe, pure-Dart NoSQL database for Flutter & server-side Dart.
 
 [![pub.dev](https://img.shields.io/pub/v/ffastdb)](https://pub.dev/packages/ffastdb)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
@@ -25,526 +25,402 @@ A high-performance, pure-Dart NoSQL database for Flutter & server-side Dart.
 | Web support | ✅ | ✅ | ❌ |
 | WASM support | ✅ | ❌ | ❌ |
 
+Also built in: full-text search, composite indexes, authenticated encryption,
+JSON export/import, schema migrations and a compact binary document format.
+
 ---
 
 ## Getting Started
 
 ```yaml
 dependencies:
-  ffastdb: ^0.3.1
+  ffastdb: ^0.3.5
 ```
 
-> **Native isolate note:** Transparent write proxying between isolates was removed.
-> On Android, iOS, macOS, Linux, and Windows, treat a database file as having a
-> single active owner at a time.
-
-### Open a database
-
-#### Flutter — mobile, desktop, web, and WASM (recommended)
+### Open a database (Flutter — mobile, desktop, web, WASM)
 
 ```dart
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:ffastdb/ffastdb.dart';
-import 'package:path_provider/path_provider.dart'; // add to your app's pubspec
+import 'package:path_provider/path_provider.dart'; // add to YOUR app's pubspec
 
-void main() async {
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // On web/WASM the directory is ignored — openDatabase() uses localStorage.
-  // On native, path_provider gives a suitable persistent directory.
-  String dir = '';
-  if (!kIsWeb) {
-    final appDir = await getApplicationDocumentsDirectory();
-    dir = appDir.path;
-  }
+  // Native: a persistent directory. Web: ignored (data lives in IndexedDB).
+  final dir = kIsWeb ? '' : (await getApplicationDocumentsDirectory()).path;
 
-final db = await openDatabase(
-  'myapp', 
-  directory: dir, 
-  version: 1,
-  indexes: ['status'],                        // O(1) exact match
-  sortedIndexes: ['createdAt', 'age'],        // O(log n) ranges, startsWith, sorting
-  ftsIndexes: ['description'],                // Full-Text Search
-  compositeIndexes: [['status', 'createdAt']], // Multi-field AND queries
-  encryptionKey: 'your_secret_key', // Optional: encrypts the entire DB
-  useIndexedDb: true,               // Optional: use IndexedDB instead of localStorage (Web)
-);
-runApp(MyApp(db: db));
+  final db = await openDatabase(
+    'myapp',
+    directory: dir,
+    indexes: ['status'],                         // HashIndex: O(1) equals
+    sortedIndexes: ['createdAt', 'age'],         // SortedIndex: ranges, sorting
+    ftsIndexes: ['description'],                 // full-text search
+    compositeIndexes: [['status', 'createdAt']], // multi-field AND
+    encryptionKey: 'your_secret_key',            // optional
+  );
+  runApp(MyApp(db: db));
 }
 ```
 
-> **Web / WASM Security & Storage:**
-> - `useIndexedDb`: Defaults to `true`. Uses browser `IndexedDB` which is more robust and has higher limits than `localStorage`.
-> - `encryptionKey`: If provided, the database is encrypted AND authenticated (AES-256-CTR with a fresh nonce per 1 KB sector + HMAC-SHA256; the password is stretched with PBKDF2-HMAC-SHA256, 100k iterations by default). A wrong key is rejected by `open()`; tampered data fails on read. For strong protection prefer a random 32-byte key from the platform's secure storage via `EncryptedStorageStrategy.withRawKey`. Files encrypted by ffastdb ≤ 0.3.5 keep working in their legacy format (`isLegacyFormat`); migrate them with `exportJson()` → `importJson()` into a new database.
+- `openDatabase()` returns the open database when called again for the same
+  database (e.g. from several places at startup) and replaces it when you ask
+  for a different one.
+- `path_provider` is **not** a dependency of `ffastdb`.
+- One process (isolate) owns a database file at a time; a second opener gets a
+  clear "locked" error.
 
-> **Durability:** `openDatabase()` uses `Durability.normal` by default — writes survive app crashes and the OS killing the app; a power loss or OS crash may lose the most recent writes, but never corrupts the database. Pass `durability: Durability.full` to fsync every write (~4-7x slower single writes).
+### Persist indexes when the app goes to the background
 
-> **App lifecycle:** call `await db.flush()` when the app goes to the background (e.g. `AppLifecycleState.paused`). It persists the secondary indexes, so if the OS then kills the process the next start loads them instead of rebuilding every index from the documents.
+```dart
+class _AppState extends State<MyApp> with WidgetsBindingObserver {
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused) widget.db.flush();
+  }
+  // ... addObserver / removeObserver in initState / dispose
+}
+```
 
-> **Note:** `path_provider` is **not** a dependency of `ffastdb` itself — add
-> it only to your app's own `pubspec.yaml` for native targets.
+`flush()` makes every write durable and saves the secondary indexes. If the OS
+then kills the app, the next start loads the indexes instead of rebuilding them
+from every document.
 
-#### Server-side Dart / manual setup
+### Server-side Dart / manual setup
 
 ```dart
 import 'package:ffastdb/ffastdb.dart';
 
-// Production: file on disk + WAL crash protection + file lock
+// File on disk + WAL + file lock
 final db = await FfastDb.init(
   WalStorageStrategy(
-    main: IoStorageStrategy('/data/myapp/users.db'),
-    wal:  IoStorageStrategy('/data/myapp/users.db.wal'),
+    main: IoStorageStrategy('/data/myapp/users.fdb'),
+    wal:  IoStorageStrategy('/data/myapp/users.fdb.wal'),
+    durability: Durability.full,
   ),
-  cacheCapacity: 512,
+  indexes: ['status'],
 );
+final same = FfastDb.instance;       // the singleton, anywhere in your app
+await FfastDb.disposeInstance();     // at shutdown
 
-// Access the singleton later from anywhere in your app:
-final db = FfastDb.instance;
-
-// Development / testing: in-memory (no persistence)
-final db = FastDB(MemoryStorageStrategy());
-await db.open();
-
-// Release resources at app shutdown:
-await FfastDb.disposeInstance();
+// Tests / in-memory (no persistence)
+final mem = FastDB(MemoryStorageStrategy());
+await mem.open();
 ```
 
-### Performance Tuning
+---
 
-FastDB is optimized for speed by default, but you can fine-tune for your workload:
+## Durability
 
-#### Cache Configuration
-
-The **LRU page cache** is your first line of defense against disk I/O. Default is `2048` pages (8 MB):
+| Mode | Each write | Survives app crash / OS killing the app | Survives power loss / OS crash |
+|---|---|---|---|
+| `Durability.normal` (default for `openDatabase`) | no fsync | ✅ | may lose the **latest** writes — never corrupts |
+| `Durability.full` | fsynced before `await` returns | ✅ | ✅ |
 
 ```dart
-// For datasets with large working sets (e.g., millions of documents):
-final db = await FfastDb.init(storage, cacheCapacity: 8192);  // 32 MB cache
-
-// For memory-constrained environments (e.g., web, embedded):
-final db = await FfastDb.init(storage, cacheCapacity: 512);   // 2 MB cache
+final db = await openDatabase('bank', directory: dir, durability: Durability.full);
 ```
 
-**Rule of thumb**: Set `cacheCapacity` to ~`workingSetSize / 4KB`. For example:
-- 1 GB working set → `cacheCapacity: 262144`
-- 100 MB working set → `cacheCapacity: 26144`
-- 10 MB working set → `cacheCapacity: 2560` (default 2048 is close)
+`normal` works like SQLite's `synchronous=NORMAL`: the main file is only
+written after the WAL is fsynced, so a power loss can roll back to an earlier
+state but never leaves a half-applied one. `db.flush()` and `db.close()` make
+everything durable in both modes. Single writes are ~4-7x faster in `normal`.
+On the web every write is committed to IndexedDB; the option is ignored.
 
-#### Batch Reads for Large Result Sets
+---
 
-When a query returns many IDs, use `findByIdBatch()` instead of looping `findById()`:
+## Encryption
 
 ```dart
-// ❌ SLOW — sequential reads
-final ids = await db.query().where('status').equals('active').findIds();
-for (final id in ids) {
-  final doc = await db.findById(id);  // Await blocks per document
-}
+// Password (stretched with PBKDF2-HMAC-SHA256, 100k iterations by default):
+final db = await openDatabase('secure', directory: dir, encryptionKey: 'passphrase');
 
-// ✅ FAST — parallel reads (10–100× faster)
-final ids = await db.query().where('status').equals('active').findIds();
-final docs = await db.findByIdBatch(ids);  // Reads up to 50 in parallel
+// Strongest: a random 32-byte key kept in the platform's secure storage
+final secure = FastDB(EncryptedStorageStrategy.withRawKey(storage, key32Bytes));
 ```
 
-Concurrency is bounded at 50 by default to prevent resource exhaustion. Adjust for your workload:
+- AES-256 with a fresh nonce every time a 1 KB sector is rewritten, plus an
+  HMAC-SHA256 tag per sector: tampered or corrupted data fails on read.
+- A wrong key is rejected by `open()`.
+- Opening costs ~0.2 s with a password (PBKDF2); a raw key opens instantly.
+  Tune with `EncryptedStorageStrategy(base, password, pbkdf2Iterations: ...)`.
+- Files encrypted by ffastdb ≤ 0.3.5 keep working in their legacy format
+  (`isLegacyFormat`). To upgrade one, `exportJson()` it and `importJson()` into
+  a new database.
+
+---
+
+## Documents
+
+### Insert, update, delete
 
 ```dart
-// More parallel reads for I/O-bound workloads:
-final docs = await db.findByIdBatch(ids, concurrency: 100);
-
-// Fewer parallel reads for CPU-bound workloads or memory-constrained systems:
-final docs = await db.findByIdBatch(ids, concurrency: 10);
-```
-
-#### Streaming for Memory Efficiency
-
-For very large result sets or exports, use `stream()` to avoid loading all documents into memory:
-
-```dart
-// Export 1 million documents without running out of RAM:
-await for (final doc in db.stream()) {
-  // Process one document at a time
-  await file.writeAsString(jsonEncode(doc) + '\n');
-}
-```
-
-#### Secondary Indexes for Query Performance
-
-Add indexes to fields you query frequently to avoid O(n) scans:
-
-```dart
-db.addIndex('status');           // O(1) exact match
-db.addSortedIndex('createdAt');  // O(log n) range queries
-```
-
-Without indexes, queries iterate the B-tree in O(log n + k) time where k is the result set size.
-With indexes, exact-match queries are O(1) and range queries are O(log n).
-
-### Add secondary indexes
-
-The recommended way to define indexes is **declaratively** when calling `openDatabase()` or `FfastDb.init()`. This ensures that FastDB knows about all indexes before reading the disk, allowing it to automatically load their persisted state or rebuild them if missing:
-
-```dart
-final db = await openDatabase(
-  'myapp',
-  indexes: ['city'],                           // HashIndex (O(1) exact-match)
-  sortedIndexes: ['age'],                      // SortedIndex (O(log n) range & startsWith)
-  ftsIndexes: ['description'],                 // FtsIndex (Full-Text Search)
-  compositeIndexes: [['city', 'status']],      // CompositeIndex (Multi-field AND)
-);
-```
-
-#### Manual registration (Advanced)
-
-If you are managing the database lifecycle manually without the factory methods, you must register the indexes **before** calling `await db.open()`, or call `db.reindex()` afterwards:
-
-```dart
-final db = FastDB(storage);
-db.addIndex('city');
-db.addSortedIndex('age');
-db.addFtsIndex('description');
-db.addCompositeIndex(['city', 'status']);
-await db.open(); // Reads the disk and populates the registered indexes
-```
-
-### Insert documents
-
-```dart
-// Insert a JSON map — returns the auto-generated int ID
 final id = await db.insert({
   'name': 'Alice',
   'age': 30,
   'city': 'London',
-  'createdAt': DateTime.now(),   // DateTime is natively supported
+  'createdAt': DateTime.now(),
 });
 
-// Manual key (Hive-style put)
-await db.put(42, {'name': 'Bob', 'age': 25});
+await db.put(42, {'name': 'Bob'});                // manual id
+await db.upsert(42, {'age': 26});                 // update or insert by id
+await db.upsertWhere('email', 'a@b.c', {'name': 'Ann'}); // by unique field
 
-// Batch insert — write coalescing makes this ~9x faster than individual inserts
-final ids = await db.insertAll([
-  {'name': 'Bob',   'city': 'Paris',  'age': 25},
-  {'name': 'Clara', 'city': 'Tokyo',  'age': 28},
+final ids = await db.insertAll([                  // bulk: much faster
+  {'name': 'Clara', 'city': 'Tokyo', 'age': 28},
   {'name': 'Dana',  'city': 'London', 'age': 35},
 ]);
+
+await db.update(id, {'age': 31});                 // merges fields
+await db.delete(id);
+
+// Atomic bulk operations (all or nothing)
+await db.updateWhere((q) => q.where('city').equals('London').findIds(), {'country': 'UK'});
+await db.deleteWhere((q) => q.where('active').equals(false).findIds());
 ```
 
-### Supported Data Types
+### Read
 
-FastDB supports all common Dart and Firebase data types with automatic serialization:
+```dart
+final doc  = await db.findById(id);     // O(log n)
+final docs = await db.findByIds(ids);   // one batched read, keeps order
+final all  = await db.getAll();
+final n    = await db.count();          // O(1)
+final has  = await db.exists(id);
 
-- **Primitives**: `int`, `double`, `String`, `bool`, `null`
-- **Date/Time**: `DateTime` (stored as UTC microseconds since epoch, read back with `isUtc: true`)
-- **Collections**: `List`, `Map` (with any nesting level)
-- **Binary**: `Uint8List` (stored natively as raw bytes in the main database file)
-- **Firebase types** (via duck-typing, no imports needed):
-  - `Timestamp` → `DateTime`
-  - `GeoPoint` → `Map<String, double>` with `latitude`/`longitude`
-  - `DocumentReference` → `String` (path)
-  - `Blob` → `Uint8List`
+// Lazy: one document at a time
+await for (final d in db.findStream((q) => q.where('city').equals('London').findIds())) {
+  print(d);
+}
+```
 
-Documents are stored in a compact binary format (not JSON). Databases written
-by older versions in the JSON format are read transparently — no migration
-step; documents switch to the binary format as they are rewritten.
+### Supported data types
+
+`int` (64-bit), `double` (incl. NaN/±Infinity), `String`, `bool`, `null`,
+`DateTime` (UTC microseconds, read back with `isUtc: true`), `Uint8List`,
+nested `List` / `Map`, and Firebase types by duck-typing (`Timestamp` →
+`DateTime`, `GeoPoint` → `{latitude, longitude}`, `DocumentReference` → path,
+`Blob` → `Uint8List`). Other objects are stored via `toJson()` (as a document)
+or `toString()` (nested). See [SUPPORTED_DATA_TYPES.md](SUPPORTED_DATA_TYPES.md).
+
+Documents are stored in a compact binary format. Databases written by older
+versions (JSON format) are read without any migration step.
 
 ### Export / import JSON
 
-To sync with or migrate to/from other document databases, convert at the
-boundary:
-
 ```dart
-final json = await db.exportJson();      // JSON array, ascending id order
+final json = await db.exportJson();        // JSON array, ascending id order
 final ids  = await other.importJson(json); // inserted as new documents
 ```
 
-`exportJson()` maps values onto plain JSON (`DateTime` → ISO-8601 UTC string,
-`Uint8List` → base64, NaN/±Infinity → `null`) and keeps each document's
-`ffdbID`. `importJson()` accepts an array or a single object, drops `ffdbID`
-(this database assigns ids) and keeps the values as plain JSON types.
+Export maps values onto plain JSON (`DateTime` → ISO-8601 UTC, `Uint8List` →
+base64, NaN/±Infinity → `null`) and keeps each document's `ffdbID`; import drops
+`ffdbID` (the database assigns ids) and keeps plain JSON types.
+
+---
+
+## Queries
+
+All query methods return Futures.
 
 ```dart
-final doc = {
-  'name': 'John Doe',           // String
-  'age': 35,                    // int
-  'salary': 75000.50,           // double
-  'isActive': true,             // bool
-  'createdAt': DateTime.now(),  // DateTime
-  'location': {                 // GeoPoint / Location
-    'latitude': 37.7749,
-    'longitude': -122.4194,
-  },
-  'roles': ['admin', 'user'],   // List
-  'metadata': {                 // Nested Map
-    'department': 'Engineering',
-    'level': 5,
-  },
-};
-await db.insert(doc);
-```
+// Exact match — O(1) with a HashIndex
+final ids = await db.query().where('city').equals('London').findIds();
 
-See [SUPPORTED_DATA_TYPES.md](SUPPORTED_DATA_TYPES.md) for detailed documentation and examples.
+// Ranges — O(log n) with a SortedIndex
+await db.query().where('age').between(18, 65).findIds();
+await db.query().where('age').greaterThan(60).findIds();
+await db.query().where('age').lessThanOrEqualTo(25).findIds();
 
-### Query documents
+// AND (most selective index first), OR, NOT, isIn, null checks
+await db.query().where('city').equals('London').where('age').between(25, 40).findIds();
+await db.query().where('city').equals('London').or().where('city').equals('Paris').findIds();
+await db.query().where('city').not().equals('London').findIds();
+await db.query().where('city').isIn(['London', 'Tokyo']).findIds();
+await db.query().where('email').isNull().findIds();
 
-```dart
-// ── Exact match — O(1) with HashIndex ─────────────────────────────────────
-final ids = db.query().where('city').equals('London').findIds();
+// Strings (case-sensitive) and full-text search (case-insensitive tokens)
+await db.query().where('name').startsWith('Al').findIds();
+await db.query().where('name').contains('ice').findIds();
+await db.query().where('description').fts('payment failed').find();
 
-// ── Negation ───────────────────────────────────────────────────────────────
-final notLondon = db.query().where('city').not().equals('London').findIds();
+// Sorting + pagination (sortBy needs a SortedIndex)
+await db.query().where('city').equals('London').sortBy('age', descending: true).skip(20).limit(10).findIds();
 
-// ── Range query — O(log n) with SortedIndex ────────────────────────────────
-final adultsIds = db.query().where('age').between(18, 65).findIds();
-final seniorIds = db.query().where('age').greaterThan(60).findIds();
-final youngIds  = db.query().where('age').lessThanOrEqualTo(25).findIds();
+// Documents instead of ids
+final docs  = await db.query().where('city').equals('London').find();
+final first = await db.query().where('name').startsWith('Al').findFirst();
+final count = await db.query().where('city').equals('London').count(); // O(1) for one equals
 
-// ── Multi-field AND query (most selective index evaluated first) ───────────
-final ids = db.query()
-    .where('city').equals('London')
-    .where('age').between(25, 40)
-    .findIds();
+// Aggregations
+await db.sumWhere((q) => q.where('active').equals(true).findIds(), 'age');
+await db.avgWhere((q) => q.where('active').equals(true).findIds(), 'age');
+await db.maxWhere((q) => q.where('city').equals('London').findIds(), 'age');
 
-// ── OR query ───────────────────────────────────────────────────────────────
-final ids = db.query()
-    .where('city').equals('London')
-    .or()
-    .where('city').equals('Paris')
-    .findIds();
-
-// ── isIn ───────────────────────────────────────────────────────────────────
-final ids = db.query().where('city').isIn(['London', 'Tokyo']).findIds();
-
-// ── String search (Case-Insensitive in 0.0.27+) ───────────────────────────
-// startsWith uses O(log n) range scan on SortedIndex. 
-// Now case-insensitive: matches "Alice", "alice", "ALICE"
-final ids = db.query().where('name').startsWith('Al').findIds();
-final ids = db.query().where('name').contains('ice').findIds();
-
-// ── Bitmask / boolean fields ───────────────────────────────────────────────
-final activeIds = db.query().where('active').equals(true).findIds();
-
-// ── Sorting + pagination ───────────────────────────────────────────────────
-final pageIds = db.query()
-    .where('city').equals('London')
-    .sortBy('age')                // requires a SortedIndex on 'age'
-    .limit(10)
-    .skip(20)
-    .findIds();
-
-// ── Fetch full documents — direct API (new in 0.0.14) ───────────────────────
-// db.query().find() resolves documents without a manual findById loop
-final londonDocs = await db.query()
-    .where('city').equals('London')
-    .find();                           // Future<List<dynamic>>
-
-// First match only — most efficient when you need a single document
-final alice = await db.query()
-    .where('name').startsWith('Al')
-    .findFirst();                      // Future<dynamic> — null if no match
-
-// Count only — O(1) for simple equals on indexed fields
-final londonCount = db.query()
-    .where('city').equals('London')
-    .count();                          // int, synchronous
-
-// ── Fetch full documents — classic API ────────────────────────────────────
-final alice  = await db.findById(id);           // O(log n) by primary key
-final people = await db.find((q) => q.where('city').equals('London').findIds());
-final all    = await db.getAll();
-
-// ── Batch read with parallel I/O (new in 0.0.22) ───────────────────────────
-// Parallelizes document reads up to concurrency limit (default 50).
-// 10–100× faster than sequential findById for queries returning many results.
-final ids = await db.query().where('status').equals('active').findIds();
-final docs = await db.findByIdBatch(ids);  // ✅ Parallel I/O, no memory spikes
-
-// With custom concurrency for very large result sets:
-final docs = await db.findByIdBatch(ids, concurrency: 100);
-
-// ── Lazy stream (one document at a time) ──────────────────────────────────
-// Yields documents without loading all results into memory at once.
-// Ideal for large exports, pagination, or processing as-you-go.
-await for (final doc in db.stream()) {
-  print(doc);
-}
-
-// ── Range scan by primary key ─────────────────────────────────────────────
-final ids = await db.rangeSearch(100, 200);
-
-// ── Aggregations ──────────────────────────────────────────────────────────
-final count  = await db.countWhere((q) => q.where('city').equals('London').findIds());
-final total  = await db.sumWhere((q) => q.where('active').equals(true).findIds(), 'age');
-final avg    = await db.avgWhere((q) => q.where('active').equals(true).findIds(), 'age');
-final oldest = await db.maxWhere((q) => q.where('city').equals('London').findIds(), 'age');
-
-// ── Query plan inspection (debugging slow queries) ─────────────────────────
+// Why is a query slow? Print the plan.
 print(db.query().where('city').equals('London').where('age').between(18, 65).explain());
-// QueryPlan {
-//   Group 0 (AND):
-//     equals             city           → HashIndex (~3 docs)
-//     between            age            → SortedIndex (~12 docs)
-// }
 ```
 
-### Update documents
+Conditions on fields without an index still work (in-memory filter); inside an
+AND they only scan the candidates left by the indexed conditions.
+
+---
+
+## Indexes
+
+Declare them in `openDatabase()` / `FfastDb.init()`, or register them **before**
+`open()`:
 
 ```dart
-// Partial update — merges specified fields, leaves the rest unchanged
-await db.update(id, {'age': 31, 'city': 'Berlin'});
-
-// Bulk update matching a query (single atomic transaction)
-final updated = await db.updateWhere(
-  (q) => q.where('city').equals('London').findIds(),
-  {'country': 'UK'},
-);
+final db = FastDB(storage);
+db.addIndex('city');                       // HashIndex — equals
+db.addSortedIndex('age');                  // SortedIndex — ranges, sortBy, startsWith
+db.addBitmaskIndex('active');              // booleans / small enums
+db.addCompositeIndex(['city', 'status']);  // multi-field AND
+db.addFtsIndex('description');             // full-text search
+await db.open();
 ```
 
-### Delete documents
+An index added after `open()` needs `await db.reindex(field: 'city')`
+(`await db.reindex()` rebuilds all). Indexes are persisted, so there is no
+reason to reindex on every start.
 
-```dart
-await db.delete(id);
+---
 
-// Bulk delete matching a query (single atomic transaction)
-final removed = await db.deleteWhere(
-  (q) => q.where('active').equals(false).findIds(),
-);
-
-// Reclaim disk space after many deletes
-await db.compact();
-
-// Auto-compact: compact automatically when > 30% of slots are deleted
-final db = FastDB(storage, autoCompactThreshold: 0.3);
-```
-
-### Transactions
-
-> Transactions require a `WalStorageStrategy` for full atomicity and rollback.
-> Without WAL, rollback is best-effort (in-memory state is restored but disk
-> writes may not be undone).
+## Transactions
 
 ```dart
 await db.transaction(() async {
   final id = await db.insert({'name': 'Alice', 'balance': 100});
   await db.update(id, {'balance': 80});
-  // If this throws, ALL operations above are rolled back automatically.
-  if (someCondition) throw Exception('Abort!');
+  if (somethingWrong) throw Exception('abort'); // everything above is undone
 });
-
-// Transactions do NOT support nesting — flatten concurrent work into one call.
 ```
 
-### TypeAdapters (typed objects)
+- Atomic: all or nothing (fully crash-safe with a `WalStorageStrategy`, the
+  default on native).
+- Isolated: other callers' reads and writes wait until it finishes; calls made
+  inside it — including nested `transaction()` calls — join it.
+
+---
+
+## Reactive watchers
+
+```dart
+db.watch('status').listen((ids) => print('status index: $ids'));
+db.watchDocs('status').listen((docs) => print(docs));
+db.query().where('status').equals('pending').watch().listen((docs) => print(docs));
+```
+
+A burst of writes produces one emission with the final state.
+
+---
+
+## TypeAdapters (typed objects)
 
 ```dart
 class User {
-  final int    id;
   final String name;
-  final int    age;
-  User(this.id, this.name, this.age);
+  final int age;
+  User(this.name, this.age);
 }
 
 class UserAdapter extends TypeAdapter<User> {
-  @override int get typeId => 1; // must be unique across all adapters
+  @override
+  int get typeId => 1; // unique, never change it once data exists (256 and 512 are reserved)
 
   @override
   User read(BinaryReader reader) {
-    return User(
-      reader.readUint32(),   // id
-      reader.readString(),   // name
-      reader.readUint32(),   // age
-    );
+    final n = reader.readUint8();
+    final f = {for (int i = 0; i < n; i++) reader.readUint8(): reader.readDynamic()};
+    return User(f[0] as String, f[1] as int? ?? 0); // tolerate missing slots
   }
 
   @override
   void write(BinaryWriter writer, User user) {
-    writer.writeUint32(user.id);
-    writer.writeString(user.name);
-    writer.writeUint32(user.age);
+    writer.writeUint8(2);                                // number of slots
+    writer.writeUint8(0); writer.writeDynamic(user.name);
+    writer.writeUint8(1); writer.writeDynamic(user.age);
   }
 }
 
-// Register BEFORE open() — duplicate typeId throws ArgumentError
-db.registerAdapter(UserAdapter());
-db.addIndex('name');
-await db.open();
-
-final id = await db.insert(User(0, 'Alice', 30));
+db.registerAdapter(UserAdapter()); // before inserting/reading Users
+final id = await db.insert(User('Alice', 30));
 final user = await db.findById(id) as User;
 ```
 
-### DateTime fields
+Numbered slots keep old data readable when you add fields: add new slot
+numbers, never reuse old ones.
 
-`DateTime` is natively supported in both map documents and binary TypeAdapters:
+---
 
-```dart
-// In map documents — stored as UTC microseconds, read back with isUtc: true
-await db.insert({'name': 'Alice', 'createdAt': DateTime.now()});
-
-// In TypeAdapters using writeDynamic / readDynamic
-writer.writeDynamic(DateTime.now());  // stores as int64 ms-since-epoch
-final dt = reader.readDynamic() as DateTime;
-```
-
-### Reactive watchers
+## Schema migrations
 
 ```dart
-// Returns a broadcast Stream — new events emitted after every write
-// The stream is automatically cleaned up when all listeners unsubscribe.
-final stream = db.watch('city');
-final sub = stream.listen((ids) => print('city index now holds IDs: $ids'));
-
-// Cancel when done — the StreamController is disposed automatically
-await sub.cancel();
-```
-
-### Schema migrations
-
-```dart
-final db = await FfastDb.init(
-  storage,
+final db = await openDatabase(
+  'myapp',
+  directory: dir,
   version: 2,
   migrations: {
-    // called for every document when upgrading from version 1 → 2
-    1: (doc) {
-      if (doc is Map<String, dynamic>) {
-        return {...doc, 'country': 'unknown'}; // add new field with default
-      }
-      return doc;
-    },
+    1: (doc) => {...doc as Map<String, dynamic>, 'country': 'unknown'}, // v1 → v2
   },
 );
 ```
 
-### Rebuild indexes manually
+Migrations run once, atomically, when the stored version is lower.
+
+---
+
+## Compaction
+
+Updates and deletes leave dead space behind; `compact()` reclaims it (atomic
+with the WAL):
 
 ```dart
-// Rebuild a specific index (e.g. after adding a new one to existing data)
-await db.reindex('city');
-
-// Rebuild all indexes at once
-await db.reindex();
+await db.compact();
+final db = FastDB(storage, autoCompactThreshold: 0.3); // auto when >30% dead (off by default)
 ```
 
 ---
 
----
+## Performance
 
-## Diagnostics & Statistics
+Measured on a Windows desktop (Dart VM). Run them yourself with
+`dart run benchmark/<name>.dart`.
 
-You can inspect the state of your indexes and database health using the `indexes` API (new in **0.0.27**):
+**In-memory storage, 1M documents** (`benchmark/million_benchmark.dart`):
 
-```dart
-// Print all index stats
-for (final entry in db.indexes.all.entries) {
-  final name = entry.key;
-  final index = entry.value;
-  print('Index $name: size=${index.size}');
-  
-  if (index is FtsIndex) {
-    print('Tokens indexed: ${index.stats()}');
-  }
-}
+| Operation | Throughput |
+|---|---|
+| Batch insert (`insertAll`) | ~200k docs/s |
+| Sequential `insert` | ~180k ops/s |
+| `findById` | ~520k ops/s |
+| HashIndex query | ~1.1M ops/s |
+| SortedIndex range query | ~660k ops/s |
+
+**On disk with the WAL** (20k documents, `openDatabase` defaults):
+
+| Operation | Throughput |
+|---|---|
+| `insertAll` | ~59k docs/s |
+| `insert` — `Durability.normal` / `Durability.full` | ~4.5k / ~650 ops/s |
+| `update` — `normal` / `full` | ~2.2k / ~600 ops/s |
+| `findById` | ~15k ops/s |
+| `getAll` | ~170k docs/s |
+
+**Flutter comparison** (`flutter_benchmark/`, real disk, 10k docs — measured
+with ffastdb 0.3.5, before the optimizations in the current version):
+
+| Operation | `ffastdb` | `isar_community` | `sembast` |
+|---|---|---|---|
+| `insertAll` (bulk) | 39.7k ops/s | 153.8k ops/s | 15.3k ops/s |
+| single insert (fsync per write) | 382 ops/s | 498 ops/s | 97 ops/s |
+| indexed query (2k queries) | 151 ops/s | 583 ops/s | 245 ops/s |
+| `findById` (5k lookups) | 13.9k ops/s | 9.2k ops/s | 333.3k ops/s |
+
+```bash
+cd flutter_benchmark && dart run bin/run_benchmark.dart 10000
 ```
 
 ---
@@ -553,86 +429,31 @@ for (final entry in db.indexes.all.entries) {
 
 ```
 FastDB
-├── B-Tree primary index (O(log n) lookups, bulk-load O(N))
-├── Secondary indexes
-│   ├── HashIndex    — O(1) exact-match
-│   ├── SortedIndex  — O(log n) range / sortBy
-│   └── BitmaskIndex — bitwise AND for boolean / enum fields
-├── LRU Page Cache (configurable RAM budget)
-│   └── Default: 2048 pages = 8 MB RAM
-├── WAL (Write-Ahead Log)
-│   ├── CRC32 checksums per entry AND per document
-│   ├── Per-transaction COMMIT markers (uncommitted entries discarded on recovery)
-│   ├── Checkpoint after every commit (WAL never holds more than 1 transaction)
-│   └── Auto crash recovery on open()
-├── BufferedStorageStrategy
-│   └── Write coalescing (~9x faster bulk inserts)
-└── StorageStrategy (platform-specific)
-    ├── IoStorageStrategy      (Mobile / Desktop / Server — file lock + WAL)
-    ├── MemoryStorageStrategy  (Tests / in-memory, zero persistence)
-    ├── WebStorageStrategy     (In-memory base, no dart:io, safe for web)
-    ├── LocalStorageStrategy   (Web JS / WASM — persists in browser localStorage)
-    ├── IndexedDbStorageStrategy (Web JS / WASM — persists in browser IndexedDB)
-    └── EncryptedStorageStrategy (Wrapper — AES-256-CTR + HMAC-SHA256 per 1 KB sector)
+├── B-Tree primary index (O(log n), bulk-load O(n))
+├── Secondary indexes: Hash · Sorted · Bitmask · Composite · Full-text
+├── Binary document codec (CRC32 per document)
+├── LRU page cache
+├── WAL (WalStorageStrategy)
+│   ├── per-transaction COMMIT markers, CRC32 per entry
+│   ├── Durability.full / Durability.normal
+│   └── automatic crash recovery on open()
+└── StorageStrategy
+    ├── IoStorageStrategy        (mobile / desktop / server — file lock)
+    ├── IndexedDbStorageStrategy (web — default)
+    ├── LocalStorageStrategy     (web — localStorage)
+    ├── MemoryStorageStrategy    (tests)
+    ├── EncryptedStorageStrategy (wrapper — AES-256 + HMAC-SHA256)
+    └── BufferedStorageStrategy  (wrapper — write coalescing)
 ```
 
----
+### Files on disk
 
-## Performance
-
-Measured with `dart run benchmark/*.dart` on the Dart VM (desktop, release-equivalent).
-Numbers are throughput (docs/sec), not fixed durations — bulk operations use `insertAll()`,
-which batches writes and defers index updates until the whole batch is applied.
-
-**In-memory storage** (`benchmark/million_benchmark.dart`):
-
-| Operation | Throughput |
-|---|---|
-| Batch insert (1M docs) | 118.6k ops/s |
-| Sequential insert (1M docs) | 139.1k ops/s |
-| `findById` (DB size: 1M) | 285.2k ops/s |
-| HashIndex query (DB size: 1M) | 1.54M ops/s |
-| SortedIndex range query (DB size: 1M) | 794.3k ops/s |
-
-**Real disk storage** (`benchmark/disk_insert_benchmark.dart`, `WalStorageStrategy` + `IoStorageStrategy` — the default native backend, with WAL crash-safety on):
-
-| Operation | Throughput |
-|---|---|
-| `insertAll()`, 100k docs, no indexes | ~80k docs/s |
-| `insertAll()`, 1,000,000 docs, no indexes | ~34k docs/s |
-| `reindex()`, 100k docs, 1 index | ~45k docs/s |
-
-These are all bulk-path numbers (`insertAll()` / `reindex()`), which batch I/O and index
-updates. Individual `insert()`/`update()` calls are WAL-transactional (durable per call) and
-correspondingly slower — see `benchmark/batch_write_benchmark.dart` for a side-by-side of
-single inserts vs. `insertAll()` on the same dataset.
-
-**Flutter Database Comparison Benchmark** (`flutter_benchmark/`, real disk I/O, `n = 10,000` docs):
-
-| Operation | `ffastdb` | `isar_community` | `sembast` | Key Insight |
-|---|---|---|---|---|
-| `insertAll` (bulk) | **39.7k ops/s** | **153.8k ops/s** | 15.3k ops/s | `ffastdb` is **2.6× faster** than `sembast`. |
-| `singleInsert` (durable WAL) | **382 ops/s** | **498 ops/s** | 97 ops/s | `ffastdb` WAL speed is **4× faster** than `sembast`. |
-| `queryIndexed` (2k queries) | 151 ops/s | **583 ops/s** | 245 ops/s | `isar` leads in query execution; `ffastdb` page cache handles disk reads. |
-| `findById` (5k lookups) | **13.9k ops/s** | 9.2k ops/s | **333.3k ops/s** | `ffastdb` B-Tree lookups are **1.5× faster** than `isar`. |
-
-Run the benchmark suite:
-```bash
-cd flutter_benchmark
-dart run bin/run_benchmark.dart 10000
-```
-
-
----
-
-## File Structure
-
-For a database at path `/data/users.db`, FastDB creates:
+For `openDatabase('users', directory: '/data')`:
 
 ```
-/data/users.db       ← Main database file (FDB2 format)
-/data/users.db.wal   ← Write-Ahead Log (deleted after checkpoint)
-/data/users.db.lock  ← Process lock file (deleted on close)
+/data/users.fdb       ← main database file
+/data/users.fdb.wal   ← write-ahead log (emptied at checkpoints)
+/data/users.fdb.lock  ← process lock (removed on close)
 ```
 
 ---

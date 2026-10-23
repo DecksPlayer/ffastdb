@@ -144,6 +144,19 @@ void main() {
       expect((await db.findById(1))?['status'], 'keep');
     });
 
+    test('reads run together; a write waits for the reads in flight',
+        () async {
+      await db.insertAll([for (int i = 0; i < 3000; i++) {'status': 'old'}]);
+      // Unindexed full scans: they take several event-loop turns.
+      final scanA = db.query().where('missing').isNull().find();
+      final scanB = db.query().where('missing').isNull().find();
+      final write = db.insert({'status': 'new'});
+      expect((await scanA).length, 3000, reason: 'read saw a later write');
+      expect((await scanB).length, 3000);
+      await write;
+      expect(await db.count(), 3001);
+    });
+
     test('query cache is invalidated by a committed transaction', () async {
       await db.insert({'status': 'a'});
       expect(await db.query().where('status').equals('a').findIds(), [1]);
