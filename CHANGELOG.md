@@ -7,12 +7,14 @@
 - `exportJson()` / `importJson()` to exchange documents as plain JSON with other databases.
 - `flush()` now also persists the indexes, so a restart after the app is killed doesn't rebuild them.
 - `TypeAdapter`, `BinaryReader` and `BinaryWriter` are exported from the public import.
+- `Durability` option (`full` / `normal`) for `openDatabase()`, `ffastdb.init()` and `WalStorageStrategy`.
 
 ### Changed
 
 - Documents are stored in a binary format instead of JSON: faster reads/writes and smaller files. Existing databases are read without migration; downgrading is not supported.
 - Encryption (new databases): authenticated AES-256 with a fresh nonce per sector and PBKDF2 password keys; a wrong key is rejected by `open()`. Databases encrypted with older versions keep working.
 - `openDatabase()` no longer compacts on every delete (`autoCompactThreshold` default is now `0`).
+- `openDatabase()` / `ffastdb.init()` default to `Durability.normal`: survives app crashes and the OS killing the app; a power loss may lose the latest writes but never corrupts the database. Use `Durability.full` to fsync every write.
 - `typeId` 512 is reserved for TypeAdapters.
 
 ### Fixed
@@ -28,9 +30,11 @@
 - Indexes on `DateTime` fields: `insertAll()`/`close()` failed, deleted documents stayed indexed, and local/UTC dates did not match.
 - Negative numbers in sorted indexes were wrong after a reopen; 64-bit index values were wrong on the web.
 - A crash after a read-only session forced a full reindex.
+- `WalStorageStrategy` did not work on the web.
 
 ### Performance
 
+- Single `insert`/`update`/`delete` up to ~7x faster with `Durability.normal`, ~1.6x with `Durability.full`.
 - `count()` is O(1).
 - `compact()` is ~4x faster and no longer loads every document into memory.
 - Indexing low-cardinality fields is linear (was quadratic).

@@ -2,6 +2,20 @@ import 'dart:typed_data';
 import 'storage_strategy.dart';
 import '../crc32.dart' as crc;
 
+/// When a committed write is guaranteed to survive.
+enum Durability {
+  /// Every commit is fsynced before it returns: survives power loss and OS
+  /// crashes. One fsync per write operation.
+  full,
+
+  /// Like SQLite's `synchronous=NORMAL` in WAL mode: commits are appended to
+  /// the WAL without an fsync and reach the main file only at a checkpoint
+  /// (WAL >= 1 MB, `flush()`, `close()`), always AFTER the WAL is fsynced.
+  /// Survives app crashes and the OS killing the app; a power loss or OS
+  /// crash may lose the most recent commits — never corrupts the database.
+  normal,
+}
+
 /// WAL entry types
 const int _kEntryWrite = 1;
 const int _kEntryCommit = 2;
@@ -100,9 +114,21 @@ class WalStorageStrategy implements StorageStrategy {
   // Current write position in the WAL
   int _walPos = 0;
 
+  /// See [Durability]. Default: [Durability.full].
+  final Durability durability;
+
+  /// [Durability.normal]: committed transactions not applied to the main
+  /// file yet (applied, after a WAL fsync, by [_applyPending]). Reads overlay
+  /// them. Never holds a truncate — a transaction with a truncate (or one
+  /// streamed to the WAL file) is applied right away, after older pending
+  /// commits.
+  final List<_WalEntry> _pending = [];
+  int _pendingExtent = 0;
+
   WalStorageStrategy({
     required StorageStrategy main,
     required StorageStrategy wal,
+    this.durability = Durability.full,
   })  : _main = main,
         _wal = wal;
 
@@ -304,20 +330,39 @@ class WalStorageStrategy implements StorageStrategy {
     final bytes = walBytes.toBytes();
     await _wal.write(_walPos, bytes);
     _walPos += bytes.length;
-    await _wal.flush();
-    // Atomic point of no return: the COMMIT marker is durable in the WAL.
+    // Normal durability defers small transactions: no fsync, no main-file
+    // write now (see _pending).
+    final deferred = durability == Durability.normal &&
+        truncateTo == null &&
+        _txStreamed.isEmpty;
+    if (!deferred) await _wal.flush();
+    // Atomic point of no return: the COMMIT marker is in the WAL.
     _commitMarkerWritten = true;
 
     // 2. Apply writes to main file (buffered from RAM, streamed read back
     //    from the WAL file to keep RAM bounded on huge transactions).
     //    The truncate is applied first — same order as in the WAL.
     try {
-      if (truncateTo != null) {
-        await _main.truncate(truncateTo);
+      if (deferred) {
+        for (final e in _txEntries) {
+          _pending.add(e);
+          final end = e.offset + e.data.length;
+          if (end > _pendingExtent) _pendingExtent = end;
+        }
+      } else {
+        // Older deferred commits first (the fsync above covered them too).
+        await _applyPending(fsyncWal: false);
+        if (truncateTo != null) {
+          await _main.truncate(truncateTo);
+        }
+        await _applyCoalesced(_txEntries);
+        await _applyStreamed(_txStreamed);
       }
-      await _applyCoalesced(_txEntries);
-      await _applyStreamed(_txStreamed);
-      await _main.flush();
+      // No fsync of the main file here: the transaction is already durable
+      // (its COMMIT marker is fsynced in the WAL) and recovery re-applies it
+      // if the process dies before the OS writes these pages back. The main
+      // file is fsynced in _checkpoint(), BEFORE the WAL is truncated. One
+      // fsync per commit instead of two.
     } catch (e) {
       // Committed but half-applied: block further operations until recovery.
       _poisoned = true;
@@ -515,7 +560,22 @@ class WalStorageStrategy implements StorageStrategy {
   }
 
   /// Truncates the WAL after all entries have been applied to main storage.
+  /// Applies the deferred commits ([_pending]) to the main file. The WAL
+  /// must be durable first — never write a main-file page whose transaction
+  /// a power loss could still erase from the WAL.
+  Future<void> _applyPending({required bool fsyncWal}) async {
+    if (_pending.isEmpty) return;
+    if (fsyncWal) await _wal.flush();
+    await _applyCoalesced(_pending);
+    _pending.clear();
+    _pendingExtent = 0;
+  }
+
   Future<void> _checkpoint() async {
+    await _applyPending(fsyncWal: true);
+    // Applied-but-not-fsynced transactions live only in the WAL until the
+    // main file is durable — it must be before the WAL is discarded.
+    await _main.flush();
     await _wal.truncate(0);
     await _wal.flush();
     _walPos = 0;
@@ -559,12 +619,9 @@ class WalStorageStrategy implements StorageStrategy {
   @override
   Future<Uint8List> read(int offset, int size) async {
     _checkUsable();
-    if (!_txOpen ||
-        (_txEntries.isEmpty &&
-            _txStreamed.isEmpty &&
-            _txTruncateTo == null)) {
-      return _main.read(offset, size);
-    }
+    final txActive = _txOpen &&
+        (_txEntries.isNotEmpty || _txStreamed.isNotEmpty || _txTruncateTo != null);
+    if (!txActive && _pending.isEmpty) return _main.read(offset, size);
     // Read-your-writes: overlay pending transaction writes (last write wins)
     // on top of the main file content, so a transaction sees its own
     // uncommitted writes — including regions beyond the main file's current
@@ -572,7 +629,7 @@ class WalStorageStrategy implements StorageStrategy {
     //
     // If a truncate is pending, main-file content at/above the truncate
     // point is already logically gone — do not serve it (it is stale).
-    final trunc = _txTruncateTo;
+    final trunc = txActive ? _txTruncateTo : null;
     final int baseSize;
     if (trunc == null) {
       baseSize = size;
@@ -599,6 +656,12 @@ class WalStorageStrategy implements StorageStrategy {
       }
     }
 
+    // Deferred commits (older) first, then the open transaction (newer).
+    // A pending truncate never coexists with _pending (see truncate()).
+    for (final entry in _pending) {
+      overlay(entry.offset, entry.data);
+    }
+    if (!txActive) return result;
     for (final entry in _txEntries) {
       overlay(entry.offset, entry.data);
     }
@@ -615,12 +678,21 @@ class WalStorageStrategy implements StorageStrategy {
   }
 
   @override
-  Future<void> flush() => _main.flush();
+  Future<void> flush() async {
+    // Inside a transaction nothing has reached the main file yet — commit()
+    // provides durability; an fsync now would be wasted.
+    if (_txOpen) return;
+    _checkUsable();
+    // Makes every commit durable (incl. deferred ones) and empties the WAL.
+    await _checkpoint();
+  }
 
   @override
   Future<void> truncate(int size) async {
     _checkUsable();
     if (_txOpen) {
+      // The read overlay cannot cut deferred commits: apply them first.
+      await _applyPending(fsyncWal: true);
       // Deferred: applied to the main file at commit time.
       _txTruncateTo = size;
     } else {
@@ -640,13 +712,17 @@ class WalStorageStrategy implements StorageStrategy {
   @override
   Future<void> close() async {
     if (_txOpen) await commit(); // Auto-commit on close
+    // Durable and with an empty WAL: the next open has nothing to replay.
+    // A poisoned WAL keeps its content — recovery needs it.
+    if (!_poisoned) await _checkpoint();
     await _main.close();
     await _wal.close();
   }
 
   @override
   Future<int> get size async {
-    final mainSize = await _main.size;
+    final m = await _main.size;
+    final mainSize = _pendingExtent > m ? _pendingExtent : m;
     if (!_txOpen ||
         (_txEntries.isEmpty &&
             _txStreamed.isEmpty &&
@@ -712,8 +788,13 @@ class WalStorageStrategy implements StorageStrategy {
   int _readInt32(Uint8List b, int off) =>
       ByteData.sublistView(b, off, off + 4).getUint32(0, Endian.little);
 
-  int _readInt64(Uint8List b, int off) =>
-      ByteData.sublistView(b, off, off + 8).getUint64(0, Endian.little);
+  // 64-bit fields as (low uint32, high uint32): dart2js supports no 64-bit
+  // ByteData accessors. Same bytes as getUint64/setUint64 on the VM.
+  int _readInt64(Uint8List b, int off) {
+    final bd = ByteData.sublistView(b, off, off + 8);
+    return bd.getUint32(4, Endian.little) * 0x100000000 +
+        bd.getUint32(0, Endian.little);
+  }
 
   void _addInt32(BytesBuilder b, int v) {
     final data = Uint8List(4);
@@ -723,7 +804,10 @@ class WalStorageStrategy implements StorageStrategy {
 
   void _addInt64(BytesBuilder b, int v) {
     final data = Uint8List(8);
-    ByteData.sublistView(data).setUint64(0, v, Endian.little);
+    final hi = v ~/ 0x100000000;
+    ByteData.sublistView(data)
+      ..setUint32(0, v - hi * 0x100000000, Endian.little)
+      ..setUint32(4, hi, Endian.little);
     b.add(data);
   }
 }

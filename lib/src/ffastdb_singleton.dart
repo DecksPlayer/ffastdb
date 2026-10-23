@@ -1,5 +1,6 @@
 import 'fastdb.dart';
 import 'serialization/type_adapter.dart';
+import 'storage/wal_storage_strategy.dart' show Durability;
 import 'platform/open_database_native.dart'
     if (dart.library.js_interop) 'platform/open_database_web.dart';
 
@@ -51,6 +52,10 @@ class FFastDbSingleton {
   /// - [migrations] — `{fromVersion: migrateFn}` map applied sequentially
   ///   when upgrading from an older schema version.
   ///
+  /// - [durability] — [Durability.normal] (default) survives app crashes and
+  ///   the OS killing the app; a power loss may lose the last writes.
+  ///   [Durability.full] fsyncs every write. Native only.
+  ///
   /// Calling [init] a second time while the database is already open returns
   /// the existing instance without re-opening.
   Future<FastDB> init(
@@ -60,6 +65,7 @@ class FFastDbSingleton {
     int cacheCapacity = 256,
     double autoCompactThreshold = 0,
     Map<int, dynamic Function(dynamic)>? migrations,
+    Durability durability = Durability.normal,
   }) async {
     if (_db != null) return _db!;
     _db = await openDatabase(
@@ -69,6 +75,7 @@ class FFastDbSingleton {
       cacheCapacity: cacheCapacity,
       autoCompactThreshold: autoCompactThreshold,
       migrations: migrations,
+      durability: durability,
     );
     return _db!;
   }

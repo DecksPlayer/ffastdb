@@ -3,6 +3,7 @@ import '../storage/storage_strategy.dart';
 import '../storage/web/local_storage_strategy.dart';
 import '../storage/web/indexed_db_strategy.dart';
 import '../storage/encrypted_storage_strategy.dart';
+import '../storage/wal_storage_strategy.dart' show Durability;
 
 /// Opens (or creates) a named database on Web using [LocalStorageStrategy].
 ///
@@ -29,6 +30,9 @@ Future<FastDB> openDatabase(
   String? encryptionKey,
   bool useIndexedDb = true,
   void Function(double)? onProgress,
+  // Accepted for API parity with native; ignored — IndexedDB commits every
+  // flush in its own transaction.
+  Durability durability = Durability.normal,
 }) async {
   // Guard: if a live instance already exists, reuse it.
   // Calling disposeInstance() unconditionally was the root cause of

@@ -119,6 +119,11 @@ void main() {
     await db.open();
     await db.insertAll(List.generate(
         n, (i) => {'n': i, 'status': i.isEven ? 'even' : 'odd'}));
+    // Rewrite every document once: the originals become dead records, so
+    // compact() must MOVE all of them (an already-packed file needs no
+    // data writes and would not exercise a partial apply).
+    await db.updateWhere(
+        (q) => q.where('status').isIn(['even', 'odd']).findIds(), {'t': 1});
     await db.close();
   }
 
@@ -192,10 +197,11 @@ void main() {
   test('C. fault MID-APPLY → replay is idempotent, no data loss', () async {
     await seedDocs(300);
 
-    // Let the truncate and the first applies through, fault on the 15th
-    // main-file write — half the transaction applied, half pending.
+    // Main-file writes during compact(): #1 the dirty mark (its own commit),
+    // then the compact transaction's apply — truncate + 3 coalesced write
+    // groups. Faulting on #3 leaves it half applied, half pending.
     // (mainFail counts are at zero: seeding used the plain stack.)
-    mainFail.failOnWriteCall = 15;
+    mainFail.failOnWriteCall = 3;
 
     final db = openWithFailpoints();
     db.addIndex('status');

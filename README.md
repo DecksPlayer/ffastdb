@@ -78,6 +78,8 @@ runApp(MyApp(db: db));
 > - `useIndexedDb`: Defaults to `true`. Uses browser `IndexedDB` which is more robust and has higher limits than `localStorage`.
 > - `encryptionKey`: If provided, the database is encrypted AND authenticated (AES-256-CTR with a fresh nonce per 1 KB sector + HMAC-SHA256; the password is stretched with PBKDF2-HMAC-SHA256, 100k iterations by default). A wrong key is rejected by `open()`; tampered data fails on read. For strong protection prefer a random 32-byte key from the platform's secure storage via `EncryptedStorageStrategy.withRawKey`. Files encrypted by ffastdb ≤ 0.3.5 keep working in their legacy format (`isLegacyFormat`); migrate them with `exportJson()` → `importJson()` into a new database.
 
+> **Durability:** `openDatabase()` uses `Durability.normal` by default — writes survive app crashes and the OS killing the app; a power loss or OS crash may lose the most recent writes, but never corrupts the database. Pass `durability: Durability.full` to fsync every write (~4-7x slower single writes).
+
 > **App lifecycle:** call `await db.flush()` when the app goes to the background (e.g. `AppLifecycleState.paused`). It persists the secondary indexes, so if the OS then kills the process the next start loads them instead of rebuilding every index from the documents.
 
 > **Note:** `path_provider` is **not** a dependency of `ffastdb` itself — add

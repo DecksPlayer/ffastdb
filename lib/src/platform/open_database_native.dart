@@ -20,6 +20,7 @@ Future<FastDB> openDatabase(
   List<List<String>> compositeIndexes = const [],
   String? encryptionKey,
   void Function(double)? onProgress,
+  Durability durability = Durability.normal,
 }) async {
   try {
     return FfastDb.instance;
@@ -36,6 +37,7 @@ Future<FastDB> openDatabase(
   StorageStrategy storage = WalStorageStrategy(
     main: IoStorageStrategy(path),
     wal: IoStorageStrategy('$path.wal'),
+    durability: durability,
   );
 
   if (encryptionKey != null && encryptionKey.isNotEmpty) {
