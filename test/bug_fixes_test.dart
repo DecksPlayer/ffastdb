@@ -276,7 +276,9 @@ void main() {
 
     test('F2.8: _writeValue falla rápido con tipos no soportados', () {
       final idx = SortedIndex('d');
-      idx.add(1, DateTime.now());
+      // DateTime is serializable since the binary document format — use a
+      // type that still is not.
+      idx.add(1, const Duration(seconds: 1));
       expect(() => idx.serialize(), throwsArgumentError,
           reason: 'mejor un error explícito que un blob de índice corrupto');
     });

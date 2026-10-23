@@ -2,18 +2,46 @@
 
 ## Unreleased
 
-### Fixed — data loss / corruption
+### Added
 
-- **`delete(id)` could remove a DIFFERENT document.** The B-Tree used CLRS deletion (replace an internal key with its predecessor, then delete the predecessor), but leaves are B+ style and internal keys are routing copies — deleting an id equal to a leaf separator (e.g. the first id of any leaf after `insertAll`) removed its predecessor's document and left the target in place. Deletion now always descends to the leaf.
-- **Closing the database could truncate documents written in that session.** `saveIndexes()` truncated the file to the end of the index blob whenever the blob shrank, even when documents and B-Tree pages had been appended after it (the normal case after a reopen). It now truncates only when the blob was the last thing in the file.
-- **Dual-file mode (`dataStorage`): the first insert after `insertAll` overwrote an existing document.** `saveIndexes()` set the data-file write offset to an offset of the index file.
-- **Dual-file mode: `compact()` corrupted documents after any `update()`.** It rewrote records in id order, overwriting not-yet-read records whenever an updated (relocated) document had a low id. Records are now copied byte-for-byte in ascending offset order.
-- **Rolling back a transaction (or a failed `insertAll`) could corrupt the B-Tree.** Pages freed during the aborted operation stayed in the free-page list although the rollback made them live again, so later allocations overwrote live nodes. The free list is now restored on rollback.
-- **`updateWhere()` deadlocked on any condition over an unindexed field** — the query re-entered the write lock it was already holding. A Dart program left with nothing else to do exits silently in that state, so every later write was lost.
+- `exportJson()` / `importJson()` to exchange documents as plain JSON with other databases.
+- `flush()` now also persists the indexes, so a restart after the app is killed doesn't rebuild them.
+- `TypeAdapter`, `BinaryReader` and `BinaryWriter` are exported from the public import.
+
+### Changed
+
+- Documents are stored in a binary format instead of JSON: faster reads/writes and smaller files. Existing databases are read without migration; downgrading is not supported.
+- Encryption (new databases): authenticated AES-256 with a fresh nonce per sector and PBKDF2 password keys; a wrong key is rejected by `open()`. Databases encrypted with older versions keep working.
+- `openDatabase()` no longer compacts on every delete (`autoCompactThreshold` default is now `0`).
+- `typeId` 512 is reserved for TypeAdapters.
+
+### Fixed
+
+- `delete()` could remove a different document.
+- Closing the database could lose documents written in that session.
+- Dual-file mode: inserts after `insertAll()` and `compact()` after updates corrupted documents.
+- Transaction rollback could corrupt the B-Tree.
+- Transactions isolated: other callers no longer run inside (and roll back with) someone else's transaction; `query()` no longer sees uncommitted data.
+- `deleteWhere()` / `updateWhere()` are atomic; `updateWhere()` no longer deadlocks on unindexed fields.
+- Stale query results after a transaction.
+- Schema migrations could lose documents.
+- Indexes on `DateTime` fields: `insertAll()`/`close()` failed, deleted documents stayed indexed, and local/UTC dates did not match.
+- Negative numbers in sorted indexes were wrong after a reopen; 64-bit index values were wrong on the web.
+- A crash after a read-only session forced a full reindex.
+
+### Performance
+
+- `count()` is O(1).
+- `compact()` is ~4x faster and no longer loads every document into memory.
+- Indexing low-cardinality fields is linear (was quadratic).
+- Queries that mix indexed and unindexed conditions only scan the candidates.
+- Watchers emit once per burst of writes instead of once per write.
+- Auto-compaction no longer scans the whole database after each delete.
 
 ### Removed
 
-- **The sequential operation log (`<db>.fdb.log`).** On open it replayed single-document operations on top of the newer WAL-recovered state; transactions and batch writes were never logged, so after an unclean shutdown (the normal way a mobile app ends) deleted documents came back and updates were reverted. It also stored documents in plaintext next to encrypted databases. The WAL already makes every committed write durable. A leftover `.fdb.log` is deleted on open.
+- The operation log (`.fdb.log`): it restored deleted/old data after a crash and stored encrypted databases' documents in plaintext. Leftover files are deleted on open.
+- The unused `IsolateCoordinator`.
 
 ## 0.3.5
 

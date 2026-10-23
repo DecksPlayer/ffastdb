@@ -154,132 +154,119 @@ class _StorageManager {
   }
 
   /// Checks if auto-compaction threshold is exceeded and compacts if needed.
+  /// Called after every delete — O(1): the live count is maintained
+  /// incrementally (the old code scanned the whole B-Tree each time).
   Future<void> maybeAutoCompact() async {
-    if (_db._autoCompactThreshold <= 0) return;
-    final liveIds = await _db._primaryIndex.rangeSearch(1, _db._nextId - 1);
+    final threshold = _db._autoCompactThreshold;
+    if (threshold <= 0) return;
     final deleted = _db._deletedCount;
-    final total = liveIds.length + deleted;
-    if (total == 0) return;
-    if (deleted / total >= _db._autoCompactThreshold) {
-      await compactImpl();
-      // BUG FIX: Reset _deletedCount after successful compaction to prevent
-      // infinite re-triggering of auto-compact on every subsequent operation.
-      _db._deletedCount = 0;
+    if (deleted == 0) return;
+    final live = await _db._countLive();
+    if (deleted / (live + deleted) >= threshold) {
+      // In a transaction: compaction rewrites the file in place — a crash
+      // half-way must roll back, not leave a half-moved file.
+      await _db._runTransaction(compactImpl);
     }
   }
 
-  /// Compacts the database by removing deleted entries and rewriting all data.
+  /// Resets the dead-slot counter used by [maybeAutoCompact].
+  void _resetDeletedCount() => _db._deletedCount = 0;
+
+  /// Compacts the database: removes dead records (deleted / overwritten
+  /// documents, abandoned index blobs, old B-Tree pages) and rebuilds the
+  /// B-Tree.
   ///
-  /// ⚠️ CRASH SAFETY: compaction rewrites data in place (single-file mode
-  /// truncates to the header page first; dual-file mode rewrites the data
-  /// file from offset 0). A crash MID-compact can lose data. Run compact()
-  /// only at controlled points (app startup, maintenance windows), ideally
-  /// after a successful close+reopen cycle. Full copy-compaction
-  /// (new file + atomic rename) is tracked as future work — see FIX_PLAN.md.
+  /// Live records are slid towards the start of the data region byte-for-byte
+  /// ([_slideRecords]) — no document is deserialized and secondary indexes
+  /// stay valid (ids do not change). Peak memory is one (id, offset) pair per
+  /// document plus one chunk of records; the old single-file path buffered
+  /// EVERY document in RAM and re-indexed them all.
+  ///
+  /// Must run inside a transaction ([FastDB.compact], [maybeAutoCompact]):
+  /// with a WAL the whole rewrite then commits or rolls back atomically. In
+  /// dual-file mode the data file is not covered by the WAL.
   Future<void> compactImpl() async {
-    final allIds = await _db._primaryIndex.rangeSearch(1, _db._nextId - 1);
-    if (allIds.isEmpty) return;
+    final single = _db.dataStorage == null;
+    final target = _db.dataStorage ?? _db.storage;
+    final slid = await _slideRecords(target, single ? PageManager.pageSize : 0);
 
-    if (_db.dataStorage != null) {
-      // ── OOM-Safe Streaming Compaction (Dual-file mode) ────────────────────
-      // The B-Tree lives in a separate file, so the data file is compacted in
-      // place one record at a time, without buffering every document in RAM.
-      //
-      // Records MUST be visited in ascending OFFSET order (not id order) and
-      // copied byte-for-byte: then writePos never passes the start of a
-      // record that has not been read yet (memmove-style left shift).
-      // Visiting by id overwrote unread records whenever an updated document
-      // (relocated to the end of the file) had a low id.
-      final entries = await _db._primaryIndex.rangeSearchEntries(1, _db._nextId - 1);
-      entries.sort((a, b) => a.value.compareTo(b.value));
-
-      int writePos = 0;
-      for (int i = 0; i < entries.length; i++) {
-        final e = entries[i];
-        final raw = await _db._readRawAt(e.value);
-        if (raw != null) {
-          if (writePos != e.value) {
-            await _db.dataStorage!.write(writePos, raw);
-            await _db._primaryIndex.insert(e.key, writePos);
-          }
-          writePos += raw.length;
-        } else {
-          // Unreadable record: its old offset is about to be overwritten, so
-          // the entry would resolve to some OTHER document — drop it.
-          await _db._primaryIndex.delete(e.key);
-        }
-        if (i > 0 && i % 250 == 0) await Future.delayed(Duration.zero);
-      }
-      _db._dataOffset = writePos;
-      await _db.dataStorage!.truncate(_db._dataOffset);
-      await _db._pageManager.flushDirty();
-      _db._pageManager.clearCache();
-      _db._primaryIndex.clearNodeCache();
+    // The old tree is dead — its pages were overwritten (single-file) or are
+    // rebuilt below (dual-file). Rebuild it from the new offsets.
+    _db._pageManager.clearCache();
+    _db._pageManager.clearFreeList();
+    _db._primaryIndex.clearNodeCache();
+    _db._primaryIndex.rootPage = null;
+    // Zero the secondary-index blob pointer (bytes 16-23): its old location
+    // is gone; saveIndexes() below writes a fresh blob.
+    await _db.storage.write(16, Uint8List(8));
+    if (single) {
+      await _db.storage.truncate(slid.end);
     } else {
-      // ── Single-file mode: full rebuild ────────────────────────────────────
-      // In single-file mode, B-Tree and data share the same file. 
-      // Truncating or overwriting is destructive to the index we need for findById.
-      // We must buffer the documents before rebuilding.
-      
-      final docs = <int, dynamic>{};
-      for (int i = 0; i < allIds.length; i++) {
-        final id = allIds[i];
-        final doc = await _db._findById(id);
-        if (doc != null) docs[id] = doc;
-        if (i > 0 && i % 250 == 0) await Future.delayed(Duration.zero);
-      }
-
-      await _db.storage.truncate(PageManager.pageSize); // keep only the header page
-      _db._pageManager.clearCache();                    // discard all cached/dirty B-Tree pages
-      _db._pageManager.clearFreeList();                 // free pages no longer exist post-truncate
-      _db._primaryIndex.clearNodeCache();
-      _db._primaryIndex.rootPage = null;                // force a fresh root on first insert
-      for (final idx in _db._secondaryIndexes.values) idx.clear();
-
-      // Zero out the secondary-index block pointer (bytes 16-23) — same fix
-      // as clearImpl(). Without this, saveIndexes() below sees the STALE
-      // pre-compact offset/length and, if the freshly-rebuilt index still
-      // fits in that old length, "reuses" that offset directly instead of
-      // computing a fresh one from the (now much smaller, rebuilt) file
-      // size — landing the index blob in the middle of the just-rewritten
-      // document data and corrupting it.
-      await _db.storage.write(16, Uint8List(8));
-
-      // Create the initial sentinel entry (id=0, offset=0) — same as open().
-      await _db._primaryIndex.insert(0, 0);
-      // Mark header dirty so clean-flag byte is written below.
-      if (_db.storage.needsExplicitFlush) {
-        await _db.storage.write(24, Uint8List(1)); // dirty flag — forces index rebuild on next open
-      }
-      _db._dataOffset = await _db.storage.size;
-
-      // Secondary-index population is deferred to one batched call after
-      // this loop (see indexDocumentsBatch) — indexDocument() per document
-      // is O(n) per call for SortedIndex (array shift to stay sorted),
-      // which made compacting a large dataset O(n^2) in the live doc count.
-      final toIndex = <MapEntry<int, Map<String, dynamic>>>[];
-      int i = 0;
-      for (final entry in docs.entries) {
-        final data = _db._serialize(entry.value, id: entry.key);
-        await _db.storage.write(_db._dataOffset, data);
-        await _db._primaryIndex.insert(entry.key, _db._dataOffset);
-        if (entry.value is Map<String, dynamic>) {
-          toIndex.add(MapEntry(entry.key, entry.value as Map<String, dynamic>));
-        }
-        // Track actual file end including any new B-Tree pages allocated during insert.
-        _db._dataOffset = _db.storage.sizeSync ?? await _db.storage.size;
-        if (i > 0 && i % 250 == 0) await Future.delayed(Duration.zero);
-        i++;
-      }
-      _db._indexMgr.indexDocumentsBatch(toIndex);
-      await _db._pageManager.flushDirty();
+      await _db.dataStorage!.truncate(slid.end);
+      await _db.storage.truncate(PageManager.pageSize); // header page only
     }
+    await _db._primaryIndex.bulkLoad([const MapEntry(0, 0), ...slid.moved]);
+    await _db._pageManager.flushDirty();
+    _db._dataOffset = single
+        ? (_db.storage.sizeSync ?? await _db.storage.size)
+        : slid.end;
 
-    _db._deletedCount = 0;
+    for (final id in slid.dropped) {
+      for (final idx in _db._secondaryIndexes.values) {
+        idx.removeById(id);
+      }
+    }
+    _db._liveCount = slid.moved.length;
+    _resetDeletedCount();
     await saveIndexes();
     await saveHeader();
     await _db.storage.flush();
     if (_db.dataStorage != null) await _db.dataStorage!.flush();
+  }
+
+  /// Moves every live record to `[start, end)` of [target], packed, keeping
+  /// their relative order. Records are visited in ascending OFFSET order and
+  /// moved in chunks: a chunk is fully read before it is written, and its
+  /// packed output ends at or before the chunk's original end, so a write
+  /// never reaches a record that has not been read yet. Chunked I/O also
+  /// keeps the WAL read-your-writes overlay cheap (few, large entries).
+  ///
+  /// Returns the new (id → offset) entries sorted by id, the end of the
+  /// packed region, and the ids of unreadable records (dropped).
+  Future<({List<MapEntry<int, int>> moved, int end, List<int> dropped})>
+      _slideRecords(StorageStrategy target, int start) async {
+    final entries =
+        await _db._primaryIndex.rangeSearchEntries(1, _db._nextId - 1);
+    entries.sort((a, b) => a.value.compareTo(b.value));
+
+    const chunkRecords = 2000;
+    final moved = <MapEntry<int, int>>[];
+    final dropped = <int>[];
+    int writePos = start;
+    for (int i = 0; i < entries.length; i += chunkRecords) {
+      final end = i + chunkRecords < entries.length ? i + chunkRecords : entries.length;
+      final chunk = entries.sublist(i, end);
+      final raws = await _db._batchReadRaw(chunk);
+      final out = BytesBuilder(copy: false);
+      final chunkStart = writePos;
+      bool inPlace = true;
+      for (int j = 0; j < chunk.length; j++) {
+        final raw = raws[j];
+        if (raw == null) {
+          dropped.add(chunk[j].key);
+          continue;
+        }
+        if (chunk[j].value != writePos) inPlace = false;
+        moved.add(MapEntry(chunk[j].key, writePos));
+        out.add(raw);
+        writePos += raw.length;
+      }
+      // Leading records that are already packed need no rewrite.
+      if (!inPlace && out.length > 0) await target.write(chunkStart, out.takeBytes());
+      await Future.delayed(Duration.zero);
+    }
+    moved.sort((a, b) => a.key.compareTo(b.key));
+    return (moved: moved, end: writePos, dropped: dropped);
   }
 
   /// Wipes all documents from the database in O(1) time by truncating storage
@@ -301,7 +288,8 @@ class _StorageManager {
       }
 
       _db._nextId = 1;
-      _db._deletedCount = 0;
+      _resetDeletedCount();
+      _db._liveCount = 0;
       _db._batchEntries.clear();
 
       await _db._primaryIndex.insert(0, 0);
@@ -346,12 +334,15 @@ class _StorageManager {
         final newOffset = _db._dataOffset;
         final data = _db._serialize(migratedDoc, id: id);
         await targetStorage.write(newOffset, data);
-        _db._dataOffset += data.length;
         await _db._primaryIndex.insert(id, newOffset);
+        // NOT `_dataOffset += data.length`: in single-file mode the insert
+        // above may allocate a B-Tree page right after this document, and
+        // the next document would be written over it.
+        await _db._syncDataOffset(data.length);
       }
       if (i > 0 && i % 250 == 0) await Future.delayed(Duration.zero);
     }
-    _db._deletedCount = 0;
+    _resetDeletedCount();
     if (_db.dataStorage != null) await _db.dataStorage!.truncate(_db._dataOffset);
     await _db.storage.flush();
     if (_db.dataStorage != null) await _db.dataStorage!.flush();

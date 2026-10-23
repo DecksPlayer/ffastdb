@@ -27,3 +27,6 @@ flutter_benchmark/windows/
 **/*.freezed.dart
 **/*.mocks.dart
 **/pubspec.lock
+
+# Debug logs (never versioned)
+*.log

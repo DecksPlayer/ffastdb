@@ -29,7 +29,7 @@ class _QueryOperations {
 
     // For small result sets, a single batch is plenty.
     if (ids.length < 50) {
-      return _db._batchFindByIds(ids);
+      return [for (final d in await _db._batchFindByIds(ids)) ?d];
     }
 
     // For larger result sets, chunk to bound peak memory (one contiguous
@@ -38,7 +38,9 @@ class _QueryOperations {
     final results = <dynamic>[];
     for (int i = 0; i < ids.length; i += chunkSize) {
       final end = (i + chunkSize < ids.length) ? i + chunkSize : ids.length;
-      results.addAll(await _db._batchFindByIds(ids.sublist(i, end)));
+      for (final d in await _db._batchFindByIds(ids.sublist(i, end))) {
+        if (d != null) results.add(d);
+      }
       // Yield to event loop to prevent blocking
       if (_runningOnWeb) await Future.delayed(Duration.zero);
     }
@@ -55,10 +57,7 @@ class _QueryOperations {
   }
 
   /// Returns the number of live documents.
-  Future<int> countImpl() async {
-    final ids = await _db._primaryIndex.rangeSearch(1, _db._nextId - 1);
-    return ids.length;
-  }
+  Future<int> countImpl() => _db._countLive();
 
   /// Returns true if a document with the given ID exists.
   Future<bool> existsImpl(int id) async {

@@ -52,6 +52,7 @@ class SortedIndex implements SecondaryIndex {
     if (a is num && b is num) return a.compareTo(b);
     if (a is String && b is String) return a.compareTo(b);
     if (a is bool && b is bool) return a == b ? 0 : (a ? 1 : -1);
+    if (a is DateTime && b is DateTime) return a.compareTo(b);
     final ra = _typeRank(a);
     final rb = _typeRank(b);
     if (ra != rb) return ra.compareTo(rb);
@@ -445,6 +446,10 @@ class SortedIndex implements SecondaryIndex {
     } else if (v is bool) {
       buf.addByte(4);
       buf.addByte(v ? 1 : 0);
+    } else if (v is DateTime) {
+      buf.addByte(6); // DateTime: int64 microseconds + isUtc flag (== needs it)
+      _writeInt64(buf, v.microsecondsSinceEpoch);
+      buf.addByte(v.isUtc ? 1 : 0);
     } else {
       // Fail fast: writing nothing (not even the tag) desynchronizes the
       // reader and corrupts the whole index blob silently.
@@ -453,15 +458,14 @@ class SortedIndex implements SecondaryIndex {
     }
   }
 
+  /// Little-endian int64 as (low uint32, high int32). Computed with `&` and
+  /// `~/` instead of `>> 32` — dart2js shifts are 32-bit, so the old code
+  /// wrote garbage for values >= 2^32 on the web. Same bytes as before on
+  /// the VM.
   void _writeInt64(BytesBuilder buf, int v) {
-    buf.addByte(v & 0xFF);
-    buf.addByte((v >> 8) & 0xFF);
-    buf.addByte((v >> 16) & 0xFF);
-    buf.addByte((v >> 24) & 0xFF);
-    buf.addByte((v >> 32) & 0xFF);
-    buf.addByte((v >> 40) & 0xFF);
-    buf.addByte((v >> 48) & 0xFF);
-    buf.addByte((v >> 56) & 0xFF);
+    final lo = v & 0xFFFFFFFF;
+    _writeInt32(buf, lo);
+    _writeInt32(buf, (v - lo) ~/ 0x100000000);
   }
 
   void _writeInt32(BytesBuilder buf, int v) {
@@ -485,7 +489,10 @@ class SortedIndex implements SecondaryIndex {
     dynamic readValue() {
       final tag = bytes[off++];
       switch (tag) {
-        case 1: return readInt32();
+        case 1:
+          // readInt32() is unsigned on the VM — negative keys came back as
+          // values >= 2^31 after a reopen.
+          return readInt32().toSigned(32);
         case 2:
           final bd = ByteData.view(bytes.buffer, bytes.offsetInBytes + off, 8);
           off += 8;
@@ -500,7 +507,12 @@ class SortedIndex implements SecondaryIndex {
           // 64-bit int (new writes); legacy tag 1 (int32) still read above.
           final lo = readInt32();
           final hi = readInt32();
-          return lo | (hi << 32);
+          return hi.toSigned(32) * 0x100000000 + lo;
+        case 6:
+          final lo = readInt32();
+          final hi = readInt32();
+          return DateTime.fromMicrosecondsSinceEpoch(hi.toSigned(32) * 0x100000000 + lo,
+              isUtc: bytes[off++] == 1);
         default: return null;
       }
     }
@@ -535,6 +547,7 @@ class SortedIndex implements SecondaryIndex {
           final strLen = readInt32();
           off += strLen;
         case 4: off += 1;
+        case 6: off += 9; // DateTime: int64 micros + isUtc byte
       }
       final idCount = readInt32();
       totalIds += idCount;

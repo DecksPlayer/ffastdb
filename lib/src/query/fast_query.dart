@@ -32,7 +32,9 @@ class QueryBuilder {
   /// Optional callback to watch secondary indexes.
   final Stream<List<int>> Function(String field)? _watchStream;
 
-  /// Optional callback to resolve many ids to documents at once.
+  /// Optional callback to resolve many ids to documents at once. Must return
+  /// a list ALIGNED with its argument (null for a missing id) — the full-scan
+  /// fallback maps documents back to their ids by position.
   ///
   /// When available (FastDB injects [FastDB._batchFindByIds]), [find] and
   /// [_fullScan] use it instead of `Future.wait(ids.map(_fetchById))` — on
@@ -42,6 +44,14 @@ class QueryBuilder {
   /// I/O call. Falls back to the per-id path when null (e.g. a QueryBuilder
   /// built directly, without a database reference).
   final Future<List<dynamic>> Function(List<int> ids)? _batchFetchByIds;
+
+  /// Optional runner that executes a terminal operation (find, findIds,
+  /// findFirst, count) under the database's operation lock, so a query never
+  /// observes a half-applied write or an open transaction's uncommitted
+  /// state. FastDB injects it for `db.query()`; builders created INSIDE the
+  /// lock (updateWhere, deleteWhere, find(queryFn), ...) get none — taking
+  /// the lock again there would deadlock.
+  final Future<R> Function<R>(Future<R> Function() body)? _run;
 
   final List<List<_Condition>> _orGroups = [
     [],
@@ -68,7 +78,13 @@ class QueryBuilder {
     this._watchStream,
     QueryCache? cache,
     this._batchFetchByIds,
+    this._run,
   ]) : _queryCache = cache ?? _defaultCache;
+
+  Future<R> _locked<R>(Future<R> Function() body) {
+    final run = _run;
+    return run == null ? body() : run(body);
+  }
 
   /// Stream that emits matching documents every time any of the queried fields change.
   Stream<List<dynamic>> watch() {
@@ -226,20 +242,26 @@ class QueryBuilder {
   ///   .where('status').equals('active')
   ///   .find();
   /// ```
-  Future<List<dynamic>> find() async {
+  Future<List<dynamic>> find() {
     if (_fetchById == null) {
       throw StateError(
         'QueryBuilder.find() requires a database reference. '
         'Use db.query().where(...).find() instead of constructing QueryBuilder directly.',
       );
     }
-    final ids = await findIds();
+    return _locked(_find);
+  }
+
+  Future<List<dynamic>> _find() async {
+    final ids = await _findIds();
     if (ids.isEmpty) return const [];
     // Batched resolution when available — see [_batchFetchByIds]. Falls back
     // to one Future per id (still concurrent, just not I/O-batched) for a
     // QueryBuilder built without a database reference.
-    if (_batchFetchByIds != null) return _batchFetchByIds(ids);
-    final docs = await Future.wait(ids.map(_fetchById), eagerError: false);
+    final batch = _batchFetchByIds;
+    final docs = batch != null
+        ? await batch(ids)
+        : await Future.wait(ids.map(_fetchById!), eagerError: false);
     return [for (final d in docs) ?d];
   }
 
@@ -253,24 +275,26 @@ class QueryBuilder {
   ///   .where('email').equals('alice@example.com')
   ///   .findFirst();
   /// ```
-  Future<dynamic> findFirst() async {
+  Future<dynamic> findFirst() {
     if (_fetchById == null) {
       throw StateError(
         'QueryBuilder.findFirst() requires a database reference. '
         'Use db.query().where(...).findFirst() instead.',
       );
     }
-    // Push limit(1) into execution so sort/pagination stop at the first hit
-    // (previously the full result set was materialized and truncated).
-    final savedLimit = _limit;
-    _limit = 1;
-    try {
-      final ids = await findIds();
-      if (ids.isEmpty) return null;
-      return _fetchById(ids.first);
-    } finally {
-      _limit = savedLimit;
-    }
+    return _locked(() async {
+      // Push limit(1) into execution so sort/pagination stop at the first hit
+      // (previously the full result set was materialized and truncated).
+      final savedLimit = _limit;
+      _limit = 1;
+      try {
+        final ids = await _findIds();
+        if (ids.isEmpty) return null;
+        return _fetchById(ids.first);
+      } finally {
+        _limit = savedLimit;
+      }
+    });
   }
 
   /// Returns the **count** of documents matching the query.
@@ -285,7 +309,9 @@ class QueryBuilder {
   /// ```dart
   /// final activeCount = await db.query().where('status').equals('active').count();
   /// ```
-  Future<int> count() async {
+  Future<int> count() => _locked(_count);
+
+  Future<int> _count() async {
     // Hot path: single non-negated equals → direct bucket size, O(1)
     if (_orGroups.length == 1 && _orGroups[0].length == 1) {
       final cond = _orGroups[0][0];
@@ -300,7 +326,7 @@ class QueryBuilder {
     _limit = null;
     _offset = null;
     try {
-      return (await findIds()).length;
+      return (await _findIds()).length;
     } finally {
       _limit = savedLimit;
       _offset = savedOffset;
@@ -380,7 +406,9 @@ class QueryBuilder {
   ///   3. Intersect (AND) results within an OR group.
   ///   4. Union (OR) results across groups.
   ///   5. Cache result for future identical queries.
-  Future<List<int>> findIds() async {
+  Future<List<int>> findIds() => _locked(_findIds);
+
+  Future<List<int>> _findIds() async {
     if (FastDB.debugQueryPlan) {
       print('[ffastdb] QueryPlan:\n${explain()}');
     }
@@ -531,14 +559,19 @@ class QueryBuilder {
       // OPTIMIZATION: Use sorted lists and merge instead of Set operations
       List<int>? groupResult;
       for (int i = 0; i < sortedConditions.length; i++) {
+        if (groupResult != null && groupResult.isEmpty) break; // short-circuit
         final cond = sortedConditions[i];
         final index = _getIndexForField(cond.field, cond);
 
-        // Unindexed field → full-scan with in-memory filtering (never
-        // silently discard the condition — that returned wrong results).
-        final matches = index != null
-            ? await cond.evaluate(index, this)
-            : await _fullScan(cond);
+        // Unindexed field → in-memory filtering (never silently discard the
+        // condition — that returned wrong results). The CBO sorts unindexed
+        // conditions last, so the indexed ones usually narrowed the group
+        // already: filter only those candidates instead of the whole DB.
+        if (index == null) {
+          groupResult = await _fullScan(cond, groupResult);
+          continue;
+        }
+        final matches = await cond.evaluate(index, this);
 
         if (groupResult == null) {
           // First evaluated condition: just convert to List
@@ -623,7 +656,7 @@ class QueryBuilder {
   /// on unindexed fields return correct results instead of being silently
   /// discarded. Register an index (`addIndex`/`addSortedIndex`/...) to make
   /// the query O(log n) instead of O(N).
-  Future<List<int>> _fullScan(_Condition cond) async {
+  Future<List<int>> _fullScan(_Condition cond, [List<int>? candidates]) async {
     if (_primarySearch == null || _fetchById == null) {
       throw StateError(
         'Cannot evaluate condition on unindexed field "${cond.field}": this '
@@ -632,23 +665,23 @@ class QueryBuilder {
         'query via db.query().',
       );
     }
-    final allIds = await _primarySearch(1, 0x7FFFFFFF);
-    if (allIds.isEmpty) return const [];
-    // Fetch in batches to bound memory and event-loop pressure.
-    final docs = List<dynamic>.filled(allIds.length, null);
-    const batchSize = 100;
-    for (int i = 0; i < allIds.length; i += batchSize) {
-      final end = (i + batchSize < allIds.length)
-          ? i + batchSize
-          : allIds.length;
-      final batch = await Future.wait([
-        for (int j = i; j < end; j++) _fetchById(allIds[j]),
-      ], eagerError: false);
-      for (int j = i; j < end; j++) {
-        docs[j] = batch[j - i];
-      }
+    final ids = candidates ?? await _primarySearch(1, 0x7FFFFFFF);
+    if (ids.isEmpty) return const [];
+    // Chunked: one batched read per chunk (when available) and only the
+    // current chunk's documents held in memory — the old code fetched every
+    // document one by one and kept them all until the end.
+    final batch = _batchFetchByIds;
+    const chunkSize = 1000;
+    final result = <int>[];
+    for (int i = 0; i < ids.length; i += chunkSize) {
+      final end = (i + chunkSize < ids.length) ? i + chunkSize : ids.length;
+      final chunk = ids.sublist(i, end);
+      final docs = batch != null
+          ? await batch(chunk)
+          : await Future.wait(chunk.map(_fetchById), eagerError: false);
+      result.addAll(_fullScanSync(cond, chunk, docs));
     }
-    return _fullScanSync(cond, allIds, docs);
+    return result;
   }
 
   /// Quick check if a list is already sorted (for optimization)
@@ -847,6 +880,7 @@ int _compareValues(dynamic a, dynamic b) {
   if (a is num && b is num) return a.compareTo(b);
   if (a is String && b is String) return a.compareTo(b);
   if (a is bool && b is bool) return a == b ? 0 : (a ? 1 : -1);
+  if (a is DateTime && b is DateTime) return a.compareTo(b);
   final ra = a is num
       ? 0
       : a is String
@@ -870,6 +904,7 @@ int _compareValues(dynamic a, dynamic b) {
 bool _indexEquals(dynamic a, dynamic b) {
   if (a == null || b == null) return false;
   if (a is num && b is num) return a == b;
+  if (a is DateTime && b is DateTime) return a.isAtSameMomentAs(b);
   if (a.runtimeType != b.runtimeType) return false;
   return a == b;
 }

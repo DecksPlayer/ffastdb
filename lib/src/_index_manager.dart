@@ -228,17 +228,15 @@ class IndexManager {
   }
 
   /// Removes a document from all secondary indexes.
+  ///
+  /// By id (every index keeps a docId → value reverse map), NOT by the
+  /// values of [doc]: [doc] is the copy read back from storage, which can
+  /// differ from what was indexed at write time — e.g. a local DateTime is
+  /// read back as UTC, and DateTime == compares the isUtc flag too, so the
+  /// value-based remove() missed it and left a stale entry behind.
   void removeDocument(int id, Map doc) {
     for (final idx in _db._secondaryIndexes.values) {
-      if (idx is CompositeIndex) {
-        final values = idx.fieldNames.map((f) => _extractField(doc, f)).toList();
-        if (values.any((v) => v != null)) {
-          idx.remove(id, values);
-        }
-      } else {
-        final val = _extractField(doc, idx.fieldName);
-        if (val != null) idx.remove(id, val);
-      }
+      idx.removeById(id);
     }
   }
 

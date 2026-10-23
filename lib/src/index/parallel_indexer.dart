@@ -2,7 +2,7 @@ import 'dart:async';
 import 'dart:isolate';
 import 'dart:typed_data';
 
-import '../serialization/fast_serializer.dart';
+import '../serialization/document_codec.dart';
 
 /// Entry representing an extracted document field for index rebuilding.
 class ExtractedIndexDoc {
@@ -37,8 +37,9 @@ List<ExtractedIndexDoc> extractFieldsWorker(ExtractionTaskPayload payload) {
     if (fullData.length < 4 + length) continue;
 
     try {
-      final payloadBytes = fullData.sublist(4, 4 + length);
-      final doc = FastSerializer.deserialize(payloadBytes);
+      final doc = decodeDocumentPayload(
+          Uint8List.sublistView(fullData, 4, 4 + length));
+      if (doc == null) continue; // TypeAdapter object — no Map fields
 
       final extracted = <String, dynamic>{};
       for (final fieldPath in payload.fieldPaths) {

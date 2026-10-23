@@ -66,7 +66,7 @@ void main() {
       }
     });
 
-    test('Wrong key produces different output', () async {
+    test('Wrong key is rejected by open()', () async {
       const key = 'secret_key_123';
       final rawData = Uint8List.fromList([1, 2, 3, 4, 5, 6, 7, 8]);
 
@@ -78,12 +78,10 @@ void main() {
       }
 
       {
+        // v2 format: a wrong key is rejected by open() (key check in the
+        // authenticated header) instead of silently decrypting to garbage.
         final wrong = EncryptedStorageStrategy(IoStorageStrategy(dbPath), 'wrong_key');
-        await wrong.open();
-        final wrongData = await wrong.read(0, rawData.length);
-        expect(wrongData, isNot(equals(rawData)),
-            reason: 'Wrong key should not decrypt correctly');
-        await wrong.close();
+        await expectLater(wrong.open(), throwsStateError);
       }
     });
 

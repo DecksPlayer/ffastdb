@@ -8,6 +8,7 @@ const int _tDouble = 2;
 const int _tString = 3;
 const int _tBool = 4;
 const int _tInt64 = 5;  // 64-bit int — used for all new writes
+const int _tDateTime = 6; // int64 microseconds + isUtc byte
 
 /// In-memory hash-based secondary index with persistence support.
 /// Fast O(1) lookups using optimized hash buckets for Isar-level performance.
@@ -35,6 +36,8 @@ class HashIndex implements SecondaryIndex {
   /// Fast FNV-1a hash with better distribution than Dart's default hashCode
   int _hash(dynamic value) {
     if (value == null) return 0;
+    // DateTimes are equal when they are the same instant (see _equals).
+    if (value is DateTime) value = value.microsecondsSinceEpoch;
 
     // FNV-1a constants
     const int fnvPrime = 16777619;
@@ -81,7 +84,11 @@ class HashIndex implements SecondaryIndex {
     // Idempotency: if this docId is already indexed under a DIFFERENT value,
     // remove the stale entry first — add() is safe without a prior remove().
     final existing = _reverse[docId];
-    if (existing != null && !_equals(existing, fieldValue)) {
+    if (existing != null) {
+      // _reverse holds docId exactly while it sits in a bucket, so this
+      // O(1) check replaces the old `docIds.contains()` — a linear scan
+      // that made indexing a low-cardinality field O(n²).
+      if (_equals(existing, fieldValue)) return; // already indexed
       remove(docId, existing);
     }
 
@@ -92,12 +99,10 @@ class HashIndex implements SecondaryIndex {
     // Check if value already exists in bucket
     for (final entry in bucket) {
       if (_equals(entry.value, fieldValue)) {
-        if (!entry.docIds.contains(docId)) {
-          entry.docIds.add(docId);
-          _reverse[docId] = fieldValue;
-          _size++;
-          _allCache = null;
-        }
+        entry.docIds.add(docId);
+        _reverse[docId] = fieldValue;
+        _size++;
+        _allCache = null;
         return;
       }
     }
@@ -248,6 +253,10 @@ class HashIndex implements SecondaryIndex {
   bool _equals(dynamic a, dynamic b) {
     if (identical(a, b)) return true;
     if (a is num && b is num) return a == b;
+    // Same instant, regardless of isUtc: documents are read back with UTC
+    // DateTimes, so `==` (which also compares isUtc) made an equals() query
+    // with a local DateTime miss documents once they had been rewritten.
+    if (a is DateTime && b is DateTime) return a.isAtSameMomentAs(b);
     if (a.runtimeType != b.runtimeType) return false;
     return a == b;
   }
@@ -394,13 +403,20 @@ class HashIndex implements SecondaryIndex {
       switch (tag) {
         case _tInt:
           // Legacy 32-bit format — read 4 bytes for backward compatibility
-          value = readInt32();
+          // (sign-extended: readInt32() is unsigned on the VM).
+          value = readInt32().toSigned(32);
           break;
         case _tInt64:
           // Current 64-bit format
           final lo = readInt32();
           final hi = readInt32();
-          value = lo | (hi << 32);
+          value = hi.toSigned(32) * 0x100000000 + lo;
+          break;
+        case _tDateTime:
+          final lo = readInt32();
+          final hi = readInt32();
+          value = DateTime.fromMicrosecondsSinceEpoch(hi.toSigned(32) * 0x100000000 + lo,
+              isUtc: bytes[off++] == 1);
           break;
         case _tDouble:
           final bd = ByteData.view(bytes.buffer, bytes.offsetInBytes + off, 8);
@@ -457,6 +473,10 @@ class HashIndex implements SecondaryIndex {
     } else if (v is bool) {
       buf.addByte(_tBool);
       buf.addByte(v ? 1 : 0);
+    } else if (v is DateTime) {
+      buf.addByte(_tDateTime); // DateTime: int64 microseconds + isUtc flag (== needs it)
+      _writeInt64(buf, v.microsecondsSinceEpoch);
+      buf.addByte(v.isUtc ? 1 : 0);
     } else {
       // Fail fast: writing nothing (not even the tag) desynchronizes the
       // reader and corrupts the whole index blob silently.
@@ -472,15 +492,14 @@ class HashIndex implements SecondaryIndex {
     buf.addByte((v >> 24) & 0xFF);
   }
 
+  /// Little-endian int64 as (low uint32, high int32). Computed with `&` and
+  /// `~/` instead of `>> 32` — dart2js shifts are 32-bit, so the old code
+  /// wrote garbage for values >= 2^32 on the web. Same bytes as before on
+  /// the VM.
   void _writeInt64(BytesBuilder buf, int v) {
-    buf.addByte(v & 0xFF);
-    buf.addByte((v >> 8) & 0xFF);
-    buf.addByte((v >> 16) & 0xFF);
-    buf.addByte((v >> 24) & 0xFF);
-    buf.addByte((v >> 32) & 0xFF);
-    buf.addByte((v >> 40) & 0xFF);
-    buf.addByte((v >> 48) & 0xFF);
-    buf.addByte((v >> 56) & 0xFF);
+    final lo = v & 0xFFFFFFFF;
+    _writeInt32(buf, lo);
+    _writeInt32(buf, (v - lo) ~/ 0x100000000);
   }
 }
 

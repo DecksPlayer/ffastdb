@@ -76,7 +76,9 @@ runApp(MyApp(db: db));
 
 > **Web / WASM Security & Storage:**
 > - `useIndexedDb`: Defaults to `true`. Uses browser `IndexedDB` which is more robust and has higher limits than `localStorage`.
-> - `encryptionKey`: If provided, the entire database buffer is obfuscated using a cyclic XOR cipher before being written to the browser storage. This prevents sensitive data from being easily visible in Chrome DevTools or other inspection tools.
+> - `encryptionKey`: If provided, the database is encrypted AND authenticated (AES-256-CTR with a fresh nonce per 1 KB sector + HMAC-SHA256; the password is stretched with PBKDF2-HMAC-SHA256, 100k iterations by default). A wrong key is rejected by `open()`; tampered data fails on read. For strong protection prefer a random 32-byte key from the platform's secure storage via `EncryptedStorageStrategy.withRawKey`. Files encrypted by ffastdb ≤ 0.3.5 keep working in their legacy format (`isLegacyFormat`); migrate them with `exportJson()` → `importJson()` into a new database.
+
+> **App lifecycle:** call `await db.flush()` when the app goes to the background (e.g. `AppLifecycleState.paused`). It persists the secondary indexes, so if the OS then kills the process the next start loads them instead of rebuilding every index from the documents.
 
 > **Note:** `path_provider` is **not** a dependency of `ffastdb` itself — add
 > it only to your app's own `pubspec.yaml` for native targets.
@@ -231,7 +233,7 @@ final ids = await db.insertAll([
 FastDB supports all common Dart and Firebase data types with automatic serialization:
 
 - **Primitives**: `int`, `double`, `String`, `bool`, `null`
-- **Date/Time**: `DateTime` (stored as milliseconds since epoch)
+- **Date/Time**: `DateTime` (stored as UTC microseconds since epoch, read back with `isUtc: true`)
 - **Collections**: `List`, `Map` (with any nesting level)
 - **Binary**: `Uint8List` (stored natively as raw bytes in the main database file)
 - **Firebase types** (via duck-typing, no imports needed):
@@ -239,6 +241,25 @@ FastDB supports all common Dart and Firebase data types with automatic serializa
   - `GeoPoint` → `Map<String, double>` with `latitude`/`longitude`
   - `DocumentReference` → `String` (path)
   - `Blob` → `Uint8List`
+
+Documents are stored in a compact binary format (not JSON). Databases written
+by older versions in the JSON format are read transparently — no migration
+step; documents switch to the binary format as they are rewritten.
+
+### Export / import JSON
+
+To sync with or migrate to/from other document databases, convert at the
+boundary:
+
+```dart
+final json = await db.exportJson();      // JSON array, ascending id order
+final ids  = await other.importJson(json); // inserted as new documents
+```
+
+`exportJson()` maps values onto plain JSON (`DateTime` → ISO-8601 UTC string,
+`Uint8List` → base64, NaN/±Infinity → `null`) and keeps each document's
+`ffdbID`. `importJson()` accepts an array or a single object, drops `ffdbID`
+(this database assigns ids) and keeps the values as plain JSON types.
 
 ```dart
 final doc = {
@@ -452,10 +473,10 @@ final user = await db.findById(id) as User;
 
 ### DateTime fields
 
-`DateTime` is natively supported in both JSON map documents and binary TypeAdapters:
+`DateTime` is natively supported in both map documents and binary TypeAdapters:
 
 ```dart
-// In JSON maps — serialized as millisecondsSinceEpoch automatically
+// In map documents — stored as UTC microseconds, read back with isUtc: true
 await db.insert({'name': 'Alice', 'createdAt': DateTime.now()});
 
 // In TypeAdapters using writeDynamic / readDynamic
@@ -550,7 +571,7 @@ FastDB
     ├── WebStorageStrategy     (In-memory base, no dart:io, safe for web)
     ├── LocalStorageStrategy   (Web JS / WASM — persists in browser localStorage)
     ├── IndexedDbStorageStrategy (Web JS / WASM — persists in browser IndexedDB)
-    └── EncryptedStorageStrategy (Wrapper — XOR obfuscation; see docs for AES guidance)
+    └── EncryptedStorageStrategy (Wrapper — AES-256-CTR + HMAC-SHA256 per 1 KB sector)
 ```
 
 ---

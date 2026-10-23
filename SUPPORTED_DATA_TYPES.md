@@ -204,15 +204,17 @@ await db.insert(complexDoc);
 
 FastDB convierte automáticamente entre tipos cuando es necesario:
 
-1. **Objetos con `toJson()`**: Clases que implementan `toJson()` se serializan automáticamente
+1. **Objetos con `toJson()`**: una clase que implementa `toJson()` y se inserta como documento se guarda como su mapa (los objetos anidados se guardan con `toString()`)
 2. **Firebase types**: Detección por duck-typing (sin imports necesarios)
 3. **Uint8List**: Se almacena de forma nativa como bytes binarios en el archivo principal
 4. **Valores desconocidos**: Se convierten a String con `toString()`
+5. **Claves no String en mapas anidados**: se guardan como String (`{1: 'a'}` → `{'1': 'a'}`)
+6. **NaN / ±Infinity**: se preservan como `double`
 
 ## ⚡ Rendimiento
 
 - **Serialización binaria eficiente**: Tipos nativos (int, double, bool) se serializan directamente en formato binario
-- **Sin overhead JSON**: Los tipos primitivos no pasan por JSON
+- **Sin JSON en disco**: los documentos Map se guardan en un formato binario propio (`DocumentCodec`); las bases escritas en el formato JSON anterior se siguen leyendo. Para interoperar usá `db.exportJson()` / `db.importJson()`
 - **Binarios más compactos**: `Uint8List` evita el overhead de Base64 en la serialización principal
 - **Compatible con Web**: Funciona en Flutter Web sin problemas
 
@@ -225,7 +227,7 @@ FastDB convierte automáticamente entre tipos cuando es necesario:
 | string      | ✅        | UTF-8, Unicode completo                  |
 | char        | ✅        | Como String de longitud 1                |
 | boolean     | ✅        | true/false                               |
-| DateTime    | ✅        | Timestamp con precisión de milisegundos  |
+| DateTime    | ✅        | Microsegundos UTC (ms en TypeAdapters y Web) |
 | timestamp   | ✅        | Como DateTime                            |
 | location    | ✅        | Como Map {latitude, longitude}           |
 | null        | ✅        | Valores nulos                            |
@@ -242,6 +244,6 @@ Ver el archivo [test/data_types_test.dart](test/data_types_test.dart) para ejemp
 
 ## Limitaciones conocidas
 
-- **Enteros > 2^53 en Web**: en dart2js todos los números son IEEE-754 doubles; los `int` con valor absoluto > 9007199254740991 pierden precisión silenciosamente al serializar documentos Map (vía JSON). En VM nativa (Android/iOS/desktop) no aplica. Usa `String` para IDs de 64 bits en Web.
+- **Enteros > 2^53 en Web**: en dart2js todos los números son IEEE-754 doubles, así que un `int` con valor absoluto > 9007199254740991 ya es impreciso en memoria; se guarda como `double`. En VM nativa (Android/iOS/desktop) no aplica (64 bits exactos). Usa `String` para IDs de 64 bits en Web.
 - **DateTime en TypeAdapters**: se almacena como epoch-ms UTC; al leer se reconstruye con `isUtc: true` (la hora local no se preserva, el instante sí).
 

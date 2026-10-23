@@ -1,6 +1,7 @@
 // Public barrel exports — users only need: import 'package:ffastdb/ffastdb.dart';
 export 'src/fastdb.dart';
 export 'src/annotations.dart';
+export 'src/serialization/type_adapter.dart'; // TypeAdapter, BinaryReader, BinaryWriter
 export 'src/ffastdb_singleton.dart';
 export 'src/storage/storage_strategy.dart';
 export 'src/storage/memory_storage_strategy.dart';

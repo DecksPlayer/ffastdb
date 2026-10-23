@@ -141,6 +141,114 @@ void main() {
     });
   });
 
+  group('index persistence', () {
+    final local = DateTime(2024, 3, 4, 5, 6, 7, 8, 9);
+    final utc = DateTime.utc(2023, 1, 2, 3, 4, 5, 6, 7);
+    final values = <dynamic>[-5, -2147483648, 3, -9000000000, local, utc];
+
+    test('SortedIndex round-trips negative ints and DateTimes', () {
+      final idx = SortedIndex('f');
+      for (int i = 0; i < values.length; i++) {
+        idx.add(i + 1, values[i]);
+      }
+      final back = SortedIndex.deserialize(idx.serialize());
+      for (int i = 0; i < values.length; i++) {
+        expect(back.lookup(values[i]), [i + 1], reason: '${values[i]}');
+        expect(back.valueOf(i + 1), values[i]);
+      }
+      expect(back.range(utc, local), [6, 5]);
+    });
+
+    test('HashIndex round-trips DateTimes (keeping isUtc)', () {
+      final idx = HashIndex('f');
+      for (int i = 0; i < values.length; i++) {
+        idx.add(i + 1, values[i]);
+      }
+      final back = HashIndex.deserialize(idx.serialize());
+      for (int i = 0; i < values.length; i++) {
+        expect(back.lookup(values[i]), [i + 1], reason: '${values[i]}');
+      }
+      expect((back.valueOf(5) as DateTime).isUtc, isFalse);
+      expect((back.valueOf(6) as DateTime).isUtc, isTrue);
+    });
+
+    test('BitmaskIndex round-trips negative ints and DateTimes', () {
+      final idx = BitmaskIndex('f');
+      for (int i = 0; i < values.length; i++) {
+        idx.add(i + 1, values[i]);
+      }
+      final back = BitmaskIndex.deserialize(idx.serialize());
+      for (int i = 0; i < values.length; i++) {
+        expect(back.lookup(values[i]), [i + 1], reason: '${values[i]}');
+      }
+    });
+
+    test('insertAll and close work with a SortedIndex on DateTime', () async {
+      final db = FastDB.forTesting(MemoryStorageStrategy())
+        ..addSortedIndex('createdAt');
+      await db.open();
+      final base = DateTime.utc(2024);
+      await db.insertAll([
+        for (int i = 0; i < 10; i++) {'createdAt': base.add(Duration(hours: i))},
+      ]);
+      final ids = await db
+          .query()
+          .where('createdAt')
+          .between(base, base.add(const Duration(hours: 2)))
+          .findIds();
+      expect(ids, [1, 2, 3]);
+      await db.close(); // persisting the index used to throw here
+    });
+  });
+
+  test('deleting a document with a local DateTime clears every index',
+      () async {
+    final db = FastDB.forTesting(MemoryStorageStrategy())
+      ..addIndex('h')
+      ..addSortedIndex('s')
+      ..addCompositeIndex(['h', 'k']);
+    await db.open();
+    addTearDown(db.close);
+    final local = DateTime(2024, 1, 1); // read back from storage as UTC
+    await db.insert({'h': local, 's': local, 'k': 1});
+    await db.update(1, {'k': 2});
+    expect(await db.query().where('h').equals(local).count(), 1);
+    await db.delete(1);
+    expect(await db.query().where('h').equals(local).count(), 0);
+    expect(await db.query().where('s').equals(local).findIds(), isEmpty);
+    expect(
+        await db.query().where('h').equals(local).where('k').equals(2).findIds(),
+        isEmpty);
+  });
+
+  test('auto-compaction fires exactly when the dead ratio reaches the threshold',
+      () async {
+    final storage = MemoryStorageStrategy();
+    final db = FastDB.forTesting(storage, autoCompactThreshold: 0.3);
+    await db.open();
+    addTearDown(db.close);
+    await db.insertAll([for (int i = 0; i < 100; i++) {'n': i, 'pad': 'x' * 64}]);
+    // Interleaved inserts: the cheap estimate must not delay compaction.
+    for (int i = 0; i < 20; i++) {
+      await db.insert({'n': 100 + i, 'pad': 'x' * 64});
+    }
+    int deletes = 0;
+    int? compactedAt;
+    var size = await storage.size;
+    for (int id = 1; id <= 80 && compactedAt == null; id++) {
+      await db.delete(id);
+      deletes++;
+      final newSize = await storage.size;
+      if (newSize < size) compactedAt = deletes;
+      size = newSize;
+    }
+    // dead/(live+dead) with live = 120 - d and dead = d: d / 120 >= 0.3 → d = 36.
+    expect(compactedAt, 36);
+    expect(await db.count(), 120 - 36);
+    expect((await db.findById(37))?['n'], 36);
+    expect((await db.findById(120))?['n'], 119);
+  });
+
   group('updateWhere', () {
     late FastDB db;
 

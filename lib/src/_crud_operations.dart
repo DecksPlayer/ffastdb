@@ -43,11 +43,11 @@ class _CrudOperations {
       }
 
       if (doc is Map) _db._indexDocument(id, Map<String, dynamic>.from(doc));
-      if (!_db._batchMode) {
-        _db._queryCache.clear();
-        _db._notifyWatchers(doc);
-      }
+      // Always: a query inside a transaction/batch must see this write.
+      _db._queryCache.clear();
+      if (!_db._batchMode) _db._notifyWatchers(doc);
       if (hasWal) await wal.commit();
+      _db._adjustLiveCount(1);
       return id;
     } catch (e) {
       if (hasWal) await wal.rollback();
@@ -64,6 +64,9 @@ class _CrudOperations {
           id, 'id', 'FastDB ids must be >= 1 (ids <= 0 are not reachable by queries)');
     }
     final oldOffset = await _db._primaryIndex.search(id);
+    // A pending batch insert of the same id is not in the B-Tree yet.
+    final existed = oldOffset != null ||
+        (_db._liveCount != null && _db._batchEntries.any((e) => e.key == id));
 
     final wal = _db._wal;
     final hasWal = !_db._inTransaction && !_db._batchMode && wal != null;
@@ -104,6 +107,7 @@ class _CrudOperations {
       _db._queryCache.clear();
       _db._notifyWatchers(value);
       if (hasWal) await wal.commit();
+      if (!existed) _db._adjustLiveCount(1);
     } catch (e) {
       if (hasWal) await wal.rollback();
       rethrow;
@@ -141,6 +145,8 @@ class _CrudOperations {
       await _db._primaryIndex.insert(id, offset);
       await _db._syncDataOffset(data.length);
       _db._indexDocument(id, Map<String, dynamic>.from(merged));
+      // Always: a query inside a transaction/batch must see this write.
+      _db._queryCache.clear();
 
       if (!_db._batchMode) {
         // Header FIRST so it is durable in the same flush (see insertImpl).
@@ -150,7 +156,6 @@ class _CrudOperations {
           await targetStorage.flush();
           if (_db.dataStorage != null) await _db.storage.flush();
         }
-        _db._queryCache.clear();
         _db._notifyWatchers(merged);
       }
       if (hasWal) await wal.commit();
@@ -182,6 +187,8 @@ class _CrudOperations {
         }
       }
       _db._deletedCount++;
+      // Always: a query inside a transaction/batch must see this write.
+      _db._queryCache.clear();
       if (!_db._batchMode) {
         // Header FIRST, then flush: delete must be durable on storages with
         // explicit flush (IndexedDB) — previously it never flushed here and a
@@ -193,10 +200,10 @@ class _CrudOperations {
           await targetStorage.flush();
           if (_db.dataStorage != null) await _db.storage.flush();
         }
-        _db._queryCache.clear();
         _db._notifyWatchers(doc);
       }
       if (hasWal) await wal.commit();
+      _db._adjustLiveCount(-1);
       if (_db._autoCompactThreshold > 0 && !_db._inTransaction && !_db._batchMode) {
         await _db._maybeAutoCompact();
       }

@@ -61,6 +61,10 @@ class CompositeIndex extends SecondaryIndex {
         sb.write('D$v;');
       } else if (v is bool) {
         sb.write(v ? 'T;' : 'F;');
+      } else if (v is DateTime) {
+        // By instant (local and UTC of the same moment are equal) and typed
+        // (toString() collided with a String of the same text).
+        sb.write('M${v.microsecondsSinceEpoch};');
       } else {
         final s = v.toString();
         sb.write('S${s.length}:$s;');
@@ -178,7 +182,8 @@ class CompositeIndex extends SecondaryIndex {
   /// Format magic: [0xC1, major]. Blobs without this magic (pre-v2 format,
   /// which serialized ambiguous `join('|')` keys) are rejected so that
   /// `_loadIndexes` discards them and they get rebuilt with collision-free keys.
-  static const List<int> _kMagic = [0xC1, 0x02];
+  /// v3: DateTime keys encoded by instant ('M') instead of toString().
+  static const List<int> _kMagic = [0xC1, 0x03];
 
   Uint8List serialize() {
     final buf = BytesBuilder();

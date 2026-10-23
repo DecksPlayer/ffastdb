@@ -5,27 +5,27 @@ import 'package:test/test.dart';
 void main() {
   group('FTS Persistence', () {
     const dbPath = 'test_fts_persist';
-    
-    tearDown(() async {
-      await FfastDb.disposeInstance();
-      for (final ext in ['.fdb', '.fidx', '.fdb.wal', '.fdb.lock', '.fdb.port']) {
-        final f = File('$dbPath$ext');
-        if (f.existsSync()) f.deleteSync();
-      }
-    });
+    // A fresh temp dir per test — NOT the working directory: the repo lives
+    // in a synced folder (OneDrive) whose client briefly locks newly created
+    // files, which made the old cwd-based cleanup fail intermittently.
+    late Directory dir;
 
     setUp(() async {
       await FfastDb.disposeInstance();
-      for (final ext in ['.fdb', '.fidx', '.fdb.wal', '.fdb.lock', '.fdb.port']) {
-        final f = File('$dbPath$ext');
-        if (f.existsSync()) f.deleteSync();
-      }
+      dir = Directory.systemTemp.createTempSync('ffastdb_persist_');
+    });
+
+    tearDown(() async {
+      await FfastDb.disposeInstance();
+      try {
+        dir.deleteSync(recursive: true);
+      } catch (_) {}
     });
 
     test('FTS index survives restart', () async {
       // 1. Open and populate
       {
-        final db = await openDatabase(dbPath, ftsIndexes: ['content']);
+        final db = await openDatabase(dbPath, directory: dir.path, ftsIndexes: ['content']);
         await db.insert({'content': 'The quick brown fox'});
         await db.insert({'content': 'Jumps over the lazy dog'});
         
@@ -38,7 +38,7 @@ void main() {
       // 2. Reopen and query
       {
         // Registering it in openDatabase allows loadIndexes to populate it
-        final db = await openDatabase(dbPath, ftsIndexes: ['content']);
+        final db = await openDatabase(dbPath, directory: dir.path, ftsIndexes: ['content']);
         
         final results = await db.query().where('content').fts('lazy').findIds();
         expect(results.length, 1, reason: 'FTS data should have been loaded from disk');
@@ -49,7 +49,7 @@ void main() {
 
     test('Composite index survives restart', () async {
       {
-        final db = await openDatabase(dbPath, compositeIndexes: [['city', 'status']]);
+        final db = await openDatabase(dbPath, directory: dir.path, compositeIndexes: [['city', 'status']]);
         await db.insert({'city': 'London', 'status': 'active'});
         
         final results = await db.query()
@@ -61,7 +61,7 @@ void main() {
       }
 
       {
-        final db = await openDatabase(dbPath, compositeIndexes: [['city', 'status']]);
+        final db = await openDatabase(dbPath, directory: dir.path, compositeIndexes: [['city', 'status']]);
         
         final results = await db.query()
             .where('city').equals('London')

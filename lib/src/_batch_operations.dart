@@ -39,15 +39,21 @@ class _BatchOperations {
       for (int i = 0; i < docs.length; i += chunkSize) {
         final end = (i + chunkSize < docs.length) ? i + chunkSize : docs.length;
         
-        // 1. Write data and collect batch entries for this chunk
+        // 1. Serialize the chunk's documents back to back and write them
+        //    with ONE call (was one write per document — every storage pays
+        //    per-call overhead, and EncryptedStorageStrategy re-sealed each
+        //    shared sector once per document).
+        final chunkStart = _db._dataOffset;
+        final buffer = BytesBuilder(copy: false);
         for (int j = i; j < end; j++) {
           final data = _db._serialize(docs[j], id: ids[j]);
-          final offset = _db._dataOffset;
-          if (!targetStorage.writeSync(offset, data)) {
-            await targetStorage.write(offset, data);
-          }
-          _db._batchEntries.add(MapEntry(ids[j], offset));
+          _db._batchEntries.add(MapEntry(ids[j], _db._dataOffset));
           _db._dataOffset += data.length;
+          buffer.add(data);
+        }
+        final chunkBytes = buffer.takeBytes();
+        if (!targetStorage.writeSync(chunkStart, chunkBytes)) {
+          await targetStorage.write(chunkStart, chunkBytes);
         }
 
         // 2. Load chunk into primary index
@@ -94,6 +100,7 @@ class _BatchOperations {
       
       await _db._syncDataOffset(0);
       
+      _db._adjustLiveCount(docs.length);
       // Notify watchers ONCE at the end of the entire batch
       _db._notifyWatchersBatch();
     } catch (e) {

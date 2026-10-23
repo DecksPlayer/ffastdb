@@ -7,13 +7,14 @@ class TypeRegistry {
   final Map<Type, int> _typeToId = {};
 
   void registerAdapter<T>(TypeAdapter<T> adapter) {
-    // 0x0100 (256) is reserved: its serialized payload begins with the bytes
-    // 0x00 0x01 — the FastSerializer magic prefix — which would misroute the
-    // document to the Map deserializer on read.
-    if (adapter.typeId == 0x0100) {
+    // 0x0100 (256) and 0x0200 (512) are reserved: their serialized payloads
+    // begin with the bytes 0x00 0x01 / 0x00 0x02 — the Map document magic
+    // prefixes (JSON v1 / binary v2) — which would misroute the object to
+    // the Map decoder on read.
+    if (adapter.typeId == 0x0100 || adapter.typeId == 0x0200) {
       throw ArgumentError(
-          'typeId 256 (0x0100) is reserved (collides with the FastSerializer '
-          'magic prefix). Choose a different typeId.');
+          'typeId ${adapter.typeId} is reserved (collides with a document '
+          'format magic prefix). Choose a different typeId.');
     }
     if (_adapters.containsKey(adapter.typeId)) {
       final existing = _adapters[adapter.typeId]!;
