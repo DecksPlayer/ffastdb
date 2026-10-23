@@ -48,12 +48,6 @@ class _CrudOperations {
         _db._notifyWatchers(doc);
       }
       if (hasWal) await wal.commit();
-      // Log AFTER commit: if the process dies between log() and commit(),
-      // _replayOpLog() would re-insert an operation that never completed.
-      if (!_db._inTransaction && !_db._batchMode && !_db._isReplayingOpLog) {
-        await _db._opLog.log('insert', id: id, data: doc);
-      }
-      if (!_db._inTransaction && !_db._batchMode) await _db._opLog.maybeCheckpoint();
       return id;
     } catch (e) {
       if (hasWal) await wal.rollback();
@@ -110,11 +104,6 @@ class _CrudOperations {
       _db._queryCache.clear();
       _db._notifyWatchers(value);
       if (hasWal) await wal.commit();
-      // Log AFTER commit (see insertImpl for rationale).
-      if (!_db._inTransaction && !_db._batchMode && !_db._isReplayingOpLog) {
-        await _db._opLog.log('put', id: id, data: value);
-      }
-      if (!_db._inTransaction && !_db._batchMode) await _db._opLog.maybeCheckpoint();
     } catch (e) {
       if (hasWal) await wal.rollback();
       rethrow;
@@ -165,11 +154,6 @@ class _CrudOperations {
         _db._notifyWatchers(merged);
       }
       if (hasWal) await wal.commit();
-      // Log AFTER commit (see insertImpl for rationale).
-      if (!_db._inTransaction && !_db._batchMode && !_db._isReplayingOpLog) {
-        await _db._opLog.log('update', id: id, data: fields);
-      }
-      if (!_db._inTransaction && !_db._batchMode) await _db._opLog.maybeCheckpoint();
       return true;
     } catch (e) {
       if (hasWal) await wal.rollback();
@@ -213,11 +197,6 @@ class _CrudOperations {
         _db._notifyWatchers(doc);
       }
       if (hasWal) await wal.commit();
-      // Log AFTER commit (see insertImpl for rationale).
-      if (!_db._inTransaction && !_db._batchMode && !_db._isReplayingOpLog) {
-        await _db._opLog.log('delete', id: id);
-      }
-      if (!_db._inTransaction && !_db._batchMode) await _db._opLog.maybeCheckpoint();
       if (_db._autoCompactThreshold > 0 && !_db._inTransaction && !_db._batchMode) {
         await _db._maybeAutoCompact();
       }

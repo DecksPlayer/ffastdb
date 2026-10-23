@@ -358,9 +358,9 @@ graph TD
 
 ---
 
-### 34. `OperationLog` & `LoggedOp`
+### 34. `deleteLegacyOperationLog`
 * **Ubicación:** [`lib/src/storage/operation_log.dart`](file:///c:/Users/gonoj/OneDrive/Documentos/GitHub/fastdb/lib/src/storage/operation_log.dart)
-* **Descripción:** Registro cronológico de operaciones escritas para auditoría, replicación o reconstrucción.
+* **Descripción:** El operation log fue eliminado (el WAL ya garantiza durabilidad y el replay reaplicaba operaciones viejas). Solo queda esta función, que borra el `.fdb.log` de versiones ≤ 0.3.5 al abrir.
 
 ---
 

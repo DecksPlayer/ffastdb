@@ -65,19 +65,30 @@ class _StorageManager {
     final meta = await _db.storage.read(16, 8);
     final prevOffset = _db._readInt32(meta, 0);
     final prevLen = _db._readInt32(meta, 4);
+    final currentSize = await _db.storage.size;
     final int writeOffset;
     if (prevOffset > 0 && prevLen > 0 && payload.length <= prevLen) {
       writeOffset = prevOffset;
     } else {
       // Round up to next page boundary to keep B-Tree pages aligned if they grow later
-      final currentSize = await _db.storage.size;
       writeOffset = ((currentSize + PageManager.pageSize - 1) ~/ PageManager.pageSize) * PageManager.pageSize;
     }
     await _db.storage.write(writeOffset, payload);
-    // Update data offset so subsequent writes (docs/more indexes) don't overlap
-    _db._dataOffset = writeOffset + payload.length;
-    if (prevOffset > 0 && prevLen > 0 && writeOffset == prevOffset && payload.length < prevLen) {
+    // Reclaim the tail ONLY when the previous blob was the last thing in the
+    // file. Documents and B-Tree pages appended after it (the normal case
+    // once the database is reopened) live past prevOffset + prevLen —
+    // truncating unconditionally destroyed them whenever the index shrank.
+    if (writeOffset == prevOffset &&
+        payload.length < prevLen &&
+        prevOffset + prevLen >= currentSize) {
       await _db.storage.truncate(writeOffset + payload.length);
+    }
+    // Single-file mode: documents share this file — the next one must land
+    // after the blob. In dual-file mode _dataOffset is an offset into
+    // dataStorage and must not be touched (it used to be overwritten with
+    // this file's offset, so the next insert clobbered existing documents).
+    if (_db.dataStorage == null) {
+      _db._dataOffset = _db.storage.sizeSync ?? await _db.storage.size;
     }
     final header = Uint8List(8);
     _db._writeInt32(header, 0, writeOffset);
@@ -171,23 +182,31 @@ class _StorageManager {
 
     if (_db.dataStorage != null) {
       // ── OOM-Safe Streaming Compaction (Dual-file mode) ────────────────────
-      // We can overwrite the data file safely because the B-Tree index is in a 
-      // separate file (storage). This allows us to process documents one by one
-      // without buffering them all in RAM.
-      
-      // 1. Get current offsets for all IDs to ensure we don't need the B-Tree nodes 
-      // during the write phase? No, findById already does that.
-      // Since dataStorage != storage, writing to dataStorage is always safe.
-      
+      // The B-Tree lives in a separate file, so the data file is compacted in
+      // place one record at a time, without buffering every document in RAM.
+      //
+      // Records MUST be visited in ascending OFFSET order (not id order) and
+      // copied byte-for-byte: then writePos never passes the start of a
+      // record that has not been read yet (memmove-style left shift).
+      // Visiting by id overwrote unread records whenever an updated document
+      // (relocated to the end of the file) had a low id.
+      final entries = await _db._primaryIndex.rangeSearchEntries(1, _db._nextId - 1);
+      entries.sort((a, b) => a.value.compareTo(b.value));
+
       int writePos = 0;
-      for (int i = 0; i < allIds.length; i++) {
-        final id = allIds[i];
-        final doc = await _db._findById(id);
-        if (doc != null) {
-          final data = _db._serialize(doc, id: id);
-          await _db.dataStorage!.write(writePos, data);
-          await _db._primaryIndex.insert(id, writePos);
-          writePos += data.length;
+      for (int i = 0; i < entries.length; i++) {
+        final e = entries[i];
+        final raw = await _db._readRawAt(e.value);
+        if (raw != null) {
+          if (writePos != e.value) {
+            await _db.dataStorage!.write(writePos, raw);
+            await _db._primaryIndex.insert(e.key, writePos);
+          }
+          writePos += raw.length;
+        } else {
+          // Unreadable record: its old offset is about to be overwritten, so
+          // the entry would resolve to some OTHER document — drop it.
+          await _db._primaryIndex.delete(e.key);
         }
         if (i > 0 && i % 250 == 0) await Future.delayed(Duration.zero);
       }
@@ -296,7 +315,6 @@ class _StorageManager {
       await saveHeader();
       await _db.storage.flush();
       if (_db.dataStorage != null) await _db.dataStorage!.flush();
-      await _db._opLog.clear();
       _db._queryCache.clear();
       if (!_db._inTransaction && wal != null) await wal.commit();
       _db._notifyWatchersBatch();

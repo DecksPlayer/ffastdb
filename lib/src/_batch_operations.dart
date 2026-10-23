@@ -26,6 +26,9 @@ class _BatchOperations {
     // Save B-Tree state so a failed batch can be rolled back in memory too
     // (the WAL rollback only discards the on-disk writes).
     final savedRoot = _db._primaryIndex.rootPage;
+    // bulkLoad() frees the replaced tree's pages — on rollback that tree is
+    // live again, so its pages must leave the free list.
+    final savedFreeList = _db._pageManager.snapshotFreeList();
 
     try {
       if (!_db._inTransaction && _db._wal != null) await _db._wal!.beginTransaction();
@@ -103,6 +106,7 @@ class _BatchOperations {
       _db._pageManager.clearDirtyPages();
       _db._pageManager.clearLruCache();
       _db._primaryIndex.rootPage = savedRoot;
+      _db._pageManager.restoreFreeList(savedFreeList);
       _db._primaryIndex.clearNodeCache();
       // Revert _nextId so failed batch IDs are not burned... unless the batch
       // ran inside a transaction, which manages its own rollback.

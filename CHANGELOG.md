@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Fixed — data loss / corruption
+
+- **`delete(id)` could remove a DIFFERENT document.** The B-Tree used CLRS deletion (replace an internal key with its predecessor, then delete the predecessor), but leaves are B+ style and internal keys are routing copies — deleting an id equal to a leaf separator (e.g. the first id of any leaf after `insertAll`) removed its predecessor's document and left the target in place. Deletion now always descends to the leaf.
+- **Closing the database could truncate documents written in that session.** `saveIndexes()` truncated the file to the end of the index blob whenever the blob shrank, even when documents and B-Tree pages had been appended after it (the normal case after a reopen). It now truncates only when the blob was the last thing in the file.
+- **Dual-file mode (`dataStorage`): the first insert after `insertAll` overwrote an existing document.** `saveIndexes()` set the data-file write offset to an offset of the index file.
+- **Dual-file mode: `compact()` corrupted documents after any `update()`.** It rewrote records in id order, overwriting not-yet-read records whenever an updated (relocated) document had a low id. Records are now copied byte-for-byte in ascending offset order.
+- **Rolling back a transaction (or a failed `insertAll`) could corrupt the B-Tree.** Pages freed during the aborted operation stayed in the free-page list although the rollback made them live again, so later allocations overwrote live nodes. The free list is now restored on rollback.
+- **`updateWhere()` deadlocked on any condition over an unindexed field** — the query re-entered the write lock it was already holding. A Dart program left with nothing else to do exits silently in that state, so every later write was lost.
+
+### Removed
+
+- **The sequential operation log (`<db>.fdb.log`).** On open it replayed single-document operations on top of the newer WAL-recovered state; transactions and batch writes were never logged, so after an unclean shutdown (the normal way a mobile app ends) deleted documents came back and updates were reverted. It also stored documents in plaintext next to encrypted databases. The WAL already makes every committed write durable. A leftover `.fdb.log` is deleted on open.
+
 ## 0.3.5
 
 ### Fixed — performance

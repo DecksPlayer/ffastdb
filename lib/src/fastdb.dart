@@ -73,15 +73,13 @@ class FastDB {
   // Reactive watchers: field → StreamController
   final Map<String, StreamController<List<int>>> _watchers = {};
 
-  late final OperationLog _opLog;
+  /// Path of the operation log written by ffastdb <= 0.3.5, deleted at open()
+  /// (see [deleteLegacyOperationLog]). Null when not backed by a file.
+  String? _legacyLogPath;
 
   bool _batchMode = false;
   bool _inTransaction = false;
   int _nextId = 1;
-
-  /// True while replaying the operation log at open() — replayed operations
-  /// must not be logged again (nor checkpoint the log they are reading).
-  bool _isReplayingOpLog = false;
 
   /// Whether this database instance has been closed.
   /// Used to prevent operations on a closed database, especially important
@@ -139,7 +137,7 @@ class FastDB {
   ///
   /// The stack may be wrapped (e.g. `EncryptedStorageStrategy(WalStorageStrategy(...))`),
   /// so we unwrap layers via [StorageStrategy.innerStorage] — same traversal as
-  /// the `_opLog` path resolution in the constructor. Without this, a wrapped
+  /// the legacy log path resolution in the constructor. Without this, a wrapped
   /// WAL is silently not detected: every internal write opens its own
   /// auto-transaction (no atomicity, ~2.5x fsyncs, non-atomic compact()).
   WalStorageStrategy? get _wal {
@@ -166,18 +164,16 @@ class FastDB {
     _pageManager = PageManager(storage, cacheCapacity: cacheCapacity);
     _primaryIndex = BTree(_pageManager);
 
-    // Initialize sequential operation log.
-    // Ensure the log is in the same directory as the main DB file.
-    String? logPath;
+    // Locate a leftover operation log from ffastdb <= 0.3.5 (next to the
+    // main DB file) so open() can delete it.
     StorageStrategy? current = storage;
     while (current != null) {
       if (current is IoStorageStrategy) {
-        logPath = '${current.path}.log';
+        _legacyLogPath = '${current.path}.log';
         break;
       }
       current = current.innerStorage;
     }
-    _opLog = logPath == null ? OperationLog.disabled() : OperationLog(logPath);
 
     // Initialize helper classes for modularized operations
     _crudOps = _CrudOperations(this);
@@ -387,7 +383,8 @@ class FastDB {
 
     _schemaVersion = version;
     await storage.open();
-    await _opLog.open();
+    final legacyLog = _legacyLogPath;
+    if (legacyLog != null) await deleteLegacyOperationLog(legacyLog);
 
     if (!storage.needsExplicitFlush) _pageManager.writeBehind = true;
 
@@ -467,58 +464,6 @@ class FastDB {
         await _saveHeader();
       });
     }
-
-    // RECOVERY: Replay any pending operations from the sequential log.
-    await _replayOpLog();
-  }
-
-  Future<void> _replayOpLog() async {
-    final ops = await _opLog.readAll();
-    if (ops.isEmpty) return;
-
-    _isReplayingOpLog = true;
-    try {
-      for (final op in ops) {
-        try {
-          switch (op.type) {
-            case 'insert':
-              // Use put to ensure the same ID is reused if possible, or just insert
-              if (op.id != null) {
-                await _putImpl(op.id!, op.data);
-              } else {
-                await _crudOps.insertImpl(op.data);
-              }
-              break;
-            case 'put':
-              await _putImpl(op.id!, op.data);
-              break;
-            case 'update':
-              await _crudOps.updateImpl(
-                op.id!,
-                op.data as Map<String, dynamic>,
-              );
-              break;
-            case 'delete':
-              await _crudOps.deleteImpl(op.id!);
-              break;
-          }
-        } catch (e, st) {
-          // Skip failed replays so a single bad entry doesn't block startup.
-          // Log the failure in debug mode for diagnostics.
-          assert(() {
-            // ignore: avoid_print
-            print(
-              '[ffastdb] Warning: replay of ${op.type}(id=${op.id}) '
-              'failed and was skipped: $e\n$st',
-            );
-            return true;
-          }());
-        }
-      }
-    } finally {
-      _isReplayingOpLog = false;
-    }
-    await _opLog.clear();
   }
 
   /// Closes the database and releases all resources.
@@ -554,14 +499,6 @@ class FastDB {
         try {
           await dataStorage?.flush();
           await dataStorage?.close();
-        } catch (_) {}
-        // Clean shutdown: everything is durable — clear the operation log so
-        // the next open() has nothing to replay (replays after a CLEAN close
-        // would redo already-applied operations, clobbering e.g. migrations).
-        // On a failed close the log is left in place so it can be replayed.
-        try {
-          if (closeError == null) await _opLog.clear();
-          await _opLog.close();
         } catch (_) {}
         final watchersCopy = _watchers.values.toList();
         _watchers.clear();
@@ -668,8 +605,11 @@ class FastDB {
     FutureOr<List<int>> Function(QueryBuilder q) queryFn,
     Map<String, dynamic> fields,
   ) => _exclusive(() async {
+    // Internal (lock-free) lookups: the public findById/rangeSearch re-enter
+    // _exclusive() and wait on the lock this call already holds — a deadlock
+    // for any condition on an unindexed field (full-scan fallback).
     final ids = await queryFn(
-      QueryBuilder(_secondaryIndexes, findById, rangeSearch, null, _queryCache),
+      QueryBuilder(_secondaryIndexes, _findById, _rangeSearch, null, _queryCache),
     );
     if (ids.isEmpty) return 0;
 
@@ -744,6 +684,7 @@ class FastDB {
       // they are committed state and must not join (and be lost with) a
       // possible rollback.
       await _pageManager.flushDirty();
+      final savedFreeList = _pageManager.snapshotFreeList();
       if (wal != null) await wal.beginTransaction();
 
       try {
@@ -765,6 +706,8 @@ class FastDB {
         _batchMode = false;
         _pageManager.clearDirtyPages();
         _pageManager.clearLruCache();
+        // Pages freed inside the tx belong to the tree restored above.
+        _pageManager.restoreFreeList(savedFreeList);
         _primaryIndex.clearNodeCache();
         _queryCache.clear();
         // Roll back SECONDARY indexes too: aborted operations already mutated

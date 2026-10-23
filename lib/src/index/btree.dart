@@ -424,8 +424,10 @@ class BTree {
 
   // ─── Delete ──────────────────────────────────────────────────────────────
 
-  /// Deletes [key] from the B-Tree using full CLRS-style deletion:
-  /// - Internal-node separators are replaced with in-order predecessor/successor.
+  /// Deletes [key] from the B-Tree (B+ style):
+  /// - Entries live ONLY in leaves; internal keys are routing copies, so the
+  ///   delete always descends to the leaf and leaves separators untouched
+  ///   (a separator whose key was deleted is still a valid routing bound).
   /// - Children are rebalanced (borrow from sibling or merge) before descending
   ///   so no node is left under-full.
   /// - An empty internal root is collapsed to its sole child.
@@ -451,68 +453,32 @@ class BTree {
 
   Future<void> _delete(int pageIdx, int key) async {
     final node = await _readNode(pageIdx);
-    int i = _lowerBound(node.keys, key);
 
-    if (i < node.keys.length && node.keys[i] == key) {
-      if (node.isLeaf) {
-        // Case 1: key lives in this leaf — remove directly.
+    if (node.isLeaf) {
+      final i = _lowerBound(node.keys, key);
+      if (i < node.keys.length && node.keys[i] == key) {
         node.keys.removeAt(i);
         node.values.removeAt(i);
         await _writeNode(node);
-      } else {
-        // Case 2: key is a separator in an internal node.
-        final leftChild  = await _readNode(node.values[i]);
-        final rightChild = await _readNode(node.values[i + 1]);
-
-        if (leftChild.keys.length >= kBTreeOrder) {
-          // Case 2a: replace with in-order predecessor (max of left subtree).
-          final pred = await _getPredecessor(node.values[i]);
-          node.keys[i] = pred;
-          await _writeNode(node);
-          await _delete(node.values[i], pred);
-        } else if (rightChild.keys.length >= kBTreeOrder) {
-          // Case 2b: replace with in-order successor (min of right subtree).
-          final succ = await _getSuccessor(node.values[i + 1]);
-          node.keys[i] = succ;
-          await _writeNode(node);
-          await _delete(node.values[i + 1], succ);
-        } else {
-          // Case 2c: both children at minimum — merge, then delete from merged node.
-          await _merge(node, i);
-          // After merge, node.values[i] is the merged child; key is now inside it.
-          await _delete(node.values[i], key);
-        }
       }
-    } else if (!node.isLeaf) {
-      // Key not in this node — descend into child i.
-      // Ensure the child has strictly more than the minimum keys so it can
-      // absorb a deletion without going under-full.
-      final child = await _readNode(node.values[i]);
-      if (child.keys.length < kBTreeOrder) {
-        i = await _fill(node, i);
-      }
-      // _fill mutates `node` in-place; no re-read needed.
-      await _delete(node.values[i], key);
+      return; // leaf and key not found — nothing to delete.
     }
-    // else: leaf and key not found — nothing to delete.
-  }
 
-  /// Returns the largest key in the subtree rooted at [pageIdx].
-  Future<int> _getPredecessor(int pageIdx) async {
-    var node = await _readNode(pageIdx);
-    while (!node.isLeaf) {
-      node = await _readNode(node.values.last);
+    // Internal node: route exactly like search()/insert() — a key EQUAL to a
+    // separator lives in the RIGHT subtree (leaf splits keep the median in
+    // the right leaf). The old CLRS case "key found in internal node →
+    // replace with predecessor and delete that" assumed internal keys are
+    // real entries; here they are copies, so it deleted the predecessor's
+    // document instead and left [key] in place.
+    int i = _upperBound(node.keys, key);
+    // Ensure the child has strictly more than the minimum keys so it can
+    // absorb a deletion without going under-full.
+    final child = await _readNode(node.values[i]);
+    if (child.keys.length < kBTreeOrder) {
+      i = await _fill(node, i);
     }
-    return node.keys.last;
-  }
-
-  /// Returns the smallest key in the subtree rooted at [pageIdx].
-  Future<int> _getSuccessor(int pageIdx) async {
-    var node = await _readNode(pageIdx);
-    while (!node.isLeaf) {
-      node = await _readNode(node.values.first);
-    }
-    return node.keys.first;
+    // _fill mutates `node` in-place; no re-read needed.
+    await _delete(node.values[i], key);
   }
 
   /// Ensures [parent.values[childIdx]] has at least [kBTreeOrder] keys by

@@ -133,6 +133,20 @@ class PageManager {
     _freeListDirty = true;
   }
 
+  /// Copy of the free list, taken before a transaction/batch so a rollback
+  /// can [restoreFreeList]. Pages freed by the aborted operation (merges,
+  /// bulkLoad rebuilds) belong to the tree that the rollback makes live
+  /// again — leaving them in the list let allocatePage() hand out live pages.
+  List<int> snapshotFreeList() => List<int>.of(_freePages);
+
+  /// Restores a list taken with [snapshotFreeList] (rollback path).
+  void restoreFreeList(List<int> snapshot) {
+    _freePages
+      ..clear()
+      ..addAll(snapshot);
+    _freeListDirty = true;
+  }
+
   /// Clears the free list (used by compact(), which rebuilds the file).
   void clearFreeList() {
     if (_freePages.isEmpty) return;

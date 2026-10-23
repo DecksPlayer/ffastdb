@@ -114,7 +114,7 @@ El ciclo de inicialización dentro de [`FastDB.open()`](file:///c:/Users/gonoj/O
 2. **Validación Magic Bytes:** Comprueba que los bytes `0..3` coincidan con `"FDB2"` (`[70, 68, 66, 50]`).
 3. **Carga del Nodo Raíz B-Tree:** Recupera el número de página raíz (bytes `4..7`), `_nextId` (bytes `8..11`) y `_schemaVersion` (bytes `12..15`).
 4. **Carga de Lista de Páginas Libres (Free-List):** Carga los punteros a páginas liberadas desde los bytes `24+` del archivo principal.
-5. **Replay del OperationLog / WAL:** Si existían escrituras no consolidadas en el WAL o en el `OperationLog`, se reproducen para garantizar la atomicidad tras un cierre inesperado.
+5. **Recuperación del WAL:** Al abrir el storage, las transacciones confirmadas en el WAL se reaplican y las incompletas se descartan. Si existe un `.fdb.log` de versiones ≤ 0.3.5 se borra (el operation log fue eliminado: reaplicaba operaciones viejas sobre el estado más nuevo).
 6. **Deserialización de Índices Secundarios:** Lee la sección de metadatos de índices (offset 16-23) y reconstruye los objetos [`SecondaryIndex`](file:///c:/Users/gonoj/OneDrive/Documentos/GitHub/fastdb/lib/src/index/secondary_index.dart) persistidos.
 7. **Reconstrucción Automática (Reindex):** Si el usuario registró un nuevo índice que no estaba persistido en disco, se ejecuta un re-escaneo para construir e indexar los registros existentes.
 
