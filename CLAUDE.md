@@ -46,11 +46,12 @@ lib/
     ├── _batch_operations.dart        ← insertAll, batch mode (part file)
     ├── _index_manager.dart           ← addIndex, reindex (part file)
     ├── _storage_manager.dart         ← compact, migrations (part file)
+    ├── _json_operations.dart         ← exportJson / importJson (part file)
     ├── ffastdb_singleton.dart        ← top-level ffastdb singleton
     ├── annotations.dart
     ├── query/fast_query.dart         ← QueryBuilder with CBO + cache
     ├── index/                        ← HashIndex, SortedIndex, BitmaskIndex, FtsIndex, CompositeIndex, BTree
-    ├── serialization/                ← TypeAdapter, FastSerializer, BinaryIO
+    ├── serialization/                ← DocumentCodec (binary docs), TypeAdapter, BinaryIO, FastSerializer (legacy JSON reader)
     └── storage/
         ├── storage_strategy.dart     ← abstract interface
         ├── io/io_storage_strategy.dart
@@ -219,21 +220,11 @@ dart analyze
 
 ---
 
-## Known Bugs — Do NOT Work Around These, Fix at Source
+## Bugs — Fix at Source, Never Work Around
 
-> **Resueltos (2026-07-27):** los 4 bugs de esta tabla ya están corregidos en el código
-> (deleteImpl notifica watchers, isNull usa complemento, FTS retainAll usa Set, QueryCache
-> es por instancia). La auditoría completa y el estado de todas las correcciones están en
-> [`FIX_PLAN.md`](FIX_PLAN.md).
-
-| Bug | Location | Estado |
-|-----|----------|--------|
-| `deleteImpl` no llamaba `_notifyWatchers` | `_crud_operations.dart` | ✅ Corregido |
-| `isNull()` devolvía `[]` | `fast_query.dart` | ✅ Corregido |
-| `FtsIndex.retainAll(List)` era O(n×m) | `fts_index.dart` | ✅ Corregido (Set postings) |
-| `QueryCache` era `static` (global) | `fast_query.dart` | ✅ Corregido (instancia por FastDB) |
-
-See `BUGS.md` for full reproduction and fix details.
+Every fixed bug gets a regression test that fails without the fix (see
+`test/data_integrity_regression_test.dart`, `test/concurrency_rollback_test.dart`,
+`test/durability_test.dart`). History of fixes: `CHANGELOG.md`.
 
 ---
 
@@ -244,8 +235,9 @@ See `BUGS.md` for full reproduction and fix details.
 3. **`compositeIndex`** for multi-field AND — eliminates intersection cost.
 4. **`sortedIndex`** is required for efficient `.sortBy()`.
 5. **Run `explain()`** during development to verify index usage.
-6. **`autoCompactThreshold: 0.3`** for delete-heavy workloads.
-7. Never call `reindex()` on every app start — trust clean-shutdown index persistence.
+6. **`autoCompactThreshold: 0.3`** for delete-heavy workloads (default `0` = off).
+7. Never call `reindex()` on every app start — trust index persistence; apps should call `db.flush()` on `AppLifecycleState.paused`.
+8. `openDatabase()` defaults to `Durability.normal` (no fsync per write; survives app kills, a power loss may lose the last writes, never corrupts). `Durability.full` fsyncs every write.
 
 ---
 
@@ -258,7 +250,7 @@ When adding a new feature to ffastdb:
 - [ ] Is it added as a `part` file if it's a new section of `FastDB`?
 - [ ] Does it have a test in `test/`?
 - [ ] Is it exported in `lib/ffastdb.dart` if it's public API?
-- [ ] Is performance acceptable? (check with `dart run benchmark/main.dart`)
+- [ ] Is performance acceptable? (benchmark before/after — e.g. `dart run benchmark/full_benchmark.dart`)
 
 ---
 
@@ -280,9 +272,7 @@ Classes available to users:
 ## Analysis Documents
 
 - `ANALYSIS.md` — Executive summary and roadmap
-- `BUGS.md` — Confirmed bugs with reproduction and fixes
 - `PERFORMANCE.md` — Bottlenecks and optimization opportunities
-- `ARCHITECTURE.md` — Architectural issues and proposals
-- `API_IMPROVEMENTS.md` — Non-breaking API enhancements
 - `SUPPORTED_DATA_TYPES.md` — All serializable types
-- `CHANGELOG.md` — Version history
+- `DOCUMENTACION_INTERNA.md`, `ffastdb_map.md` — Internal architecture notes
+- `CHANGELOG.md` — Version history (short summaries)

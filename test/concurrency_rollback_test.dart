@@ -106,6 +106,44 @@ void main() {
       expect(ids, [1]);
     });
 
+    test('update/put/delete of a document inserted in the same transaction',
+        () async {
+      late int a, b, c;
+      await db.transaction(() async {
+        a = await db.insert({'status': 'a', 'v': 1});
+        await db.update(a, {'v': 2});
+        b = await db.insert({'status': 'b'});
+        expect(await db.delete(b), isTrue);
+        c = await db.insert({'status': 'c', 'v': 1});
+        await db.put(c, {'status': 'c', 'v': 3});
+        expect(await db.count(), 2);
+      });
+      expect((await db.findById(a))?['v'], 2);
+      expect(await db.findById(b), isNull);
+      expect((await db.findById(c))?['v'], 3);
+      expect(await db.count(), 2);
+      expect(await db.query().where('status').equals('b').count(), 0);
+    });
+
+    test('rolled-back inserts leave no trace', () async {
+      await db.insert({'status': 'keep'});
+      await expectLater(
+        db.transaction(() async {
+          for (int i = 0; i < 500; i++) {
+            await db.insert({'status': 'tx'});
+          }
+          throw StateError('abort');
+        }),
+        throwsStateError,
+      );
+      expect(await db.count(), 1);
+      expect(await db.findById(2), isNull);
+      expect(await db.query().where('status').equals('tx').count(), 0);
+      final id = await db.insert({'status': 'after'});
+      expect(id, 2);
+      expect((await db.findById(1))?['status'], 'keep');
+    });
+
     test('query cache is invalidated by a committed transaction', () async {
       await db.insert({'status': 'a'});
       expect(await db.query().where('status').equals('a').findIds(), [1]);

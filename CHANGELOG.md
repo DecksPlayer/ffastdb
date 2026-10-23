@@ -31,6 +31,8 @@
 - Negative numbers in sorted indexes were wrong after a reopen; 64-bit index values were wrong on the web.
 - A crash after a read-only session forced a full reindex.
 - `WalStorageStrategy` did not work on the web.
+- Updates, puts and deletes of a document inserted in the same transaction were lost.
+- `openDatabase()` / `ffastdb.init()` could return a different database that was already open; concurrent opens of the same database raced for the file lock.
 
 ### Performance
 
@@ -41,11 +43,14 @@
 - Queries that mix indexed and unindexed conditions only scan the candidates.
 - Watchers emit once per burst of writes instead of once per write.
 - Auto-compaction no longer scans the whole database after each delete.
+- Large transactions that read a lot (`updateWhere`, migrations, `compact`) are no longer quadratic with the WAL.
+- Faster chunk cache on the web (IndexedDB).
 
 ### Removed
 
 - The operation log (`.fdb.log`): it restored deleted/old data after a crash and stored encrypted databases' documents in plaintext. Leftover files are deleted on open.
 - The unused `IsolateCoordinator`.
+- Debug scripts, scratch code and internal docs from the published package.
 
 ## 0.3.5
 

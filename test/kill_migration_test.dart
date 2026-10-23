@@ -89,7 +89,7 @@ void main() {
         // 2. Worker reopens with version: 2 — READY fires from INSIDE the
         //    migration, then we SIGKILL at a random point mid-migration.
         proc = await spawnWorker(dir.path, 'migtest');
-        proc.stderr.drain();
+        unawaited(proc.stderr.drain<void>());
         final ready = Completer<void>();
         proc.stdout.transform(utf8.decoder).listen((chunk) {
           if (chunk.contains('READY') && !ready.isCompleted) ready.complete();

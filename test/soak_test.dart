@@ -47,7 +47,7 @@ void main() {
             [workerSource, dir.path, 'soaktest'],
             workingDirectory: Directory.current.path,
           );
-          proc.stderr.drain();
+          unawaited(proc.stderr.drain<void>());
           final ready = Completer<void>();
           proc.stdout.transform(utf8.decoder).listen((chunk) {
             if (chunk.contains('READY') && !ready.isCompleted) {

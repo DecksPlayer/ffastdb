@@ -4,6 +4,7 @@ import '../storage/web/local_storage_strategy.dart';
 import '../storage/web/indexed_db_strategy.dart';
 import '../storage/encrypted_storage_strategy.dart';
 import '../storage/wal_storage_strategy.dart' show Durability;
+import '_singleton_open.dart';
 
 /// Opens (or creates) a named database on Web using [LocalStorageStrategy].
 ///
@@ -34,40 +35,25 @@ Future<FastDB> openDatabase(
   // flush in its own transaction.
   Durability durability = Durability.normal,
 }) async {
-  // Guard: if a live instance already exists, reuse it.
-  // Calling disposeInstance() unconditionally was the root cause of
-  // "Bad state: Cannot perform operations on a closed database" errors
-  // when openDatabase / ffastdb.init was called from multiple code paths
-  // during app startup (e.g., from BLoC + repository simultaneously).
-  try {
-    return FfastDb.instance; // throws StateError if null or closed
-  } on StateError {
-    // No live instance — fall through to create one.
-  }
-
-  // Clean up any stale closed instance before opening a new one.
-  await FfastDb.disposeInstance();
-
-  StorageStrategy baseStorage = useIndexedDb
-      ? IndexedDbStorageStrategy(name)
-      : LocalStorageStrategy(name);
-
-  if (encryptionKey != null && encryptionKey.isNotEmpty) {
-    baseStorage = EncryptedStorageStrategy(baseStorage, encryptionKey);
-  }
-
-  final db = await FfastDb.init(
-    baseStorage,
-    cacheCapacity: cacheCapacity,
-    autoCompactThreshold: autoCompactThreshold,
-    version: version,
-    migrations: migrations,
-    indexes: indexes,
-    sortedIndexes: sortedIndexes,
-    ftsIndexes: ftsIndexes,
-    compositeIndexes: compositeIndexes,
-    onProgress: onProgress,
-  );
-
-  return db;
+  return openSingleton(name, () {
+    StorageStrategy baseStorage = useIndexedDb
+        ? IndexedDbStorageStrategy(name)
+        : LocalStorageStrategy(name);
+    if (encryptionKey != null && encryptionKey.isNotEmpty) {
+      baseStorage = EncryptedStorageStrategy(baseStorage, encryptionKey);
+    }
+    return FfastDb.init(
+      baseStorage,
+      cacheCapacity: cacheCapacity,
+      autoCompactThreshold: autoCompactThreshold,
+      version: version,
+      migrations: migrations,
+      indexes: indexes,
+      sortedIndexes: sortedIndexes,
+      ftsIndexes: ftsIndexes,
+      compositeIndexes: compositeIndexes,
+      onProgress: onProgress,
+      name: name,
+    );
+  });
 }

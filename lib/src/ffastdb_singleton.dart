@@ -56,8 +56,8 @@ class FFastDbSingleton {
   ///   the OS killing the app; a power loss may lose the last writes.
   ///   [Durability.full] fsyncs every write. Native only.
   ///
-  /// Calling [init] a second time while the database is already open returns
-  /// the existing instance without re-opening.
+  /// Calling [init] again for the database that is already open returns it
+  /// without re-opening; a different database replaces it.
   Future<FastDB> init(
     String name, {
     String directory = '',
@@ -67,7 +67,8 @@ class FFastDbSingleton {
     Map<int, dynamic Function(dynamic)>? migrations,
     Durability durability = Durability.normal,
   }) async {
-    if (_db != null) return _db!;
+    // openDatabase() reuses the live database when it is the same one and
+    // replaces it otherwise (it used to return whatever database was open).
     _db = await openDatabase(
       name,
       directory: directory,

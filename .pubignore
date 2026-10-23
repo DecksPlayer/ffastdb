@@ -11,3 +11,20 @@ test_file_mode.dart
 
 # Local dev files
 pubspec.lock
+
+# Dev tooling and scratch code (not part of the package). Note: with a
+# .pubignore present, pub does NOT apply .gitignore — list local files too.
+bin/
+scratch/
+flutter_benchmark/
+example_flutter/
+.gemini/
+CLAUDE.md
+DOCUMENTACION_INTERNA.md
+ffastdb_map.md
+*.log
+test_output.txt
+*.fdb
+*.fdb.wal
+*.fdb.lock
+!test/fixtures/*.fdb

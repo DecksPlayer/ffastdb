@@ -105,7 +105,7 @@ void main() {
     final dir = Directory.systemTemp.createTempSync('ffastdb_kill_');
     try {
       final proc = await spawnWorker(dir.path, 'killtest', mode, encryptionKey);
-      proc.stderr.drain();
+      unawaited(proc.stderr.drain<void>());
 
       // Wait until the worker has the DB open and is writing.
       final ready = Completer<void>();
@@ -181,6 +181,12 @@ void main() {
 
       await db.close();
     } finally {
+      // A failed check above skips db.close(): without this, the still-open
+      // singleton was handed to the NEXT cycle's openDatabase(), turning one
+      // failure into a cascade across every following test.
+      try {
+        await FfastDb.disposeInstance();
+      } catch (_) {}
       try {
         dir.deleteSync(recursive: true);
       } catch (_) {}

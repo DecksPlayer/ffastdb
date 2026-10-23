@@ -5,6 +5,7 @@ import '../storage/storage_strategy.dart';
 import '../storage/io/io_storage_strategy.dart';
 import '../storage/wal_storage_strategy.dart';
 import '../storage/encrypted_storage_strategy.dart';
+import '_singleton_open.dart';
 
 /// Opens (or creates) a named database in [directory].
 Future<FastDB> openDatabase(
@@ -22,40 +23,29 @@ Future<FastDB> openDatabase(
   void Function(double)? onProgress,
   Durability durability = Durability.normal,
 }) async {
-  try {
-    return FfastDb.instance;
-  } on StateError {
-    // No live instance in this isolate.
-  }
-
   final dir = directory.isEmpty ? Directory.current.path : directory;
   final path = p.join(dir, '$name.fdb');
-
-  // Normal open as the Owner isolate
-  await FfastDb.disposeInstance();
-
-  StorageStrategy storage = WalStorageStrategy(
-    main: IoStorageStrategy(path),
-    wal: IoStorageStrategy('$path.wal'),
-    durability: durability,
-  );
-
-  if (encryptionKey != null && encryptionKey.isNotEmpty) {
-    storage = EncryptedStorageStrategy(storage, encryptionKey);
-  }
-
-  final db = await FfastDb.init(
-    storage,
-    cacheCapacity: cacheCapacity,
-    autoCompactThreshold: autoCompactThreshold,
-    version: version,
-    migrations: migrations,
-    indexes: indexes,
-    sortedIndexes: sortedIndexes,
-    ftsIndexes: ftsIndexes,
-    compositeIndexes: compositeIndexes,
-    onProgress: onProgress,
-  );
-
-  return db;
+  return openSingleton(path, () {
+    StorageStrategy storage = WalStorageStrategy(
+      main: IoStorageStrategy(path),
+      wal: IoStorageStrategy('$path.wal'),
+      durability: durability,
+    );
+    if (encryptionKey != null && encryptionKey.isNotEmpty) {
+      storage = EncryptedStorageStrategy(storage, encryptionKey);
+    }
+    return FfastDb.init(
+      storage,
+      cacheCapacity: cacheCapacity,
+      autoCompactThreshold: autoCompactThreshold,
+      version: version,
+      migrations: migrations,
+      indexes: indexes,
+      sortedIndexes: sortedIndexes,
+      ftsIndexes: ftsIndexes,
+      compositeIndexes: compositeIndexes,
+      onProgress: onProgress,
+      name: path,
+    );
+  });
 }

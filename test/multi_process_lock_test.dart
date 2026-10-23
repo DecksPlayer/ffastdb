@@ -28,7 +28,7 @@ void main() {
         [workerSource, dir.path, 'locktest'],
         workingDirectory: Directory.current.path,
       );
-      proc.stderr.drain();
+      unawaited(proc.stderr.drain<void>());
       final ready = Completer<void>();
       proc.stdout.transform(utf8.decoder).listen((chunk) {
         if (chunk.contains('READY') && !ready.isCompleted) ready.complete();
@@ -49,7 +49,7 @@ void main() {
 
       // Kill the owner — the OS releases the file lock on process death.
       proc.kill(ProcessSignal.sigkill);
-      await proc!.exitCode.timeout(const Duration(seconds: 10));
+      await proc.exitCode.timeout(const Duration(seconds: 10));
       proc = null;
 
       // Now the same open must succeed (this is what makes crash recovery

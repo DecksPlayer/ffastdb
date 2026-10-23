@@ -22,11 +22,12 @@ class _CrudOperations {
         await targetStorage.write(offset, data);
       }
 
-      if (_db._batchMode) {
-        _db._batchEntries.add(MapEntry(id, offset));
-      } else {
-        await _db._primaryIndex.insert(id, offset);
-      }
+      // Straight into the B-Tree, also in batch/transaction mode (dirty
+      // pages under write-behind — cheap, and discarded on rollback). The
+      // old deferral to a bulkLoad at commit lost every update/put/delete of
+      // that document made later in the same transaction: the commit
+      // re-applied the original insert on top of them.
+      await _db._primaryIndex.insert(id, offset);
       await _db._syncDataOffset(data.length);
 
       if (!_db._batchMode) {
@@ -64,9 +65,7 @@ class _CrudOperations {
           id, 'id', 'FastDB ids must be >= 1 (ids <= 0 are not reachable by queries)');
     }
     final oldOffset = await _db._primaryIndex.search(id);
-    // A pending batch insert of the same id is not in the B-Tree yet.
-    final existed = oldOffset != null ||
-        (_db._liveCount != null && _db._batchEntries.any((e) => e.key == id));
+    final existed = oldOffset != null;
 
     final wal = _db._wal;
     final hasWal = !_db._inTransaction && !_db._batchMode && wal != null;

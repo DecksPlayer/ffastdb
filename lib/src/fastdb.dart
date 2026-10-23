@@ -158,7 +158,7 @@ class FastDB {
   Future<T> _exclusive<T>(Future<T> Function() fn) {
     if (_isClosed) {
       throw StateError(
-        'Bad state: Cannot perform operations on a closed database'
+        'Cannot perform operations on a closed database'
         '${name != null ? " \"$name\"" : ""}.',
       );
     }
@@ -166,7 +166,7 @@ class FastDB {
     final next = _writeLock.then((_) async {
       if (_isClosed) {
         throw StateError(
-          'Bad state: Cannot perform operations on a closed database'
+          'Cannot perform operations on a closed database'
           '${name != null ? " \"$name\"" : ""}.',
         );
       }
@@ -197,10 +197,9 @@ class FastDB {
     if (c != null) _liveCount = c + delta;
   }
 
-  /// O(1) after the first call. Pending batch inserts are not in the B-Tree
-  /// yet ([_batchEntries]) but are live documents.
-  Future<int> _countLive() async => _liveCount ??=
-      (await _primaryIndex.rangeSearch(1, _nextId - 1)).length + _batchEntries.length;
+  /// O(1) after the first call.
+  Future<int> _countLive() async =>
+      _liveCount ??= (await _primaryIndex.rangeSearch(1, _nextId - 1)).length;
 
   // Helper classes for modularized operations
   late final _CrudOperations _crudOps;
@@ -811,15 +810,7 @@ class FastDB {
 
   Future<dynamic> _findById(int id) async {
     final offset = await _primaryIndex.search(id);
-    if (offset != null) return _readAt(offset);
-    // Read-your-writes in batch/transaction mode: pending inserts live in
-    // _batchEntries until bulkLoad() at commit — they are not in the B-Tree yet.
-    if (_batchEntries.isNotEmpty) {
-      for (final e in _batchEntries) {
-        if (e.key == id) return _readAt(e.value);
-      }
-    }
-    return null;
+    return offset == null ? null : _readAt(offset);
   }
 
   /// Find all documents matching a query.
@@ -1374,15 +1365,6 @@ class FastDB {
       if (offset != null) {
         entries.add(MapEntry(id, offset));
         positions.add(p);
-      } else if (_batchEntries.isNotEmpty) {
-        // Read-your-writes in batch/transaction mode (see _findById).
-        for (final e in _batchEntries) {
-          if (e.key == id) {
-            entries.add(e);
-            positions.add(p);
-            break;
-          }
-        }
       }
     }
     if (entries.isEmpty) return docs;

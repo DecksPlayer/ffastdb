@@ -125,6 +125,34 @@ class WalStorageStrategy implements StorageStrategy {
   final List<_WalEntry> _pending = [];
   int _pendingExtent = 0;
 
+  /// Block indexes over [_pending], [_txEntries] and [_txStreamed]: a read
+  /// overlays only the entries touching its blocks. It scanned every entry
+  /// on every read — quadratic for transactions that read a lot (updateWhere,
+  /// migrations, compact).
+  final _BlockIndex _pendingIndex = _BlockIndex();
+  final _BlockIndex _txIndex = _BlockIndex();
+  final _BlockIndex _streamedIndex = _BlockIndex();
+
+  /// Highest end offset written by the open transaction (for [size]).
+  int _txExtent = 0;
+
+  void _resetTx() {
+    _txEntries.clear();
+    _txStreamed.clear();
+    _txIndex.clear();
+    _streamedIndex.clear();
+    _txExtent = 0;
+    _txBufferedBytes = 0;
+    _txTruncateTo = null;
+  }
+
+  void _addTxEntry(int offset, Uint8List data) {
+    _txIndex.add(_txEntries.length, offset, data.length);
+    _txEntries.add(_WalEntry(txId: _txId, offset: offset, data: data));
+    _txBufferedBytes += data.length;
+    if (offset + data.length > _txExtent) _txExtent = offset + data.length;
+  }
+
   WalStorageStrategy({
     required StorageStrategy main,
     required StorageStrategy wal,
@@ -300,8 +328,7 @@ class WalStorageStrategy implements StorageStrategy {
     }
     _txOpen = true;
     _txId++;
-    _txEntries.clear();
-    _txTruncateTo = null;
+    _resetTx();
     _commitMarkerWritten = false;
   }
 
@@ -345,6 +372,7 @@ class WalStorageStrategy implements StorageStrategy {
     try {
       if (deferred) {
         for (final e in _txEntries) {
+          _pendingIndex.add(_pending.length, e.offset, e.data.length);
           _pending.add(e);
           final end = e.offset + e.data.length;
           if (end > _pendingExtent) _pendingExtent = end;
@@ -372,10 +400,7 @@ class WalStorageStrategy implements StorageStrategy {
     _commitMarkerWritten = false;
 
     _txOpen = false;
-    _txEntries.clear();
-    _txStreamed.clear();
-    _txBufferedBytes = 0;
-    _txTruncateTo = null;
+    _resetTx();
 
     // Checkpoint policy: truncate the WAL only when it exceeds the threshold.
     // The multi-transaction recovery is correct, so keeping several committed
@@ -389,10 +414,7 @@ class WalStorageStrategy implements StorageStrategy {
   /// Rolls back the current transaction (discards buffered writes).
   Future<void> rollback() async {
     _txOpen = false;
-    _txEntries.clear();
-    _txStreamed.clear();
-    _txBufferedBytes = 0;
-    _txTruncateTo = null;
+    _resetTx();
     // Discard any streamed bytes not yet flushed. Already-flushed ones carry
     // no COMMIT marker either, so the checkpoint below (or recovery, if the
     // process dies first) discards them the same way it already did before
@@ -568,6 +590,7 @@ class WalStorageStrategy implements StorageStrategy {
     if (fsyncWal) await _wal.flush();
     await _applyCoalesced(_pending);
     _pending.clear();
+    _pendingIndex.clear();
     _pendingExtent = 0;
   }
 
@@ -592,8 +615,7 @@ class WalStorageStrategy implements StorageStrategy {
     if (_txOpen) {
       if (_txBufferedBytes + data.length <= _txStreamThreshold) {
         // Small transactions: buffer in RAM (fast path).
-        _txEntries.add(_WalEntry(txId: _txId, offset: offset, data: data));
-        _txBufferedBytes += data.length;
+        _addTxEntry(offset, data);
       } else {
         // Huge transactions (e.g. insertAll of 1M docs): the entry's data is
         // never held in RAM as a whole (bounds RAM) — its ENCODED bytes go
@@ -602,7 +624,9 @@ class WalStorageStrategy implements StorageStrategy {
         final walPos = _walPos + _streamBufferBytes;
         _encodeWalEntry(_streamBuffer, _kEntryWrite, _txId, offset, data);
         _streamBufferBytes += 25 + data.length + 4; // header + data + CRC
+        _streamedIndex.add(_txStreamed.length, offset, data.length);
         _txStreamed.add((offset: offset, length: data.length, walPos: walPos));
+        if (offset + data.length > _txExtent) _txExtent = offset + data.length;
         if (_streamBufferBytes >= _streamFlushBytes) {
           await _flushStreamBuffer();
         }
@@ -610,8 +634,7 @@ class WalStorageStrategy implements StorageStrategy {
     } else {
       // Auto-wrap in a single-op transaction
       await beginTransaction();
-      _txEntries.add(_WalEntry(txId: _txId, offset: offset, data: data));
-      _txBufferedBytes += data.length;
+      _addTxEntry(offset, data);
       await commit();
     }
   }
@@ -658,19 +681,19 @@ class WalStorageStrategy implements StorageStrategy {
 
     // Deferred commits (older) first, then the open transaction (newer).
     // A pending truncate never coexists with _pending (see truncate()).
-    for (final entry in _pending) {
-      overlay(entry.offset, entry.data);
+    for (final i in _pendingIndex.lookup(offset, readEnd)) {
+      overlay(_pending[i].offset, _pending[i].data);
     }
     if (!txActive) return result;
-    for (final entry in _txEntries) {
-      overlay(entry.offset, entry.data);
+    for (final i in _txIndex.lookup(offset, readEnd)) {
+      overlay(_txEntries[i].offset, _txEntries[i].data);
     }
     // Streamed entries live in the WAL file (RAM-bounded transactions) — but
     // some may still be sitting in the unflushed rolling buffer rather than
     // actually on disk yet. Flush first so every entry below is readable.
     if (_streamBufferBytes > 0) await _flushStreamBuffer();
-    for (final s in _txStreamed) {
-      if (s.offset + s.length <= offset || s.offset >= readEnd) continue;
+    for (final i in _streamedIndex.lookup(offset, readEnd)) {
+      final s = _txStreamed[i];
       final data = await _wal.read(s.walPos + 25, s.length); // +25: header
       overlay(s.offset, data);
     }
@@ -734,16 +757,8 @@ class WalStorageStrategy implements StorageStrategy {
     // buffered/streamed entries so that callers like _dataOffset and
     // allocatePage() see the correct "virtual end of file". A pending
     // truncate lowers the floor of that virtual size.
-    var maxExtent = _txTruncateTo ?? mainSize;
-    for (final entry in _txEntries) {
-      final extent = entry.offset + entry.data.length;
-      if (extent > maxExtent) maxExtent = extent;
-    }
-    for (final s in _txStreamed) {
-      final extent = s.offset + s.length;
-      if (extent > maxExtent) maxExtent = extent;
-    }
-    return maxExtent;
+    final floor = _txTruncateTo ?? mainSize;
+    return _txExtent > floor ? _txExtent : floor;
   }
 
   // ─── WAL Binary Writers ──────────────────────────────────────────────────
@@ -824,4 +839,36 @@ class _WalEntry {
       required this.offset,
       required this.data,
       this.isTruncate = false});
+}
+
+/// Positions of the entries of an append-only list that touch each 4 KB
+/// block of the main file (see [WalStorageStrategy._txIndex]).
+class _BlockIndex {
+  static const int _block = 4096;
+  final Map<int, List<int>> _blocks = {};
+
+  void add(int position, int offset, int length) {
+    if (length <= 0) return;
+    final last = (offset + length - 1) ~/ _block;
+    for (int b = offset ~/ _block; b <= last; b++) {
+      (_blocks[b] ??= <int>[]).add(position);
+    }
+  }
+
+  /// Positions touching `[offset, end)`, ascending (= write order).
+  List<int> lookup(int offset, int end) {
+    if (_blocks.isEmpty || end <= offset) return const [];
+    final first = offset ~/ _block;
+    final last = (end - 1) ~/ _block;
+    // Each block list is already ascending (positions are appended in order).
+    if (first == last) return _blocks[first] ?? const [];
+    final positions = <int>{};
+    for (int b = first; b <= last; b++) {
+      final list = _blocks[b];
+      if (list != null) positions.addAll(list);
+    }
+    return positions.toList()..sort();
+  }
+
+  void clear() => _blocks.clear();
 }

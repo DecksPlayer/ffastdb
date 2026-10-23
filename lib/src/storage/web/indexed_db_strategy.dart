@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:js_interop';
 import 'dart:math' show min;
 import 'dart:typed_data';
@@ -13,8 +14,8 @@ import '../storage_strategy.dart';
 /// [open] time, keeping RAM usage proportional to the *working set* rather
 /// than the full database size.
 ///
-/// A bounded LRU cache of at most [_maxCachedChunks] chunks (32 × 64 KB =
-/// 2 MB) is maintained in RAM. Clean chunks are evicted when the cache is
+/// A bounded LRU cache of at most [_maxCachedChunks] chunks (2048 × 64 KB =
+/// up to 128 MB) is maintained in RAM. Clean chunks are evicted when the cache is
 /// full; dirty (not-yet-flushed) chunks are never evicted.
 ///
 /// ## Format in IndexedDB (objectStore `"ffastdb_store"`)
@@ -29,9 +30,8 @@ class IndexedDbStorageStrategy implements StorageStrategy {
   /// Chunk size in bytes — 64 KB gives good granularity vs. IDB overhead.
   static const int _chunkSize = 65536;
 
-  /// Maximum number of chunks kept in the in-memory LRU cache.
-  /// 32 × 64 KB = 2 MB — enough to hold the full B-Tree working set for
-  /// most apps while keeping RAM bounded regardless of database size.
+  /// Maximum number of chunks kept in the in-memory LRU cache:
+  /// 2048 × 64 KB = up to 128 MB of RAM.
   static const int _maxCachedChunks = 2048;
 
   final String _dbName;
@@ -43,11 +43,10 @@ class IndexedDbStorageStrategy implements StorageStrategy {
   // ── Sparse chunk cache ───────────────────────────────────────────────────
   // Only chunks that have been accessed (read or written) since open() are
   // held in RAM. The map is bounded by _maxCachedChunks via LRU eviction.
-  final Map<int, Uint8List> _chunks = {};
-
-  // LRU order: front = oldest, back = most-recently-used.
-  // List.remove() is O(n) but with ≤ 32 entries that's negligible.
-  final List<int> _lruOrder = [];
+  // Insertion order doubles as LRU order: front = oldest, back = most
+  // recently used (a touch removes and re-inserts the key — O(1); the old
+  // separate List paid an O(n) List.remove() per touch, n up to 2048).
+  final LinkedHashMap<int, Uint8List> _chunks = LinkedHashMap();
 
   int _usedSize = 0;
 
@@ -246,7 +245,6 @@ class IndexedDbStorageStrategy implements StorageStrategy {
     final toEvict = _chunks.keys.where((c) => c > maxChunk).toList();
     for (final c in toEvict) {
       _chunks.remove(c);
-      _lruOrder.remove(c);
     }
     // Orphan chunk deletion in IndexedDB happens in flush().
   }
@@ -320,11 +318,11 @@ class IndexedDbStorageStrategy implements StorageStrategy {
     return chunk;
   }
 
-  /// Moves [ci] to the back of [_lruOrder] (most-recently-used) and evicts
+  /// Marks [ci] as most recently used and evicts
   /// the oldest clean chunk(s) when the cache exceeds [_maxCachedChunks].
   void _touchLru(int ci) {
-    _lruOrder.remove(ci);
-    _lruOrder.add(ci);
+    final chunk = _chunks.remove(ci);
+    if (chunk != null) _chunks[ci] = chunk;
     _evictCleanChunks();
   }
 
@@ -332,17 +330,17 @@ class IndexedDbStorageStrategy implements StorageStrategy {
   /// [_maxCachedChunks]. Dirty chunks are skipped — they must stay in RAM
   /// until [flush] persists them.
   void _evictCleanChunks() {
-    int i = 0;
-    while (_chunks.length > _maxCachedChunks && i < _lruOrder.length) {
-      final candidate = _lruOrder[i];
-      if (!_dirtyChunks.contains(candidate)) {
-        _chunks.remove(candidate);
-        _lruOrder.removeAt(i);
-        // Don't advance i — the next element shifted into position i.
-      } else {
-        i++;
+    var excess = _chunks.length - _maxCachedChunks;
+    if (excess <= 0) return;
+    final victims = <int>[];
+    for (final ci in _chunks.keys) {
+      if (excess == 0) break;
+      if (!_dirtyChunks.contains(ci)) {
+        victims.add(ci);
+        excess--;
       }
     }
+    victims.forEach(_chunks.remove);
   }
 
   // ── IDB helpers ──────────────────────────────────────────────────────────
@@ -370,11 +368,10 @@ class IndexedDbStorageStrategy implements StorageStrategy {
           final bytes = (r as JSUint8Array).toDart;
           chunk.setRange(0, bytes.length, bytes);
         }
+        // Add as most recently used, without triggering eviction yet — all
+        // loaded chunks must survive until the transaction completes.
+        _chunks.remove(idx);
         _chunks[idx] = chunk;
-        // Add to LRU without triggering eviction yet — all loaded chunks
-        // must survive until the transaction completes.
-        _lruOrder.remove(idx);
-        _lruOrder.add(idx);
       }).toJS;
     }
 
